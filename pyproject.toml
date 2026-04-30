@@ -1,0 +1,87 @@
+[project]
+name = "agentic"
+version = "0.1.0"
+description = "Proof-obligation controlled agent for long-document QA"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+# Dependency policy:
+#   - Generation / reranking / embedding go through OpenAI-compatible HTTP APIs.
+#   - Local models are NOT allowed except for one carve-out: the spaCy NER
+#     pipeline. Loading the transformer-based variants (en_core_web_trf,
+#     zh_core_web_trf) requires spacy-transformers, which transitively brings
+#     in transformers + torch — these are accepted ONLY as part of the NER
+#     exception. Do not introduce any other local-model runtime
+#     (sentence-transformers, accelerate, vllm, …).
+dependencies = [
+    # HTTP / API clients used by the model clients and PaddleOCR client.
+    "requests>=2.28.0",
+    "httpx>=0.25.0",
+    "openai>=1.40.0",
+    # Tokenization and cost accounting in the chat client.
+    "tiktoken>=0.7.0",
+    # Configs / IO.
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "python-dotenv>=1.0.0",
+    # Slice large PDFs into ≤50-page batches before submission to the
+    # PaddleOCR layout-parsing API.
+    "pypdf>=4.0.0",
+    # Numerics and columnar storage. scipy.sparse for the graph index;
+    # parquet for embedding stores.
+    # spaCy 3.7 / thinc 8 are not numpy-2 compatible — pin <2 for ABI safety.
+    "numpy>=1.26.0,<2.0",
+    "scipy>=1.11.0",
+    "pandas>=2.0.0",
+    "pyarrow>=14.0.0",
+    "scikit-learn>=1.3.0",
+    # Local search / graph backends — no external services like neo4j.
+    "python-igraph>=0.11.0",
+    "tantivy>=0.26.0",
+    "faiss-cpu>=1.8.0",
+    # spaCy NER (the local-model carve-out). The recent en/zh _trf models on
+    # HuggingFace ship the curated-transformers factory; older spacy-
+    # transformers is kept too because some downloaded models still
+    # reference its `transformer` factory. langdetect routes each page to
+    # the right pipeline.
+    "spacy>=3.7.0,<3.8.0",
+    "spacy-transformers>=1.4.0",
+    "spacy-curated-transformers>=0.2.0,<1.0.0",
+    "langdetect>=1.0.9",
+    "ftfy>=6.3.1",
+    "opencc-python-reimplemented>=0.1.7",
+    "regex>=2026.4.4",
+    "spacy-pkuseg>=0.0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/agentic",
+    "src/config",
+    "src/ingestion",
+    "src/model_client",
+    "src/pipeline",
+    "src/storage",
+]
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

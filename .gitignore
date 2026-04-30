@@ -1,0 +1,47 @@
+# Python bytecode / build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project runtime data — STORAGE_PATH lives outside the repo.
+# src/local_storage/ exists due to a stray write into the package tree
+# and contains BM25 / FAISS / OCR artifacts, not code.
+local_storage/
+src/local_storage/
+
+# Test / E2E artifacts
+e2e_test_summary.json
+
+# PDFs at the project root (input documents, not source).
+/*.pdf
+
+# Ad-hoc dirs not yet part of the tracked tree
+/docs/
+/scripts/
+/projects/
