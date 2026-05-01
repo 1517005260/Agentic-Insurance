@@ -7,7 +7,8 @@ No runtime model code lives here.
 """
 
 from model_client.chat import LLMClient
+from model_client.rerank import RerankClient
 from model_client.text_embedding import EmbeddingClient
 from model_client.visual_embedding import VisualEmbeddingClient
 
-__all__ = ["LLMClient", "EmbeddingClient", "VisualEmbeddingClient"]
+__all__ = ["LLMClient", "EmbeddingClient", "VisualEmbeddingClient", "RerankClient"]

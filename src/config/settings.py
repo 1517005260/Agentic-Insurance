@@ -148,6 +148,19 @@ VISUAL_EMBEDDING_API_BASE_URL: str = (
 VISUAL_EMBEDDING_MODEL: str | None = _get("VISUAL_EMBEDDING_MODEL")
 
 
+# -------------------------------------------------------------- reranker ----
+
+# DashScope native rerank API. Base URL ends at /api/v1; the client appends
+# /services/rerank/text-rerank/text-rerank. Default model is gte-rerank-v2
+# because it's available on both Beijing and Singapore endpoints; switch to
+# qwen3-rerank with the -intl URL for higher quality where available.
+RERANKER_API_KEY: str | None = _get("RERANKER_API_KEY")
+RERANKER_API_BASE_URL: str = (
+    _get("RERANKER_API_BASE_URL") or "https://dashscope.aliyuncs.com/api/v1"
+)
+RERANKER_MODEL: str = _get("RERANKER_MODEL") or "gte-rerank-v2"
+
+
 __all__ = [
     "STORAGE_PATH",
     "PADDLE_OCR_SUBDIR",
@@ -185,4 +198,7 @@ __all__ = [
     "VISUAL_EMBEDDING_API_KEY",
     "VISUAL_EMBEDDING_API_BASE_URL",
     "VISUAL_EMBEDDING_MODEL",
+    "RERANKER_API_KEY",
+    "RERANKER_API_BASE_URL",
+    "RERANKER_MODEL",
 ]
