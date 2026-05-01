@@ -59,14 +59,36 @@ class VisualEmbeddingClient:
 
     def encode_paths(self, image_paths: Sequence[Union[str, Path]]) -> np.ndarray:
         """Embed every image path. Returns (N, D), L2-normalized."""
+        if not image_paths:
+            return np.zeros((0, 0), dtype=np.float32)
+        contents = [{"image": self._image_to_data_uri(Path(p))} for p in image_paths]
+        return self._encode_contents(contents)
+
+    def encode_text(self, text: str) -> np.ndarray:
+        """Embed a single text string in the SHARED multimodal space.
+
+        qwen3-vl-embedding (and tongyi-embedding-vision-*) accept ``{"text":
+        ...}`` items in the same ``input.contents`` payload as ``{"image":
+        ...}`` items; the resulting vector lives in the same space as image
+        vectors, so cosine similarity between a text query and a page-image
+        embedding is meaningful (cross-modal retrieval).
+        """
+        return self._encode_contents([{"text": text}])[0]
+
+    # ---------------------------------------------------------- internals
+
+    def _encode_contents(self, contents: Sequence[Dict[str, Any]]) -> np.ndarray:
+        """Send a flat list of content items to the multimodal endpoint.
+
+        Each item (``{"image": ...}`` or ``{"text": ...}``) is one
+        independent input; the response returns one embedding per item,
+        aligned by the ``index`` field.
+        """
         if not self.available():
             raise RuntimeError(
                 "VisualEmbeddingClient is not configured (set "
                 "VISUAL_EMBEDDING_API_KEY and VISUAL_EMBEDDING_MODEL)."
             )
-        if not image_paths:
-            return np.zeros((0, 0), dtype=np.float32)
-
         if "compatible-mode" in self.base_url:
             raise RuntimeError(
                 f"VISUAL_EMBEDDING_API_BASE_URL is set to '{self.base_url}', "
@@ -82,21 +104,20 @@ class VisualEmbeddingClient:
         }
 
         all_vectors: List[List[float]] = []
-        for start in range(0, len(image_paths), self.batch_size):
-            batch_paths = [Path(p) for p in image_paths[start : start + self.batch_size]]
-            contents = [{"image": self._image_to_data_uri(p)} for p in batch_paths]
+        for start in range(0, len(contents), self.batch_size):
+            batch = list(contents[start : start + self.batch_size])
             payload: Dict[str, Any] = {
                 "model": self.model,
-                "input": {"contents": contents},
+                "input": {"contents": batch},
                 "parameters": {},
             }
             response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             embeddings = self._parse_embeddings(response.json())
-            if len(embeddings) != len(batch_paths):
+            if len(embeddings) != len(batch):
                 raise RuntimeError(
                     f"DashScope returned {len(embeddings)} vectors for "
-                    f"{len(batch_paths)} inputs (model={self.model})."
+                    f"{len(batch)} inputs (model={self.model})."
                 )
             all_vectors.extend(embeddings)
 
