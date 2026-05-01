@@ -73,6 +73,7 @@ packages = [
     "src/ingestion",
     "src/model_client",
     "src/pipeline",
+    "src/rag",
     "src/storage",
 ]
 
