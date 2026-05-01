@@ -17,9 +17,6 @@ Multilingual: language-agnostic Unicode-property classes (``\\p{L}``,
 ``\\p{Han}``) handle CN / EN / Traditional / mixed. OpenCC folds
 Traditional → Simplified for cross-script entity dedup.
 """
-
-from __future__ import annotations
-
 import html
 import unicodedata
 from typing import Optional

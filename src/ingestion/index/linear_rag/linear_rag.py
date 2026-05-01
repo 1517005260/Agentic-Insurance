@@ -1,10 +1,10 @@
 """LinearRAG build-time graph construction (incremental-by-default).
 
-Each call ``LinearRAG.index(passages, file_id)`` appends the file's contents
-into the global stores and graph:
+Each call ``LinearRAG.index(passages, file_id, page_numbers)`` appends the
+file's contents into the global stores and graph:
 
-    passages
-        → embed (passage store, hash dedup → only new)
+    passages (plain page Markdown — no metadata prefix)
+        → embed (passage store; meta carries file_id + page_number)
         → spaCy NER per new passage (NER cache reuses existing)
         → entity_nodes / sentence_nodes / passage→entities
         → embed sentences and entities (hash dedup)
@@ -17,14 +17,18 @@ State persists across calls — graphml is loaded if it exists, NER cache is
 loaded if it exists, all three faiss stores auto-load. No
 ``dataset_name`` / ``working_dir``: storage layout is fixed by
 ``config.settings``.
+
+Passage identity (file_id, page_number) is stored as meta columns on the
+passage embedding store rather than encoded into the passage text, so the
+text fed to embeddings / NER / lang routing is exactly the document
+content with no metadata pollution.
 """
 
 import json
 import logging
-import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Iterable, List, Optional, Set
 
 import igraph as ig
 
@@ -47,12 +51,6 @@ from storage import EmbeddingStore
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-
-# Passage text format. The leading ``<file_id>#<page_number>:`` is parsed
-# back by `add_adjacent_passage_edges` to keep adjacency chains within
-# their source file (no cross-file linking).
-_PASSAGE_PREFIX_RE = re.compile(r"^([^#]+)#(\d+):")
 
 
 class LinearRAG:
@@ -130,21 +128,45 @@ class LinearRAG:
 
     # --------------------------------------------------------------- index
 
-    def index(self, passages: List[str], file_id: str) -> dict:
+    def index(
+        self,
+        passages: List[str],
+        file_id: str,
+        page_numbers: Optional[List[int]] = None,
+    ) -> dict:
         """Append a file's passages into the global graph + stores.
 
-        Returns a dict of counts: ``{passages, entities, sentences, alias_edges}``
-        — only counts items added by THIS call (hash dedup means re-running on
-        the same content yields zeros across the board).
+        ``passages[i]`` is the plain page Markdown (no prefix); the
+        identity ``(file_id, page_numbers[i])`` is stored as a meta column
+        on the passage embedding store so the on-disk passage text matches
+        the document body exactly. ``page_numbers`` defaults to
+        ``[1, 2, ..., len(passages)]`` for callers that don't track them
+        separately.
+
+        Returns a dict of counts: ``{passages, entities, sentences,
+        alias_edges}`` — only counts items added by THIS call (hash dedup
+        means re-running on the same content yields zeros across the board).
         """
+        if page_numbers is None:
+            page_numbers = list(range(1, len(passages) + 1))
+        if len(page_numbers) != len(passages):
+            raise ValueError(
+                f"page_numbers length {len(page_numbers)} != passages length "
+                f"{len(passages)}"
+            )
+
         self.node_to_node_stats = defaultdict(dict)
 
-        # 1. Embed new passages (existing ones skip via hash dedup).
-        passage_file_ids = [self._extract_file_id(p, fallback=file_id) for p in passages]
+        # 1. Embed new passages (existing ones skip via hash dedup). The
+        #    passage text is the page Markdown verbatim; (file_id,
+        #    page_number) live as meta columns.
         added_passage_hashes = self._insert_with_dedup(
             self.passage_embedding_store,
             passages,
-            extra_metadata={"file_id": passage_file_ids},
+            extra_metadata={
+                "file_id": [file_id] * len(passages),
+                "page_number": list(page_numbers),
+            },
         )
         new_passage_hash_set: Set[str] = set(added_passage_hashes)
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
@@ -376,11 +398,6 @@ class LinearRAG:
 
     # ------------------------------------------------------------ helpers
 
-    @staticmethod
-    def _extract_file_id(passage_text: str, fallback: str) -> str:
-        match = _PASSAGE_PREFIX_RE.match(passage_text.lstrip())
-        return match.group(1) if match else fallback
-
     def _insert_with_dedup(
         self, store: EmbeddingStore, texts: List[str], extra_metadata=None
     ):
@@ -447,17 +464,24 @@ class LinearRAG:
                 )
 
     def _add_adjacent_passage_edges(self, file_id: str):
-        """Link adjacent passages within the same file_id by page_number."""
-        passage_id_to_text = self.passage_embedding_store.get_hash_id_to_text()
-        items = []
-        for hash_id, text in passage_id_to_text.items():
-            match = _PASSAGE_PREFIX_RE.match(text.lstrip())
-            if not match:
+        """Link adjacent passages within the same file_id by page_number.
+
+        Reads the passage store's ``file_id`` and ``page_number`` meta
+        columns rather than parsing a text prefix — keeps the passage text
+        clean of metadata.
+        """
+        hash_ids = self.passage_embedding_store.hash_ids
+        file_ids = self.passage_embedding_store.meta_column("file_id")
+        page_numbers = self.passage_embedding_store.meta_column("page_number")
+
+        items: List[tuple[int, str]] = []
+        for h, fid, pn in zip(hash_ids, file_ids, page_numbers):
+            if fid != file_id or pn is None:
                 continue
-            text_file_id, page_number = match.group(1), int(match.group(2))
-            if text_file_id != file_id:
+            try:
+                items.append((int(pn), h))
+            except (TypeError, ValueError):
                 continue
-            items.append((page_number, hash_id))
         items.sort(key=lambda x: x[0])
         for i in range(len(items) - 1):
             current = items[i][1]

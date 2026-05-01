@@ -40,12 +40,13 @@ DEFAULT_DROP_LABELS: FrozenSet[str] = frozenset(
 
 
 def _detect_lang(text: str) -> str:
-    """Return ``"zh"`` if text is Chinese, ``"en"`` otherwise.
+    """Return ``"zh"`` if text contains a Han ideograph, ``"en"`` otherwise.
 
-    First a fast Han-ideograph check (any CJK char → zh); when there are
-    no Han chars, fall back to langdetect, which classifies as ``"en"`` /
-    ``"de"`` / etc. — we treat anything non-zh as ``"en"`` because
-    ``en_core_web_trf`` is the most reasonable shared fallback.
+    Any-Han-char → zh works once passage text is the document body alone
+    (no metadata prefix). Stray Han characters inside an English passage
+    are rare in practice; if they show up the trf-en pipeline still
+    handles them gracefully (transformer tokenizers don't crash on OOV
+    scripts), the worst case is a misroute on a single passage.
     """
     import regex
 

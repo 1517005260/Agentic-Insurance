@@ -1,9 +1,10 @@
 """Graph index built by LinearRAG.
 
-Thin adapter around :class:`ingestion.index.linear_rag.LinearRAG`. PageAssets
-are turned into "passages" — one passage per page, prefixed with
-``<file_id>#<page_number>:`` so LinearRAG's adjacency-edge regex keeps each
-file's passage chain isolated.
+Thin adapter around :class:`ingestion.index.linear_rag.LinearRAG`. Each
+PageAsset becomes one passage (its plain ``text_markdown``); the
+``(file_id, page_number)`` identity is carried as meta columns on the
+passage embedding store, NOT prefixed into the text — that keeps the
+text fed to embedding / NER / lang routing free of metadata pollution.
 
 Build artifacts land under ``STORAGE_PATH/faiss/graph/``:
 
@@ -42,10 +43,10 @@ class GraphIndexBuilder(IndexBuilder):
         return faiss_graph_dir()
 
     def _build(self, file_id: str, pages: List[PageAsset]) -> IndexBuildResult:
-        passages = [
-            self._page_to_passage(p, file_id)
-            for p in pages
-            if p.text_markdown.strip()
+        eligible = [p for p in pages if p.text_markdown.strip()]
+        passages = [p.text_markdown for p in eligible]
+        page_numbers = [
+            p.page_number if p.page_number is not None else 0 for p in eligible
         ]
 
         # spacy.load() interprets relative names as installed-package names
@@ -69,7 +70,7 @@ class GraphIndexBuilder(IndexBuilder):
         )
 
         graph = LinearRAG(config)
-        added = graph.index(passages, file_id=file_id)
+        added = graph.index(passages, file_id=file_id, page_numbers=page_numbers)
 
         return IndexBuildResult(
             index_name=self.name,
@@ -85,8 +86,3 @@ class GraphIndexBuilder(IndexBuilder):
                 "added": added,
             },
         )
-
-    @staticmethod
-    def _page_to_passage(page: PageAsset, file_id: str) -> str:
-        n = page.page_number if page.page_number is not None else 0
-        return f"{file_id}#{n}: {page.text_markdown}"
