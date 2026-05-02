@@ -25,6 +25,7 @@ from rag.channels import (
 from rag.preprocess import QueryContext, preprocess
 from rag.rerank import RerankedPage, rerank_pages
 from storage.page_store import PageAsset, PageStore
+from tracer import Tracer, TraceSession
 
 
 logger = logging.getLogger(__name__)
@@ -122,17 +123,74 @@ class RAGPipeline:
 
     # --------------------------------------------------------- public ----
 
-    def run(self, query: str, file_ids: Optional[List[str]] = None) -> AnswerResult:
+    def run(
+        self,
+        query: str,
+        file_ids: Optional[List[str]] = None,
+        tracer: Optional[Tracer] = None,
+    ) -> AnswerResult:
+        session = tracer.session(query) if tracer is not None else None
+        if session is not None:
+            # RAGConfig is static across runs; record once per day. The
+            # per-query channel/rerank state is small but very dynamic
+            # so it stays per-run via snapshot().
+            session.daily(
+                "config",
+                {
+                    "channels": [c.name for c in self.channels],
+                    "rag_config": {
+                        k: getattr(self.config, k)
+                        for k in vars(self.config)
+                        if not k.startswith("_")
+                    },
+                },
+            )
         timings: Dict[str, float] = {}
         channel_timings: Dict[str, float] = {}
 
         t0 = time.perf_counter()
         ctx = preprocess(query, llm=self.llm, file_ids=file_ids)
         timings["preprocess"] = time.perf_counter() - t0
+        if session is not None:
+            session.snapshot(
+                "preprocess",
+                {
+                    "query": ctx.query,
+                    "hyde": ctx.hyde,
+                    "rewrite": ctx.rewrite,
+                    "lang": ctx.lang,
+                    "regexes": [
+                        {"pattern": r.pattern, "weight": r.weight, "rationale": r.rationale}
+                        for r in ctx.regexes
+                    ],
+                    "file_ids": ctx.file_ids,
+                    "elapsed_seconds": round(timings["preprocess"], 3),
+                },
+            )
 
         t0 = time.perf_counter()
         channel_hits = self._retrieve_all(ctx, channel_timings=channel_timings)
         timings["retrieve"] = time.perf_counter() - t0
+        if session is not None:
+            for name, hits in channel_hits.items():
+                session.snapshot(
+                    f"channels/{name}",
+                    {
+                        "channel": name,
+                        "elapsed_seconds": round(channel_timings.get(name, 0.0), 3),
+                        "hit_count": len(hits),
+                        "hits": [
+                            {
+                                "rank": i + 1,
+                                "file_id": h.file_id,
+                                "page_id": h.page_id,
+                                "score": h.score,
+                                "evidence": h.evidence,
+                            }
+                            for i, h in enumerate(hits)
+                        ],
+                    },
+                )
 
         t0 = time.perf_counter()
         fused = rrf(
@@ -141,9 +199,38 @@ class RAGPipeline:
             top_m=self.config.rrf_top_m,
         )
         timings["rrf"] = time.perf_counter() - t0
+        if session is not None:
+            session.snapshot(
+                "fused",
+                {
+                    "rrf_k": self.config.rrf_k,
+                    "top_m": self.config.rrf_top_m,
+                    "results": [
+                        {"rank": i + 1, "file_id": fid, "page_id": pid, "score": score}
+                        for i, (fid, pid, score) in enumerate(fused)
+                    ],
+                },
+            )
 
         t0 = time.perf_counter()
         candidate_pages = self._load_pages(fused)
+        if session is not None:
+            session.snapshot(
+                "candidates",
+                {
+                    "loaded": [
+                        {
+                            "file_id": p.file_id,
+                            "page_id": p.page_id,
+                            "page_number": p.page_number,
+                            "text_chars": len(p.text_markdown or ""),
+                        }
+                        for p in candidate_pages
+                    ],
+                    "missing_from_fused": len(fused) - len(candidate_pages),
+                },
+            )
+
         reranked = rerank_pages(
             query=query,
             pages=candidate_pages,
@@ -151,6 +238,23 @@ class RAGPipeline:
             client=self.rerank_client,
         )
         timings["rerank"] = time.perf_counter() - t0
+        if session is not None:
+            session.snapshot(
+                "rerank",
+                {
+                    "top_n": self.config.rerank_top_n,
+                    "results": [
+                        {
+                            "rank": i + 1,
+                            "file_id": r.page.file_id,
+                            "page_id": r.page.page_id,
+                            "page_number": r.page.page_number,
+                            "score": r.score,
+                        }
+                        for i, r in enumerate(reranked)
+                    ],
+                },
+            )
 
         t0 = time.perf_counter()
         text = answer_call(
@@ -161,7 +265,7 @@ class RAGPipeline:
         )
         timings["answer"] = time.perf_counter() - t0
 
-        return AnswerResult(
+        result = AnswerResult(
             query=query,
             answer=text,
             pages=reranked,
@@ -171,6 +275,20 @@ class RAGPipeline:
             timings=timings,
             channel_timings=channel_timings,
         )
+        if session is not None:
+            session.finalize(
+                answer=text,
+                summary={
+                    "timings": timings,
+                    "channel_timings": channel_timings,
+                    "channels_hit_counts": {n: len(h) for n, h in channel_hits.items()},
+                    "fused_count": len(fused),
+                    "candidate_count": len(candidate_pages),
+                    "reranked_count": len(reranked),
+                    "answer_chars": len(text),
+                },
+            )
+        return result
 
     # --------------------------------------------------------- internals ----
 
@@ -217,7 +335,8 @@ def answer_query(
     file_ids: Optional[List[str]] = None,
     *,
     pipeline: Optional[RAGPipeline] = None,
+    tracer: Optional[Tracer] = None,
 ) -> AnswerResult:
     """Convenience: run a single query against a default pipeline."""
     pipe = pipeline or RAGPipeline()
-    return pipe.run(query, file_ids=file_ids)
+    return pipe.run(query, file_ids=file_ids, tracer=tracer)
