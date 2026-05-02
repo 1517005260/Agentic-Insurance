@@ -56,6 +56,21 @@ def page_assets_path(file_id: str) -> Path:
     return page_assets_root() / f"{file_id}.json"
 
 
+# Per-file structural inventory (sections derived from Markdown headings;
+# more inventory types may join later). One file per indexed document at
+# <STORAGE_PATH>/inventory/<file_id>.json. Lazily built on first access by
+# ``storage.InventoryStore``; re-ingest invalidates by overwrite.
+INVENTORY_SUBDIR: str = "inventory"
+
+
+def inventory_root() -> Path:
+    return STORAGE_PATH / INVENTORY_SUBDIR
+
+
+def inventory_path(file_id: str) -> Path:
+    return inventory_root() / f"{file_id}.json"
+
+
 # All faiss-backed embedding stores live under one global root. Stores are
 # global (not per-file): new files append into the same index; the meta
 # table carries `file_id` so per-file filtering is still cheap. This makes
@@ -170,6 +185,9 @@ __all__ = [
     "PAGE_ASSETS_SUBDIR",
     "page_assets_root",
     "page_assets_path",
+    "INVENTORY_SUBDIR",
+    "inventory_root",
+    "inventory_path",
     "FAISS_SUBDIR",
     "faiss_root",
     "faiss_dense_dir",
