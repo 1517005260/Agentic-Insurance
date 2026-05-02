@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Tuple, TYPE_CHECKING
 
+from agentic.tools.acquisition._common import err
 from agentic.tools.base import BaseTool
 
 if TYPE_CHECKING:
@@ -26,11 +27,21 @@ class ToolRegistry:
     ) -> Tuple[str, Dict[str, Any]]:
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found", {"error": "tool_not_found"}
+            return (
+                err(
+                    "tool_not_found",
+                    f"No tool named {name!r} is registered.",
+                    available=sorted(self._tools.keys()),
+                ),
+                {"error": "tool_not_found"},
+            )
         try:
             return tool.execute(context, **kwargs)
-        except Exception as e:
-            return f"Error executing tool: {str(e)}", {"error": str(e)}
+        except Exception as exc:
+            return (
+                err("tool_exception", f"{type(exc).__name__}: {exc}", tool=name),
+                {"error": "tool_exception"},
+            )
 
     def list_tools(self) -> List[str]:
         return list(self._tools.keys())

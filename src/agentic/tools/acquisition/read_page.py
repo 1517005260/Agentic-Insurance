@@ -8,22 +8,30 @@ The schema accepts either:
 * or ``file_id`` + ``page_ids`` (per-file page IDs, joined automatically)
 
 Returns a structured ``PageObservation`` per page: Markdown text, embedded
-tables, image refs, optional VLM summary, source citation. The mode parameter
-selects channels:
+tables, image refs, optional VLM summary, source citation. The mode
+parameter selects channels:
 
 * ``text``           — Markdown only.
-* ``text_with_img``  — Markdown + VLM read of the rendered page image.
+* ``text_with_img``  — Markdown + parallel VLM read of the rendered page image.
 * ``auto``           — defer to each page's own ``page_mode`` flag.
 
-VLM is pluggable via ``vlm_reader``; when unset (or no image), the VLM
-block is empty.
+VLM is pluggable via the ``vlm_reader`` callable; if not supplied the
+tool builds the default OpenAI-compat reader from the ``VLM_*`` env
+vars. The reader is invoked **in parallel across pages** so a multi-
+page read does not block sequentially on each VLM HTTP round-trip.
+VLM failures degrade gracefully — Markdown is still returned and the
+error is surfaced on the per-page observation under ``vlm_error``.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import tiktoken
 
+from agentic.tools.acquisition._common import err
+from agentic.tools.acquisition._vlm import VlmReader, default_vlm_reader
 from agentic.tools.base import BaseTool
 from storage.page_store import PageAsset, PageStore, make_global_id
 
@@ -31,14 +39,27 @@ if TYPE_CHECKING:
     from agentic.core.context import AgentContext
 
 
+logger = logging.getLogger(__name__)
+
+
 _VALID_MODES = {"auto", "text", "text_with_img"}
+_DEFAULT_VLM_PARALLELISM = 4
 
 
 class ReadPageTool(BaseTool):
-    def __init__(self, page_store: PageStore, vlm_reader=None):
+    def __init__(
+        self,
+        page_store: PageStore,
+        vlm_reader: Optional[VlmReader] = None,
+        vlm_parallelism: int = _DEFAULT_VLM_PARALLELISM,
+    ):
         self.page_store = page_store
-        self.vlm_reader = vlm_reader
-        self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
+        self.vlm_reader = vlm_reader if vlm_reader is not None else default_vlm_reader()
+        self.vlm_parallelism = max(1, int(vlm_parallelism))
+        try:
+            self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
+        except Exception:
+            self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
     @property
     def name(self) -> str:
@@ -58,8 +79,13 @@ class ReadPageTool(BaseTool):
                     "(e.g. 'axa_abcd1234/p_0001'). Pass them in `page_ids`. "
                     "Alternatively, supply `file_id` and pass per-file page ids "
                     "in `page_ids` (e.g. 'p_0001').\n\n"
-                    "Each result is a structured PageObservation. Previously "
-                    "read pages are flagged so you do not re-cite stale snippets."
+                    "Each new result is a structured PageObservation containing "
+                    "Markdown text, embedded tables, image refs, and (for "
+                    "figure/table/chart-heavy pages) a VLM summary of the "
+                    "rendered page image. Pages already read in this trajectory "
+                    "are returned as a stub with `status='already_read'` and NO "
+                    "Markdown — the model is expected to recall the prior read "
+                    "from earlier turns rather than re-fetch content."
                 ),
                 "parameters": {
                     "type": "object",
@@ -101,14 +127,34 @@ class ReadPageTool(BaseTool):
 
     def _read_vlm(self, page: PageAsset) -> Dict[str, Any]:
         if self.vlm_reader is None or not page.page_image_path:
-            return {"vlm_summary": "", "vlm_extracted_items": []}
-        result = self.vlm_reader(page.page_image_path, page) or {}
-        return {
-            "vlm_summary": result.get("summary", ""),
-            "vlm_extracted_items": result.get("items", []),
+            return {
+                "vlm_summary": "",
+                "vlm_extracted_items": [],
+                "vlm_error": None if page.page_image_path else "no_page_image",
+            }
+        try:
+            result = self.vlm_reader(page.page_image_path, page) or {}
+        except Exception as exc:
+            logger.warning("read_page: vlm_reader raised: %s", exc)
+            return {
+                "vlm_summary": "",
+                "vlm_extracted_items": [],
+                "vlm_error": "exception",
+                "vlm_error_message": str(exc),
+            }
+        out: Dict[str, Any] = {
+            "vlm_summary": result.get("summary", "") or "",
+            "vlm_extracted_items": result.get("items", []) or [],
         }
+        if result.get("error"):
+            out["vlm_error"] = result["error"]
+            if result.get("error_message"):
+                out["vlm_error_message"] = result["error_message"]
+        return out
 
     def _build_observation(self, page: PageAsset, mode: str) -> Dict[str, Any]:
+        # Build a Markdown-only skeleton; VLM merging happens after the
+        # parallel batch finishes (see ``execute``).
         observation: Dict[str, Any] = {
             "observation_type": "PageObservation",
             "global_id": page.global_id,
@@ -118,11 +164,8 @@ class ReadPageTool(BaseTool):
             "page_mode": mode,
         }
         observation.update(self._read_text(page))
-        if mode == "text_with_img":
-            observation.update(self._read_vlm(page))
-        else:
-            observation["vlm_summary"] = ""
-            observation["vlm_extracted_items"] = []
+        observation["vlm_summary"] = ""
+        observation["vlm_extracted_items"] = []
         observation["source_citation"] = {
             "file_id": page.file_id,
             "page_number": page.page_number,
@@ -141,12 +184,19 @@ class ReadPageTool(BaseTool):
             if page_id is not None:
                 page_ids = [str(page_id)]
             else:
-                return "Error: No page IDs provided", {"retrieved_tokens": 0}
+                return (
+                    err("invalid_argument", "No page IDs provided. Pass `page_ids` (list)."),
+                    {"retrieved_tokens": 0, "error": "invalid_argument"},
+                )
 
         if mode not in _VALID_MODES:
             return (
-                f"Error: invalid mode '{mode}'. Expected one of {sorted(_VALID_MODES)}.",
-                {"retrieved_tokens": 0, "error": "invalid_mode"},
+                err(
+                    "invalid_argument",
+                    f"Invalid mode {mode!r}. Expected one of {sorted(_VALID_MODES)}.",
+                    mode=mode,
+                ),
+                {"retrieved_tokens": 0, "error": "invalid_argument"},
             )
 
         # Normalize each page_id to a global id.
@@ -166,6 +216,11 @@ class ReadPageTool(BaseTool):
         not_found: List[str] = []
         total_tokens = 0
 
+        # Pass 1: build the Markdown skeletons synchronously and collect
+        # the (index, page) pairs that need a VLM call. We mark pages
+        # read AFTER the VLM batch so a failed batch doesn't poison the
+        # session's already-read set.
+        vlm_targets: List[Tuple[int, PageAsset]] = []
         for pid in normalized:
             page = self.page_store.get(pid)
             if page is None:
@@ -193,16 +248,60 @@ class ReadPageTool(BaseTool):
             obs = self._build_observation(page, effective_mode)
             observations.append(obs)
             new_pages_read.append(gid)
-            total_tokens += len(self.tokenizer.encode(obs.get("text_markdown", "")))
+            if effective_mode == "text_with_img":
+                vlm_targets.append((len(observations) - 1, page))
+
+        # Pass 2: parallel VLM calls for the figure-heavy pages.
+        if vlm_targets and self.vlm_reader is not None:
+            workers = min(self.vlm_parallelism, len(vlm_targets))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._read_vlm, page): idx for idx, page in vlm_targets
+                }
+                for fut, idx in futures.items():
+                    try:
+                        observations[idx].update(fut.result())
+                    except Exception as exc:
+                        logger.warning("read_page: VLM future raised: %s", exc)
+                        observations[idx].update(
+                            {
+                                "vlm_summary": "",
+                                "vlm_extracted_items": [],
+                                "vlm_error": "exception",
+                                "vlm_error_message": str(exc),
+                            }
+                        )
+
+        # Pass 3: token accounting and read-set marking. Token cost is
+        # measured against the final text + VLM summary so an empty VLM
+        # block does not inflate the cost.
+        for obs in observations:
+            if obs.get("status") in {"already_read", "not_found"}:
+                continue
+            total_tokens += len(self.tokenizer.encode(obs.get("text_markdown", "") or ""))
             if obs.get("vlm_summary"):
                 total_tokens += len(self.tokenizer.encode(obs["vlm_summary"]))
+            context.mark_page_as_read(obs["global_id"])
 
-            context.mark_page_as_read(gid)
-
+        # Top-level summary so the agent can tell at a glance whether
+        # any page failed without iterating per-result statuses (a
+        # full-fail batch otherwise looks like a successful tool call
+        # with cryptic-looking stubs).
+        summary = {
+            "requested": len(normalized),
+            "new_pages_read": len(new_pages_read),
+            "already_read": len(already_read),
+            "not_found": len(not_found),
+        }
         tool_result = json.dumps(
-            {"observation_type": "ReadPageResult", "results": observations},
+            {
+                "observation_type": "ReadPageResult",
+                "ok": True,
+                "summary": summary,
+                "results": observations,
+            },
             ensure_ascii=False,
-            indent=2,
+            separators=(",", ":"),
         )
 
         context.add_retrieval_log(
