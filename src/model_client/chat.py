@@ -146,9 +146,22 @@ class LLMClient:
         result = response.json()
         usage = result.get("usage", {})
 
+        # Cached-token reporting varies by provider:
+        #   OpenAI / DeepSeek / Anthropic-via-relay typically expose it under
+        #   ``usage.prompt_tokens_details.cached_tokens``; a few self-hosted
+        #   relays use ``usage.prompt_cache_hit_tokens`` instead. We prefer
+        #   the standard nested key and fall back to the legacy flat key.
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        cached_tokens = (
+            prompt_details.get("cached_tokens")
+            or usage.get("prompt_cache_hit_tokens")
+            or 0
+        )
+
         return {
             "message": result["choices"][0]["message"],
             "input_tokens": usage.get("prompt_tokens", 0),
+            "cached_tokens": int(cached_tokens),
             "output_tokens": usage.get("completion_tokens", 0),
             "cost": self.calculate_cost(usage),
             "raw_response": result,
