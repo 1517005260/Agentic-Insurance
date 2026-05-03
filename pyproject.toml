@@ -53,6 +53,10 @@ dependencies = [
     "opencc-python-reimplemented>=0.1.7",
     "regex>=2026.4.4",
     "spacy-pkuseg>=0.0.27",
+    "babel>=2.18.0",
+    "dateparser>=1.4.0",
+    "portion>=2.6.1",
+    "pydantic>=2.13.3",
 ]
 
 [project.optional-dependencies]
