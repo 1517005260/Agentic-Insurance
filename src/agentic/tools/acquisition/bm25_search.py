@@ -148,19 +148,39 @@ class Bm25SearchTool(BaseTool):
         top_k: int = 10,
     ):
         if not query or not str(query).strip():
-            return err("invalid_argument", "`query` must be a non-empty string."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`query` must be a non-empty string.",
+                remediation="Pass `query` as a non-empty free-text string; punctuation is stripped automatically.",
+                valid_example={"query": "AFYP rebate"},
+            ), {"error": "invalid_argument"}
         scope, scope_err = parse_scope(
             file_ids, page_range, section_ids, inventory=self.inventory
         )
         if scope_err is not None:
-            return err("invalid_argument", scope_err), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                scope_err,
+                remediation="Fix the scope arguments per the message: file_ids must come from list_files; page_range must be [start, end]; section_ids must come from toc.",
+                valid_example={"file_ids": ["<file_id>"], "page_range": [1, 50]},
+            ), {"error": "invalid_argument"}
 
         try:
             top_k_int = int(top_k)
         except (TypeError, ValueError):
-            return err("invalid_argument", "`top_k` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be an integer.",
+                remediation="Pass `top_k` as a positive integer (default 10, max 50).",
+                valid_example={"top_k": 10},
+            ), {"error": "invalid_argument"}
         if top_k_int < 1:
-            return err("invalid_argument", "`top_k` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be >= 1.",
+                remediation="Set `top_k` to a positive integer (default 10, max 50).",
+                valid_example={"top_k": 10},
+            ), {"error": "invalid_argument"}
         limit = min(top_k_int, 50)
 
         idx = self.index
@@ -169,6 +189,7 @@ class Bm25SearchTool(BaseTool):
                 err(
                     "index_unavailable",
                     "BM25 index is not built or unreadable.",
+                    remediation="The BM25 index is not built; fall back to semantic_search or pattern_search for this query, or ask the operator to build the BM25 index.",
                     index_path=str(self.index_path),
                 ),
                 {"error": "index_unavailable"},
@@ -177,14 +198,24 @@ class Bm25SearchTool(BaseTool):
         sanitized = _sanitize_query(query).strip()
         if not sanitized:
             return (
-                err("invalid_argument", "`query` reduces to empty after punctuation stripping."),
+                err(
+                    "invalid_argument",
+                    "`query` reduces to empty after punctuation stripping.",
+                    remediation="Re-issue with at least one alphanumeric token in the query (the tokenizer strips +-!(){}[]^\"~*?:\\/ before parsing).",
+                    valid_example={"query": "Premium USD"},
+                ),
                 {"error": "invalid_argument"},
             )
         try:
             q = idx.parse_query(sanitized, default_field_names=["text"])
         except Exception as exc:
             return (
-                err("query_parse_failed", f"Tantivy could not parse the query: {exc}", query=sanitized),
+                err(
+                    "query_parse_failed",
+                    f"Tantivy could not parse the query: {exc}",
+                    remediation="Simplify the query to plain alphanumeric tokens; remove anything that looks like Lucene/tantivy operator syntax.",
+                    query=sanitized,
+                ),
                 {"error": "query_parse_failed"},
             )
 
@@ -197,7 +228,12 @@ class Bm25SearchTool(BaseTool):
             raw_hits = searcher.search(q, limit=depth).hits
         except Exception as exc:
             return (
-                err("search_failed", f"Tantivy search raised: {exc}", query=sanitized),
+                err(
+                    "search_failed",
+                    f"Tantivy search raised: {exc}",
+                    remediation="Retry with a simpler query (fewer tokens, no special characters); if the failure repeats, fall back to semantic_search or pattern_search.",
+                    query=sanitized,
+                ),
                 {"error": "search_failed"},
             )
 

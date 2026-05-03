@@ -120,18 +120,33 @@ class PatternSearchTool(BaseTool):
         section_ids: Optional[List[str]] = None,
     ):
         if not pattern or not str(pattern).strip():
-            return err("invalid_argument", "`pattern` must be a non-empty string."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`pattern` must be a non-empty string.",
+                remediation="Pass `pattern` as a non-empty Python regex; anchor it with literal terms (bare '.*' / '.+' will match every page and waste budget).",
+                valid_example={"pattern": r"AFYP\s+rebate"},
+            ), {"error": "invalid_argument"}
         scope, scope_err = parse_scope(
             file_ids, page_range, section_ids, inventory=self.inventory
         )
         if scope_err is not None:
-            return err("invalid_argument", scope_err), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                scope_err,
+                remediation="Fix the scope arguments per the message: file_ids must come from list_files; page_range must be [start, end]; section_ids must come from toc.",
+                valid_example={"file_ids": ["<file_id>"]},
+            ), {"error": "invalid_argument"}
 
         try:
             compiled = ureg.compile(pattern, ureg.IGNORECASE)
         except Exception as exc:
             return (
-                err("invalid_regex", f"Pattern failed to compile: {exc}", pattern=pattern),
+                err(
+                    "invalid_regex",
+                    f"Pattern failed to compile: {exc}",
+                    remediation="Fix the regex syntax (Python `regex` module flavor; supports \\p{Han} etc.); escape special characters like '(', ')', '\\', '.' if matching literally.",
+                    pattern=pattern,
+                ),
                 {"error": "invalid_regex"},
             )
 

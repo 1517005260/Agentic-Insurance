@@ -150,9 +150,19 @@ class ListFilesTool(BaseTool):
         try:
             limit = int(recent_n) if recent_n is not None else _DEFAULT_RECENT_N
         except (TypeError, ValueError):
-            return err("invalid_argument", "`recent_n` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`recent_n` must be an integer.",
+                remediation="Pass `recent_n` as a positive integer (default 10), or omit it.",
+                valid_example={"recent_n": 10},
+            ), {"error": "invalid_argument"}
         if limit < 1:
-            return err("invalid_argument", "`recent_n` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`recent_n` must be >= 1.",
+                remediation="Pass `recent_n` as an integer >= 1 (e.g. 10).",
+                valid_example={"recent_n": 10},
+            ), {"error": "invalid_argument"}
 
         compiled = None
         if filename_regex:
@@ -160,7 +170,12 @@ class ListFilesTool(BaseTool):
                 compiled = ureg.compile(filename_regex, ureg.IGNORECASE)
             except Exception as exc:
                 return (
-                    err("invalid_regex", f"`filename_regex` failed to compile: {exc}", pattern=filename_regex),
+                    err(
+                        "invalid_regex",
+                        f"`filename_regex` failed to compile: {exc}",
+                        remediation="Re-emit `filename_regex` as a valid Python regex (the `regex` module flavor); escape literals like '.' and '(' if matching them literally.",
+                        pattern=filename_regex,
+                    ),
                     {"error": "invalid_regex"},
                 )
 

@@ -102,14 +102,29 @@ class TocTool(BaseTool):
         max_depth: int = _DEFAULT_MAX_DEPTH,
     ):
         if not file_id or not str(file_id).strip():
-            return err("invalid_argument", "`file_id` is required."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`file_id` is required.",
+                remediation="Call list_files first to discover valid file_ids in this corpus, then pass one as `file_id`.",
+                valid_example={"file_id": "<file_id>"},
+            ), {"error": "invalid_argument"}
         try:
             depth_cap = int(max_depth)
         except (TypeError, ValueError):
-            return err("invalid_argument", "`max_depth` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`max_depth` must be an integer.",
+                remediation="Pass `max_depth` as an integer in [1, 6] (default 3), or omit the field.",
+                valid_example={"max_depth": 3},
+            ), {"error": "invalid_argument"}
         if not 1 <= depth_cap <= 6:
             return (
-                err("invalid_argument", "`max_depth` must be between 1 and 6."),
+                err(
+                    "invalid_argument",
+                    "`max_depth` must be between 1 and 6.",
+                    remediation="Set `max_depth` to a value in [1, 6] (default 3 keeps #, ##, ### headings).",
+                    valid_example={"max_depth": 3},
+                ),
                 {"error": "invalid_argument"},
             )
 
@@ -120,7 +135,12 @@ class TocTool(BaseTool):
         has_pages = any(gid.startswith(file_id_s + "/") for gid in self.page_store.ids())
         if not has_pages:
             return (
-                err("file_not_found", f"No pages indexed for file_id={file_id_s!r}.", file_id=file_id_s),
+                err(
+                    "file_not_found",
+                    f"No pages indexed for file_id={file_id_s!r}.",
+                    remediation="Call list_files to enumerate ingested file_ids in this corpus, then pass one of those ids as `file_id`. The id you supplied is unknown or its parse never completed.",
+                    file_id=file_id_s,
+                ),
                 {"error": "file_not_found"},
             )
 

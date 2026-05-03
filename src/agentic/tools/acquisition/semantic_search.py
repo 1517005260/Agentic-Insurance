@@ -193,12 +193,22 @@ class SemanticSearchTool(BaseTool):
         channels: Optional[List[str]] = None,
     ):
         if not query or not str(query).strip():
-            return err("invalid_argument", "`query` must be a non-empty string."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`query` must be a non-empty string.",
+                remediation="Pass `query` as a non-empty natural-language string (a HyDE-style fact-rich draft answer often improves recall).",
+                valid_example={"query": "What is the maximum AFYP rebate percentage?"},
+            ), {"error": "invalid_argument"}
         scope, scope_err = parse_scope(
             file_ids, page_range, section_ids, inventory=self.inventory
         )
         if scope_err is not None:
-            return err("invalid_argument", scope_err), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                scope_err,
+                remediation="Fix the scope arguments per the message: file_ids must be a list of ids from list_files; page_range must be [start, end] with 1<=start<=end; section_ids must come from toc.",
+                valid_example={"file_ids": ["<file_id>"], "page_range": [1, 50], "section_ids": ["<file_id>:sec_001"]},
+            ), {"error": "invalid_argument"}
         if (scope.page_range is not None or scope.section_ranges is not None) and self.page_store is None:
             # Embedding stores carry only file_id/page_id meta; without a
             # PageStore we cannot resolve page_number, so a page_range or
@@ -207,6 +217,7 @@ class SemanticSearchTool(BaseTool):
                 err(
                     "misconfigured",
                     "page_range / section_ids filtering requires a PageStore to be wired into the tool.",
+                    remediation="Drop `page_range` and `section_ids` and rely on `file_ids` only; this deployment does not have a PageStore wired into semantic_search.",
                 ),
                 {"error": "misconfigured"},
             )
@@ -214,15 +225,30 @@ class SemanticSearchTool(BaseTool):
         try:
             top_k_int = int(top_k)
         except (TypeError, ValueError):
-            return err("invalid_argument", "`top_k` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be an integer.",
+                remediation="Pass `top_k` as a positive integer (default 10, max 50).",
+                valid_example={"top_k": 10},
+            ), {"error": "invalid_argument"}
         if top_k_int < 1:
-            return err("invalid_argument", "`top_k` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be >= 1.",
+                remediation="Set `top_k` to a positive integer (default 10, max 50).",
+                valid_example={"top_k": 10},
+            ), {"error": "invalid_argument"}
         limit = min(top_k_int, 50)
 
         wanted = self._normalize_channels(channels)
         if wanted is None:
             return (
-                err("invalid_argument", "`channels` must be a subset of ['text', 'vision']."),
+                err(
+                    "invalid_argument",
+                    "`channels` must be a subset of ['text', 'vision'].",
+                    remediation="Set `channels` to ['text'], ['vision'], ['text','vision'], or omit it (default both).",
+                    valid_example={"channels": ["text", "vision"]},
+                ),
                 {"error": "invalid_argument"},
             )
 

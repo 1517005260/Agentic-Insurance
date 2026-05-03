@@ -165,12 +165,22 @@ class CodeRunTool(BaseTool):
         purpose: Optional[str] = None,
     ):
         if not code or not str(code).strip():
-            return err("invalid_argument", "`code` must be a non-empty string."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`code` must be a non-empty string.",
+                remediation="Pass `code` as a non-empty Python source string; assign to `OUTPUT` to return a structured value.",
+                valid_example={"code": "OUTPUT = sum(INPUTS['xs'])", "inputs": {"xs": [1, 2, 3]}},
+            ), {"error": "invalid_argument"}
         try:
             inputs_json = json.dumps(inputs or {}, ensure_ascii=False)
         except (TypeError, ValueError) as exc:
             return (
-                err("invalid_argument", f"`inputs` must be JSON-serializable: {exc}"),
+                err(
+                    "invalid_argument",
+                    f"`inputs` must be JSON-serializable: {exc}",
+                    remediation="Re-emit `inputs` containing only JSON-serializable values (str / int / float / bool / null / list / dict); replace any custom Python objects with primitives.",
+                    valid_example={"inputs": {"xs": [1, 2, 3]}},
+                ),
                 {"error": "invalid_argument"},
             )
         inputs_bytes = inputs_json.encode("utf-8")
@@ -180,6 +190,7 @@ class CodeRunTool(BaseTool):
                     "invalid_argument",
                     f"`inputs` is too large ({len(inputs_bytes)} bytes); "
                     f"max is {_INPUTS_LIMIT_BYTES}.",
+                    remediation=f"Trim `inputs` to <= {_INPUTS_LIMIT_BYTES} bytes when JSON-serialized; load large data inside the snippet via `code` instead of passing it through `inputs`.",
                     inputs_bytes=len(inputs_bytes),
                     limit=_INPUTS_LIMIT_BYTES,
                 ),
@@ -203,6 +214,7 @@ class CodeRunTool(BaseTool):
                     err(
                         "timeout",
                         f"Subprocess exceeded the {self.wall_seconds}s wall-clock limit and was killed.",
+                        remediation=f"Simplify the snippet so it runs in under {self.wall_seconds}s wall-clock and {self.cpu_seconds}s CPU; avoid unbounded loops, large array allocations, or sympy-heavy symbolic work.",
                         elapsed_ms=elapsed_ms,
                     ),
                     {"error": "timeout", "elapsed_ms": elapsed_ms},

@@ -217,6 +217,8 @@ class GraphExploreTool(BaseTool):
                 err(
                     "invalid_argument",
                     f"`mode` must be one of {sorted(_VALID_MODES)}.",
+                    remediation="Set `mode` to 'ppr' (free-text), 'neighbors' (BFS from seeds), or 'entity_lookup' (surface-form to entity).",
+                    valid_example={"mode": "ppr"},
                 ),
                 {"error": "invalid_argument"},
             )
@@ -225,6 +227,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "graph_unavailable",
                     "LinearRAG graph is not built; ingest the corpus first.",
+                    remediation="Fall back to semantic_search / bm25_search / pattern_search for this query — the entity graph is not available in this corpus.",
                 ),
                 {"error": "graph_unavailable"},
             )
@@ -240,7 +243,12 @@ class GraphExploreTool(BaseTool):
     def _run_ppr(self, context: "AgentContext", **kwargs):
         question = (kwargs.get("question") or "").strip()
         if not question:
-            return err("invalid_argument", "mode='ppr' requires `question`."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "mode='ppr' requires `question`.",
+                remediation="Add `question` (free-text natural-language query) to the call; PPR uses NER to seed the random walk.",
+                valid_example={"mode": "ppr", "question": "Which sections discuss premium rebates?"},
+            ), {"error": "invalid_argument"}
         scope, scope_err = parse_scope(
             kwargs.get("file_ids"),
             kwargs.get("page_range"),
@@ -248,14 +256,29 @@ class GraphExploreTool(BaseTool):
             inventory=self.inventory,
         )
         if scope_err is not None:
-            return err("invalid_argument", scope_err), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                scope_err,
+                remediation="Fix the scope arguments per the message: file_ids must come from list_files; page_range must be [start, end]; section_ids must come from toc.",
+                valid_example={"file_ids": ["<file_id>"]},
+            ), {"error": "invalid_argument"}
 
         try:
             top_k_int = int(kwargs.get("top_k", _DEFAULT_TOP_K))
         except (TypeError, ValueError):
-            return err("invalid_argument", "`top_k` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be an integer.",
+                remediation="Pass `top_k` as a positive integer (default 20, max 50).",
+                valid_example={"top_k": 20},
+            ), {"error": "invalid_argument"}
         if top_k_int < 1:
-            return err("invalid_argument", "`top_k` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be >= 1.",
+                remediation="Set `top_k` to a positive integer (default 20, max 50).",
+                valid_example={"top_k": 20},
+            ), {"error": "invalid_argument"}
         limit = min(top_k_int, _MAX_TOP_K)
 
         ctx = QueryContext(
@@ -270,7 +293,11 @@ class GraphExploreTool(BaseTool):
             channel_hits = self._channel.retrieve(ctx)
         except Exception as exc:
             logger.exception("graph_explore[ppr] failed: %s", exc)
-            return err("ppr_failed", f"PPR raised: {exc}"), {"error": "ppr_failed"}
+            return err(
+                "ppr_failed",
+                f"PPR raised: {exc}",
+                remediation="Retry with a simpler question or fall back to semantic_search / bm25_search; the PPR channel hit an internal error.",
+            ), {"error": "ppr_failed"}
 
         # Apply the page_range gate post-hoc (PPR channel honors file_ids
         # but not page_range — the channel was designed for the global RAG
@@ -335,28 +362,58 @@ class GraphExploreTool(BaseTool):
     def _run_neighbors(self, context: "AgentContext", **kwargs):
         seeds = kwargs.get("seeds") or []
         if not isinstance(seeds, (list, tuple)) or not seeds:
-            return err("invalid_argument", "mode='neighbors' requires a non-empty `seeds` list."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "mode='neighbors' requires a non-empty `seeds` list.",
+                remediation="Pass `seeds` as a list of entity surface forms (e.g. 'AXA') and/or page references (e.g. 'fileA_xxx/p_0001'). Use mode='entity_lookup' first to discover canonical surface forms.",
+                valid_example={"mode": "neighbors", "seeds": ["AXA", "<file_id>/p_0001"]},
+            ), {"error": "invalid_argument"}
 
         try:
             hops = int(kwargs.get("hops", _DEFAULT_HOPS))
         except (TypeError, ValueError):
-            return err("invalid_argument", "`hops` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`hops` must be an integer.",
+                remediation="Pass `hops` as an integer in [1, 3] (default 1).",
+                valid_example={"hops": 1},
+            ), {"error": "invalid_argument"}
         if not 1 <= hops <= _MAX_HOPS:
             return (
-                err("invalid_argument", f"`hops` must be 1..{_MAX_HOPS}."),
+                err(
+                    "invalid_argument",
+                    f"`hops` must be 1..{_MAX_HOPS}.",
+                    remediation=f"Set `hops` to an integer in [1, {_MAX_HOPS}] (default 1).",
+                    valid_example={"hops": 1},
+                ),
                 {"error": "invalid_argument"},
             )
         try:
             top_k_int = int(kwargs.get("top_k", _DEFAULT_TOP_K))
         except (TypeError, ValueError):
-            return err("invalid_argument", "`top_k` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be an integer.",
+                remediation="Pass `top_k` as a positive integer (default 20, max 50).",
+                valid_example={"top_k": 20},
+            ), {"error": "invalid_argument"}
         if top_k_int < 1:
-            return err("invalid_argument", "`top_k` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be >= 1.",
+                remediation="Set `top_k` to a positive integer (default 20, max 50).",
+                valid_example={"top_k": 20},
+            ), {"error": "invalid_argument"}
         limit = min(top_k_int, _MAX_TOP_K)
 
         scope, scope_err = parse_scope(kwargs.get("file_ids"), None)
         if scope_err is not None:
-            return err("invalid_argument", scope_err), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                scope_err,
+                remediation="Fix `file_ids`: pass a list of ids returned by list_files, or omit the field for corpus-wide neighbors.",
+                valid_example={"file_ids": ["<file_id>"]},
+            ), {"error": "invalid_argument"}
 
         resolved = self._resolve_seeds(seeds)
         if not resolved["found"]:
@@ -364,6 +421,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "no_seeds_resolved",
                     "None of the seeds could be matched to a graph node.",
+                    remediation="Call mode='entity_lookup' with each surface form first to find the canonical entity, then pass its hash_id (or the matched surface) as a seed; for page seeds use 'file_id/p_NNNN' from any retrieval observation.",
                     seeds=list(seeds),
                     unresolved=resolved["unresolved"],
                 ),
@@ -682,19 +740,38 @@ class GraphExploreTool(BaseTool):
     def _run_entity_lookup(self, context: "AgentContext", **kwargs):
         surface = (kwargs.get("surface") or "").strip()
         if not surface:
-            return err("invalid_argument", "mode='entity_lookup' requires `surface`."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "mode='entity_lookup' requires `surface`.",
+                remediation="Pass `surface` as the entity name to look up (e.g. 'AXA' or 'AXA Hong Kong').",
+                valid_example={"mode": "entity_lookup", "surface": "AXA"},
+            ), {"error": "invalid_argument"}
         try:
             top_k_int = int(kwargs.get("top_k", 5))
         except (TypeError, ValueError):
-            return err("invalid_argument", "`top_k` must be an integer."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be an integer.",
+                remediation="Pass `top_k` as a positive integer (default 5, max 10).",
+                valid_example={"top_k": 5},
+            ), {"error": "invalid_argument"}
         if top_k_int < 1:
-            return err("invalid_argument", "`top_k` must be >= 1."), {"error": "invalid_argument"}
+            return err(
+                "invalid_argument",
+                "`top_k` must be >= 1.",
+                remediation="Set `top_k` to a positive integer (default 5, max 10).",
+                valid_example={"top_k": 5},
+            ), {"error": "invalid_argument"}
         limit = min(top_k_int, 10)
 
         store = self._channel.entity_store
         if len(store) == 0:
             return (
-                err("graph_unavailable", "Entity store is empty; index the corpus first."),
+                err(
+                    "graph_unavailable",
+                    "Entity store is empty; index the corpus first.",
+                    remediation="Fall back to semantic_search / bm25_search / pattern_search — the entity layer is not built for this corpus.",
+                ),
                 {"error": "graph_unavailable"},
             )
 
@@ -702,7 +779,11 @@ class GraphExploreTool(BaseTool):
             emb = self._channel.embedding_client.encode(surface)
         except Exception as exc:
             return (
-                err("embed_failed", f"Embedding the surface failed: {exc}"),
+                err(
+                    "embed_failed",
+                    f"Embedding the surface failed: {exc}",
+                    remediation="Retry once; if the failure repeats, fall back to bm25_search or pattern_search using the surface form as the query.",
+                ),
                 {"error": "embed_failed"},
             )
         emb_arr = np.asarray(emb)

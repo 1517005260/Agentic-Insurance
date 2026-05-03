@@ -79,13 +79,14 @@ class ReadPageTool(BaseTool):
                     "(e.g. 'axa_abcd1234/p_0001'). Pass them in `page_ids`. "
                     "Alternatively, supply `file_id` and pass per-file page ids "
                     "in `page_ids` (e.g. 'p_0001').\n\n"
-                    "Each new result is a structured PageObservation containing "
+                    "Every result is a structured PageObservation containing "
                     "Markdown text, embedded tables, image refs, and (for "
                     "figure/table/chart-heavy pages) a VLM summary of the "
-                    "rendered page image. Pages already read in this trajectory "
-                    "are returned as a stub with `status='already_read'` and NO "
-                    "Markdown — the model is expected to recall the prior read "
-                    "from earlier turns rather than re-fetch content."
+                    "rendered page image. A re-fetch of a page already read "
+                    "in this trajectory still returns the full snapshot but "
+                    "with `status='already_read'` set so the agent can decide "
+                    "whether the prior read is stale; the snapshot is always "
+                    "available so WitnessClaim citations can quote spans."
                 ),
                 "parameters": {
                     "type": "object",
@@ -185,7 +186,12 @@ class ReadPageTool(BaseTool):
                 page_ids = [str(page_id)]
             else:
                 return (
-                    err("invalid_argument", "No page IDs provided. Pass `page_ids` (list)."),
+                    err(
+                        "invalid_argument",
+                        "No page IDs provided. Pass `page_ids` (list).",
+                        remediation="Pass `page_ids` as a list of global ids ('file_id/page_id') or per-file page ids (with `file_id` set). Discover page_ids from a search tool's results first.",
+                        valid_example={"page_ids": ["<file_id>/p_0001", "<file_id>/p_0002"]},
+                    ),
                     {"retrieved_tokens": 0, "error": "invalid_argument"},
                 )
 
@@ -194,6 +200,8 @@ class ReadPageTool(BaseTool):
                 err(
                     "invalid_argument",
                     f"Invalid mode {mode!r}. Expected one of {sorted(_VALID_MODES)}.",
+                    remediation="Set `mode` to 'auto' (default), 'text', or 'text_with_img'; or omit the field.",
+                    valid_example={"mode": "auto"},
                     mode=mode,
                 ),
                 {"retrieved_tokens": 0, "error": "invalid_argument"},
@@ -231,21 +239,20 @@ class ReadPageTool(BaseTool):
             gid = page.global_id
             effective_mode = self._resolve_effective_mode(page, mode)
 
+            obs = self._build_observation(page, effective_mode)
             if context.is_page_read(gid):
+                # The page was already read once this session; the
+                # ProofAgent still needs the text snapshot to build
+                # WitnessClaim citations against, so we always return
+                # the full PageObservation. The repeat marker is
+                # informational — token-budget bookkeeping treats this
+                # call as a re-read.
+                obs["status"] = "already_read"
+                obs["note"] = "Re-read; full snapshot returned for citation."
                 already_read.append(gid)
-                observations.append(
-                    {
-                        "observation_type": "PageObservation",
-                        "global_id": gid,
-                        "file_id": page.file_id,
-                        "page_id": page.page_id,
-                        "status": "already_read",
-                        "note": "This page has been read before in the current session.",
-                    }
-                )
+                observations.append(obs)
                 continue
 
-            obs = self._build_observation(page, effective_mode)
             observations.append(obs)
             new_pages_read.append(gid)
             if effective_mode == "text_with_img":

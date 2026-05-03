@@ -32,17 +32,38 @@ def ok(observation_type: str, **fields: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def err(code: str, message: str, **context: Any) -> str:
-    """Serialize a structured error. The agent sees `error.code` and can
-    branch on it; humans see `error.message` for diagnosis.
+def err(
+    code: str,
+    message: str,
+    *,
+    remediation: Optional[str] = None,
+    valid_example: Optional[Any] = None,
+    affected_fields: Optional[list] = None,
+    **context: Any,
+) -> str:
+    """Serialize a structured error envelope for the LLM.
+
+    Every error to the LLM should answer three questions: what failed
+    (``code``), why (``message``), and what to do next (``remediation``
+    and optionally ``valid_example``). When multiple fields fail at
+    once (typically pydantic validation), ``affected_fields`` lists
+    every distinct top-level field with errors so the LLM repairs all
+    of them in one turn instead of looping on the first.
     """
+    error: Dict[str, Any] = {"code": code, "message": message}
+    if remediation is not None:
+        error["remediation"] = remediation
+    if valid_example is not None:
+        error["valid_example"] = valid_example
+    if affected_fields:
+        error["affected_fields"] = list(affected_fields)
+    if context:
+        error["context"] = context
     payload: Dict[str, Any] = {
         "observation_type": "ToolError",
         "ok": False,
-        "error": {"code": code, "message": message},
+        "error": error,
     }
-    if context:
-        payload["error"]["context"] = context
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
