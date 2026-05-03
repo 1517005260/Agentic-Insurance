@@ -6,15 +6,24 @@ globally-unique strings of the form ``"<file_id>:sec_NNN"`` where ``N``
 is the heading's document-order rank, so an agent can quote the same id
 across tool calls without re-discovery.
 
+Each section also carries a ``provenance`` flag indicating how the
+boundary was derived (``toc_explicit`` from a real PDF outline,
+``heading_extracted`` from the OCR markdown structure, or
+``heuristic_split`` from a fallback split). ``confidence`` follows from
+provenance and gates which proof obligations may close at section level.
+``is_page_exclusive`` records whether the section owns at least one page
+no other section covers — closure rules use it to refuse certifying a
+section-level scan when boundaries are ambiguous.
+
 The store lazily builds a per-file inventory on first request and
 persists it under ``STORAGE_PATH/inventory/<file_id>.json``. Re-ingest
 of a file overwrites the cache; mid-process changes are NOT watched —
 construct a fresh ``InventoryStore`` if the underlying ``PageStore`` is
 swapped out.
 
-This module is intentionally narrow. ``DocumentInventory`` per
-``docs/algorithm.md`` §1.2 is broader (entities, tables, clauses,
-terms, …); we add types here as later phases need them.
+This module is intentionally narrow. Richer document units (entities,
+tables, clauses, terms) live in their own stores; this one is the
+file/section axis only.
 """
 
 import json
@@ -23,7 +32,7 @@ import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from config.settings import inventory_root
 from storage.page_store import PageAsset, PageStore
@@ -32,13 +41,31 @@ from storage.page_store import PageAsset, PageStore
 logger = logging.getLogger(__name__)
 
 
-_INVENTORY_VERSION = 1
+# Cached inventories tag themselves with this version; a mismatch forces
+# rebuild so callers never read caches that lack fields the current
+# Section dataclass expects.
+_INVENTORY_VERSION = 3
 # CommonMark allows up to 3 leading spaces before an ATX heading. Beyond
 # that the line is an indented code block, not a heading. PaddleOCR
 # emits flush-left headings in practice but cheap correctness here
 # costs nothing and protects against quirky parses.
 _HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*$")
 _FENCE_PREFIXES = ("```", "~~~")
+
+
+Provenance = Literal["toc_explicit", "heading_extracted", "heuristic_split"]
+Confidence = Literal["high", "medium", "low"]
+UnitType = Literal["file", "section"]
+
+
+# Provenance → confidence mapping. Confidence is a derived field so we
+# don't accept user overrides; a low-confidence section that "feels"
+# high to a caller still must not close completeness obligations.
+_PROVENANCE_CONFIDENCE: Dict[Provenance, Confidence] = {
+    "toc_explicit": "high",
+    "heading_extracted": "medium",
+    "heuristic_split": "low",
+}
 
 
 @dataclass(frozen=True)
@@ -52,9 +79,14 @@ class Section:
     page_start: int
     page_end: int
     parent_section_id: Optional[str]
+    provenance: Provenance
+    confidence: Confidence
+    is_page_exclusive: bool
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Section":
+        provenance = data.get("provenance") or "heading_extracted"
+        confidence = data.get("confidence") or _PROVENANCE_CONFIDENCE[provenance]
         return cls(
             section_id=str(data["section_id"]),
             file_id=str(data["file_id"]),
@@ -63,6 +95,9 @@ class Section:
             page_start=int(data["page_start"]),
             page_end=int(data["page_end"]),
             parent_section_id=data.get("parent_section_id"),
+            provenance=provenance,  # type: ignore[arg-type]
+            confidence=confidence,  # type: ignore[arg-type]
+            is_page_exclusive=bool(data.get("is_page_exclusive", False)),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -74,6 +109,9 @@ class Section:
             "page_start": self.page_start,
             "page_end": self.page_end,
             "parent_section_id": self.parent_section_id,
+            "provenance": self.provenance,
+            "confidence": self.confidence,
+            "is_page_exclusive": self.is_page_exclusive,
         }
 
 
@@ -168,6 +206,81 @@ class InventoryStore:
             if file_id and file_id not in out:
                 out[file_id] = len(self.sections_for_file(file_id))
         return out
+
+    # ----------------------------------------------------- proof-layer API
+
+    def section_for_page(self, page_global_id: str) -> Optional[str]:
+        """Map a page global_id (``<file_id>/<page_id>``) to the
+        deepest section whose span contains the page.
+
+        Returns ``None`` when the page is in an unknown file or falls
+        outside every section span (e.g., a cover page before any heading).
+        Used by auto-extractors to aggregate page-level pattern hits up
+        to section-level ScanClaims.
+        """
+        file_id, sep, page_id = page_global_id.partition("/")
+        if not sep:
+            return None
+        page = self.page_store.get(page_global_id)
+        if page is None:
+            return None
+        page_no = page.page_number
+        if page_no is None:
+            return None
+        sections = self.sections_for_file(file_id)
+        if not sections:
+            return None
+        # Pick the deepest containing section so a leaf wins over its
+        # parent in nested headings.
+        best: Optional[Section] = None
+        for s in sections:
+            if s.page_start <= page_no <= s.page_end:
+                if best is None or s.depth > best.depth:
+                    best = s
+        return best.section_id if best is not None else None
+
+    def units(
+        self,
+        unit_type: UnitType,
+        *,
+        file_ids: Optional[List[str]] = None,
+        section_ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Enumerate the addressable unit ids inside a scope.
+
+        For ``unit_type="file"`` the result is the supplied ``file_ids``
+        (or the union of files that own ``section_ids``).
+        For ``unit_type="section"`` the result is the section ids
+        contained in the resolved scope. ``section_ids`` is preserved
+        verbatim if supplied; otherwise we expand each ``file_id`` to
+        all of its sections.
+
+        Closure rules use this to compute the universe a ScanClaim must
+        partition. Returning a stable, sorted list keeps the partition
+        diff cheap for diagnostics.
+        """
+        if unit_type not in ("file", "section"):
+            raise ValueError(f"unit_type must be 'file' or 'section', got {unit_type!r}")
+        if unit_type == "file":
+            if file_ids:
+                return sorted({f for f in file_ids if f})
+            if section_ids:
+                derived = set()
+                for sid in section_ids:
+                    sec = self.get(sid)
+                    if sec is not None:
+                        derived.add(sec.file_id)
+                return sorted(derived)
+            return []
+        # unit_type == "section"
+        if section_ids:
+            cleaned = sorted({s for s in section_ids if s})
+            return [s for s in cleaned if self.get(s) is not None]
+        out: List[str] = []
+        for fid in file_ids or []:
+            for s in self.sections_for_file(fid):
+                out.append(s.section_id)
+        return sorted(out)
 
     # ------------------------------------------------------------- internals
 
@@ -284,11 +397,14 @@ def _resolve_spans(
     ``parent_section_id`` is threaded via a depth stack so the inventory
     surfaces the heading tree the agent's ``toc`` tool already computes.
     Section IDs include the file_id so they survive round-trips through
-    tool arguments without an extra ``file_id`` field.
+    tool arguments without an extra ``file_id`` field. After spans are
+    resolved we compute :func:`_compute_page_exclusivity` so leaves and
+    siblings carry an authoritative ``is_page_exclusive`` flag rather
+    than a per-call recomputation.
     """
     if not headings:
         return []
-    sections: List[Section] = []
+    raw: List[Tuple[int, int, str, int, Optional[str]]] = []  # (start, depth, title, end, parent)
     stack: List[Tuple[int, str]] = []
     for i, (page_no, depth, title) in enumerate(headings):
         section_id = f"{file_id}:sec_{i+1:03d}"
@@ -301,16 +417,69 @@ def _resolve_spans(
             if nd <= depth:
                 end = max(page_no, np - 1) if np > page_no else page_no
                 break
-        sections.append(
-            Section(
-                section_id=section_id,
-                file_id=file_id,
-                title=title,
-                depth=depth,
-                page_start=page_no,
-                page_end=end,
-                parent_section_id=parent,
-            )
-        )
+        raw.append((page_no, depth, title, end, parent))
         stack.append((depth, section_id))
-    return sections
+
+    # We need is_page_exclusive — does any non-ancestor section overlap
+    # this section's pages? Compute pairwise so the answer is stable
+    # regardless of traversal order.
+    exclusivity = _compute_page_exclusivity(raw, file_id)
+
+    return [
+        Section(
+            section_id=f"{file_id}:sec_{i+1:03d}",
+            file_id=file_id,
+            title=title,
+            depth=depth,
+            page_start=start,
+            page_end=end,
+            parent_section_id=parent,
+            provenance="heading_extracted",
+            confidence=_PROVENANCE_CONFIDENCE["heading_extracted"],
+            is_page_exclusive=exclusivity[i],
+        )
+        for i, (start, depth, title, end, parent) in enumerate(raw)
+    ]
+
+
+def _compute_page_exclusivity(
+    raw: List[Tuple[int, int, str, int, Optional[str]]],
+    file_id: str,
+) -> List[bool]:
+    """``is_page_exclusive(s)`` iff *no* page in ``s.page_range`` is
+    covered by any other section in the same file.
+
+    This is the property §6 / §13 require for section-level scan
+    certificates: any overlap with a sibling or descendant means a
+    page-hit cannot be unambiguously attributed to a single section,
+    so the section is unsafe as a closure unit. Nested headings —
+    where a parent's range contains a child's range — therefore yield
+    a non-exclusive parent, by design.
+
+    Implementation: difference-array sweep. ``counts[p]`` = number of
+    sections covering page p; build by ``+1`` at start and ``-1`` at
+    end+1 then prefix-sum. Section i is exclusive iff every page in its
+    span has count exactly 1 (just itself). O(n + max_page) — drops the
+    original O(n²) double loop while staying allocation-light for
+    documents with thousands of sections.
+    """
+    if not raw:
+        return []
+    max_page = max(end for _, _, _, end, _ in raw)
+    counts: List[int] = [0] * (max_page + 2)
+    for start, _, _, end, _ in raw:
+        counts[start] += 1
+        counts[end + 1] -= 1
+    running = 0
+    for p in range(len(counts)):
+        running += counts[p]
+        counts[p] = running
+    out: List[bool] = []
+    for start, _, _, end, _ in raw:
+        exclusive = True
+        for p in range(start, end + 1):
+            if counts[p] != 1:
+                exclusive = False
+                break
+        out.append(exclusive)
+    return out
