@@ -34,9 +34,8 @@ Lifetime assumption:
   The graph and passage stores are treated as immutable for the life
   of the agent process. ``_passage_meta_lookup`` / ``_passage_hash_by_meta``
   / ``_cluster_index`` are cached on the tool instance after first use.
-  If the corpus is re-ingested mid-session (we don't currently support
-  this), construct a fresh tool instance — the caches are not
-  invalidated automatically.
+  If the corpus is re-ingested mid-session, construct a fresh tool
+  instance — the caches are not invalidated automatically.
 """
 
 import json
@@ -862,9 +861,8 @@ class GraphExploreTool(BaseTool):
 
     @staticmethod
     def _guess_vertex_type(hash_id: str) -> str:
-        # graphs built before we added the `vertex_type` attribute use
-        # the namespace prefix on the hash id (`entity-…`, `passage-…`,
-        # `sentence-…`) as the only signal.
+        # When `vertex_type` is missing, derive it from the hash-id
+        # namespace prefix (`entity-…`, `passage-…`, `sentence-…`).
         if hash_id.startswith("entity-"):
             return "entity"
         if hash_id.startswith("passage-"):

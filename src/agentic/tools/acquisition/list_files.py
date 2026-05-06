@@ -179,34 +179,63 @@ class ListFilesTool(BaseTool):
                     {"error": "invalid_regex"},
                 )
 
-        rows = self._scan()
+        all_rows = self._scan()
+        all_rows.sort(key=lambda r: r["_upload_ts"], reverse=True)
+
         if compiled is not None:
-            rows = [r for r in rows if compiled.search(r["filename"])]
-        rows.sort(key=lambda r: r["_upload_ts"], reverse=True)
-        total_matched = len(rows)  # pre-truncation count (the actual match population)
+            matched = [r for r in all_rows if compiled.search(r["filename"])]
+        else:
+            matched = all_rows
+        total_matched = len(matched)
         truncated = total_matched > limit
-        rows = rows[:limit]
+        rows = matched[:limit]
 
         files = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+
+        # Zero-hit recovery: when the LLM's filename_regex matches no
+        # files, return the most-recent files anyway as a fallback so
+        # the LLM has something to orient on. Filenames in this corpus
+        # are routinely in a different language / use product code
+        # names that the LLM's English regex won't match — without
+        # this hint the agent burns turns guessing regex variants.
+        recent_fallback: List[Dict[str, Any]] = []
+        hint: Optional[str] = None
+        if compiled is not None and total_matched == 0:
+            recent_fallback = [
+                {k: v for k, v in r.items() if not k.startswith("_")}
+                for r in all_rows[:_DEFAULT_RECENT_N]
+            ]
+            hint = (
+                "filename_regex matched zero files. Filenames in this "
+                "corpus may be in another language than your query "
+                "(e.g. Chinese vs English product names) or use code "
+                "names rather than English titles. The 10 most recent "
+                "files are returned in `recent_fallback` for orientation; "
+                "their content may still match your query — try "
+                "semantic_search / bm25_search over those file_ids."
+            )
+
         log_meta = {
             "files_returned": len(files),
             "total_matched": total_matched,
             "recent_n": limit,
             "filename_regex": filename_regex,
             "truncated": truncated,
+            "fallback_returned": len(recent_fallback),
         }
         context.add_retrieval_log(tool_name="list_files", tokens=0, metadata=log_meta)
 
+        kwargs: Dict[str, Any] = {
+            "files": files,
+            "truncated": truncated,
+            "total_matched": total_matched,
+        }
+        if recent_fallback:
+            kwargs["recent_fallback"] = recent_fallback
+        if hint:
+            kwargs["hint"] = hint
         return (
-            ok(
-                "FileListObservation",
-                files=files,
-                truncated=truncated,
-                total_matched=total_matched,
-                # `total_matched` is the count BEFORE truncation so the
-                # agent can decide whether raising `recent_n` is worth it;
-                # `truncated` is the boolean shortcut.
-            ),
+            ok("FileListObservation", **kwargs),
             {"retrieved_tokens": 0, "files_returned": len(files), "total_matched": total_matched},
         )
 

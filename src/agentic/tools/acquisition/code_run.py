@@ -23,8 +23,8 @@ Isolation strategy (light, OS-only):
   so a runaway loop cannot blow the agent's context.
 
 This is **not** a security boundary against an adversarial user. It is
-"prevent-an-LLM-from-burning-the-machine" hardening. Strong isolation
-(firejail, nsjail, gVisor) is left as future work for the business mode.
+"prevent-an-LLM-from-burning-the-machine" hardening; strong isolation
+(firejail, nsjail, gVisor) is out of scope here.
 """
 
 import json

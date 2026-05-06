@@ -21,7 +21,7 @@ from storage.page_store import PageAsset, PageStore
 
 def ok(observation_type: str, **fields: Any) -> str:
     """Serialize a successful observation. Every retrieval tool returns
-    this shape, with `observation_type` matching docs/engineering.md §5.
+    this shape.
 
     JSON is compact (no indent) so the agent's context window is not
     spent on whitespace — readability is achieved through stable field
