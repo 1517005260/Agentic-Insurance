@@ -1,4 +1,4 @@
-"""Wire the default acquisition agent and the Phase-4 proof agent.
+"""Wire the default acquisition agent.
 
 Centralizing construction here keeps three properties straight:
 
@@ -8,12 +8,10 @@ Centralizing construction here keeps three properties straight:
    tools accidentally read stale snapshots.
 2. **Warm-up correctness.** ``BaseAgent.warm_up()`` walks tools by
    registry order. The graph tool's NER warmer is the slowest, so we
-   register it last to maximise overlap if a future change parallelises
-   the warm-up walk.
-3. **Single entry point.** Tests, the CLI, and notebook scripts all
-   import :func:`build_default_agent` (acquisition baseline) or
-   :func:`build_proof_agent` (gate-controlled) instead of constructing
-   the parts themselves; the construction order is the contract.
+   register it last to maximise overlap once warm-up parallelises.
+3. **Single entry point.** Tests, the CLI, and notebook scripts import
+   :func:`build_default_agent` instead of constructing the parts
+   themselves; the construction order is the contract.
 """
 
 import logging
@@ -21,26 +19,19 @@ from pathlib import Path
 from typing import Optional
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.proof_agent import ProofAgent
 from agentic.agent.prompts import PROOF_SYSTEM_PROMPT, SYSTEM_PROMPT
-from agentic.proof import Plant
+from agentic.agent.proof_agent import ProofAgent
 from agentic.tools.acquisition import (
     Bm25SearchTool,
     CodeRunTool,
     GraphExploreTool,
     ListFilesTool,
     PatternSearchTool,
-    ReadPageTool,
+    ReadTool,
     SemanticSearchTool,
     TocTool,
 )
-from agentic.tools.proof import (
-    AnswerFinalizeTool,
-    EvidenceIngestTool,
-    ObligationChallengeTool,
-    ObligationCreateTool,
-    ObligationDecomposeTool,
-)
+from agentic.closure.inventory import InventoryAdapter
 from agentic.tools.registry import ToolRegistry
 from config.settings import page_assets_root
 from model_client import EmbeddingClient, LLMClient, VisualEmbeddingClient
@@ -99,7 +90,7 @@ def build_default_agent(
     registry.register(Bm25SearchTool(page_store=page_store, inventory=inventory))
     registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
     registry.register(GraphExploreTool(channel=graph_channel, inventory=inventory))
-    registry.register(ReadPageTool(page_store=page_store))
+    registry.register(ReadTool(page_store=page_store, inventory=inventory))
     registry.register(CodeRunTool())
 
     agent = BaseAgent(
@@ -121,69 +112,55 @@ def build_proof_agent(
     page_store: Optional[PageStore] = None,
     inventory: Optional[InventoryStore] = None,
     graph_channel: Optional[GraphPPRChannel] = None,
-    plant: Optional[Plant] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 24,
+    max_loops: int = 16,
     max_token_budget: int = 128_000,
-    stall_window: int = 4,
     verbose: bool = False,
 ) -> ProofAgent:
-    """Build a ProofAgent with all 13 tools (8 acquisition + 5 proof).
+    """Build a ProofAgent with the eight acquisition tools wired in.
 
-    Shares the acquisition stack with :func:`build_default_agent` —
-    PageStore, InventoryStore, and the GraphPPRChannel are constructed
-    once and threaded into both proof tools (via the plant) and
-    acquisition tools (via their constructors).
+    The proof tools (plan_init, gap_propose, claim_ingest, finalize)
+    are registered fresh per ``ProofAgent.run`` call against the
+    per-run ``ProofSession``, so they are not in the registry built
+    here.
     """
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
-    inventory = inventory or InventoryStore(page_store=page_store)
+    inventory_store = inventory or InventoryStore(page_store=page_store)
 
     embedding_client = embedding_client or EmbeddingClient()
     visual_client = visual_client or VisualEmbeddingClient()
     llm_client = llm_client or LLMClient()
-    graph_channel = graph_channel or GraphPPRChannel(embedding_client=embedding_client)
 
-    plant = plant or Plant(inventory=inventory)
+    graph_channel = graph_channel or GraphPPRChannel(
+        embedding_client=embedding_client,
+    )
 
-    registry = ToolRegistry()
-    # Acquisition tools first — same order as the BaseAgent factory so
-    # warm-up walks them in the strategy-prompt sequence.
-    registry.register(ListFilesTool())
-    registry.register(TocTool(page_store=page_store, inventory=inventory))
-    registry.register(
+    acquisition = ToolRegistry()
+    acquisition.register(ListFilesTool())
+    acquisition.register(TocTool(page_store=page_store, inventory=inventory_store))
+    acquisition.register(
         SemanticSearchTool(
             page_store=page_store,
             embedding_client=embedding_client,
             visual_client=visual_client,
-            inventory=inventory,
+            inventory=inventory_store,
         )
     )
-    registry.register(Bm25SearchTool(page_store=page_store, inventory=inventory))
-    registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
-    registry.register(GraphExploreTool(channel=graph_channel, inventory=inventory))
-    registry.register(ReadPageTool(page_store=page_store))
-    registry.register(CodeRunTool())
+    acquisition.register(Bm25SearchTool(page_store=page_store, inventory=inventory_store))
+    acquisition.register(PatternSearchTool(page_store=page_store, inventory=inventory_store))
+    acquisition.register(GraphExploreTool(channel=graph_channel, inventory=inventory_store))
+    acquisition.register(ReadTool(page_store=page_store, inventory=inventory_store))
+    acquisition.register(CodeRunTool())
 
-    # Proof tools — created with the plant.
-    registry.register(ObligationCreateTool(plant=plant))
-    registry.register(ObligationDecomposeTool(plant=plant))
-    registry.register(ObligationChallengeTool(plant=plant))
-    registry.register(EvidenceIngestTool(plant=plant))
-    # answer_finalize gets a budget_check closure so it can return
-    # ABSTAIN instead of REJECT when budget is exhausted. The agent
-    # also abstains on its own when budget runs out, but answering
-    # truthfully through the tool keeps the LLM-visible state coherent.
-    registry.register(AnswerFinalizeTool(plant=plant))
-
-    agent = ProofAgent(
+    return ProofAgent(
         llm_client=llm_client,
-        tools=registry,
-        plant=plant,
+        acquisition_tools=acquisition,
+        inventory=InventoryAdapter(inventory_store),
+        page_store=page_store,
+        inventory_store=inventory_store,
         system_prompt=system_prompt or PROOF_SYSTEM_PROMPT,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
-        stall_window=stall_window,
         verbose=verbose,
     )
-    return agent

@@ -1,4 +1,4 @@
-"""Per-run agent state: retrieval cost log and read-page bookkeeping."""
+"""Per-run agent state: retrieval cost log, read-page bookkeeping."""
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Set
@@ -12,7 +12,7 @@ class RetrievalLog:
 
 
 class AgentContext:
-    """Tracks token cost and which pages have been read this run.
+    """Tracks token cost and which pages have been read.
 
     Read deduplication is page-level so the model is not handed the same
     Markdown blob twice within a single trajectory.
