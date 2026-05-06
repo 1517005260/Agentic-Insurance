@@ -43,7 +43,7 @@ class AnswerResult:
     context: QueryContext
     timings: Dict[str, float] = field(default_factory=dict)
     channel_timings: Dict[str, float] = field(default_factory=dict)
-    citations_pending: bool = True  # TODO: page-level citation post-processor
+    citations_pending: bool = True
 
 
 class RAGPipeline:

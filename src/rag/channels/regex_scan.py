@@ -6,7 +6,7 @@ Markdown stored in ``STORAGE_PATH/page_assets/<file_id>.json`` (same content
 as ``paddle_ocr/<file_id>/combined.md`` but already split per page, so we
 get accurate page boundaries for free).
 
-Per-match score (codex-recommended scheme, see ``docs/rag_pipeline.md`` §4.4)::
+Per-match score::
 
     s_i = w_r * idf_r * quality(m, line) * g(m) * h(r)
 

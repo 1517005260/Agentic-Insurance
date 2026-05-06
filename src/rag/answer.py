@@ -4,10 +4,6 @@ The reader receives ``query`` plus the reranked pages serialized as a
 labeled block. We instruct the model to (1) reply in the user's language(s)
 (2) use only the provided pages, (3) admit ignorance when the answer is not
 present.
-
-Page-level citations (``[file_id#page_id]``) are a TODO — once enabled, the
-reader will be asked to cite, and a post-processor will validate that every
-citation refers to one of the candidate pages.
 """
 
 import logging

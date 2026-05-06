@@ -19,7 +19,7 @@ class RAGConfig:
     semantic_channel_topk: int = 30
     bm25_channel_topk: int = 30
     regex_channel_topk: int = 30
-    # Saturate per-page unique regex matches (TF cap) — see docs §4.4.
+    # Saturate per-page unique regex matches (TF cap).
     regex_dedup_cap: int = 5
 
     # ---------- cross-channel fusion ----------
@@ -39,7 +39,7 @@ class RAGConfig:
     # visible content, which fits all current reasoning models we use.
     answer_max_tokens: int = 8000
 
-    # ---------- PPR (sourced from projects/LinearRAG/src/config.py) ----------
+    # ---------- PPR ----------
     ppr_damping: float = 0.5
     ppr_max_iterations: int = 3
     ppr_top_k_sentence: int = 1

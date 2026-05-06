@@ -1,4 +1,5 @@
-"""Graph PPR channel — strict port of ``projects/LinearRAG`` retrieval.
+"""Graph PPR channel — Personalized PageRank retrieval over the
+LinearRAG entity-passage graph.
 
 Pipeline (one PPR run per query):
 
@@ -6,7 +7,7 @@ Pipeline (one PPR run per query):
 2. ``normalize_for_hash`` each surface so it lives in the same canonical
    space as the stored entities.
 3. For each canonical question entity, find the single best-matching stored
-   entity by cosine similarity (matches LinearRAG.get_seed_entities).
+   entity by cosine similarity (LinearRAG.get_seed_entities).
 4. BFS entity-score expansion: for every active entity, take its mention
    sentences, dot with the question embedding, follow the top-1 sentence to
    the next entities; cut by ``iteration_threshold`` and ``max_iterations``.
@@ -22,8 +23,6 @@ Pipeline (one PPR run per query):
 Logical-entity (alias-cluster) aggregation is **not** done here: the
 build-time alias edges already participate in PPR propagation, so passage
 scores include cross-alias mass without an extra aggregation step.
-Cluster-level evidence display lives in a separate (future) component
-per ``docs/entity_alignment.md`` §4.
 """
 
 import json
@@ -92,7 +91,8 @@ class GraphPPRChannel(BaseChannel):
                     v.index for v in self.graph.vs if v["vertex_type"] == "passage"
                 ]
             else:
-                # Older graphs (pre vertex_type) — fall back to "is in passage store".
+                # Without an explicit `vertex_type` attribute, treat any
+                # vertex whose name is in the passage store as a passage.
                 passage_hashes = set(self.passage_store.hash_ids)
                 self._passage_vidx = [
                     v.index for v in self.graph.vs if v["name"] in passage_hashes
@@ -320,10 +320,9 @@ class GraphPPRChannel(BaseChannel):
         sims = np.dot(passage_emb, q).flatten()
 
         # Min-max normalize so the dpr term lives on [0, 1] before being
-        # combined with the log entity bonus (matches LinearRAG's
-        # ``min_max_normalize`` at projects/LinearRAG/src/utils.py — when
-        # all values are equal it returns ones, NOT zeros, so a single-
-        # passage corpus or all-tied DPR doesn't zero out passage weights).
+        # combined with the log entity bonus. When all values are equal
+        # we return ones (NOT zeros), so a single-passage corpus or
+        # all-tied DPR doesn't zero out passage weights.
         if sims.size > 0:
             lo, hi = float(sims.min()), float(sims.max())
             if hi > lo:

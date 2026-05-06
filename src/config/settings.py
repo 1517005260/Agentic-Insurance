@@ -34,7 +34,7 @@ def paddle_ocr_root() -> Path:
 
 
 # Subdirectory under STORAGE_PATH that holds downloaded model weights
-# (currently the spaCy NER model used by the entity layer).
+# (e.g. the spaCy NER model used by the entity layer).
 MODELS_SUBDIR: str = "models"
 
 
@@ -56,10 +56,10 @@ def page_assets_path(file_id: str) -> Path:
     return page_assets_root() / f"{file_id}.json"
 
 
-# Per-file structural inventory (sections derived from Markdown headings;
-# more inventory types may join later). One file per indexed document at
-# <STORAGE_PATH>/inventory/<file_id>.json. Lazily built on first access by
-# ``storage.InventoryStore``; re-ingest invalidates by overwrite.
+# Per-file structural inventory (sections derived from Markdown headings).
+# One file per indexed document at <STORAGE_PATH>/inventory/<file_id>.json.
+# Lazily built on first access by ``storage.InventoryStore``; re-ingest
+# invalidates by overwrite.
 INVENTORY_SUBDIR: str = "inventory"
 
 
@@ -69,6 +69,28 @@ def inventory_root() -> Path:
 
 def inventory_path(file_id: str) -> Path:
     return inventory_root() / f"{file_id}.json"
+
+
+# Sibling stores that share the inventory's per-file lazy-build pattern
+# but operate at sub-page granularity:
+# * passages   — paragraph / paragraph_title blocks from PaddleOCR's
+#                ``parsing_res_list``
+# * table_rows — individual ``<tr>`` rows extracted from each page's
+#                rendered HTML tables
+# Both live under <STORAGE_PATH>/inventory_atoms/<kind>/<file_id>.json.
+INVENTORY_ATOMS_SUBDIR: str = "inventory_atoms"
+
+
+def inventory_atoms_root(kind: str) -> Path:
+    return STORAGE_PATH / INVENTORY_ATOMS_SUBDIR / kind
+
+
+def passage_atoms_path(file_id: str) -> Path:
+    return inventory_atoms_root("passages") / f"{file_id}.json"
+
+
+def table_row_atoms_path(file_id: str) -> Path:
+    return inventory_atoms_root("table_rows") / f"{file_id}.json"
 
 
 # All faiss-backed embedding stores live under one global root. Stores are
