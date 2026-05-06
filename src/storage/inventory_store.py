@@ -1,10 +1,10 @@
 """Persistent per-file structural inventory.
 
-For now the only inventory type is **sections** — page-spans derived from
-the Markdown heading structure that PaddleOCR emits. Section IDs are
-globally-unique strings of the form ``"<file_id>:sec_NNN"`` where ``N``
-is the heading's document-order rank, so an agent can quote the same id
-across tool calls without re-discovery.
+The inventory tracks **sections** — page-spans derived from the Markdown
+heading structure that PaddleOCR emits. Section IDs are globally-unique
+strings of the form ``"<file_id>:sec_NNN"`` where ``N`` is the heading's
+document-order rank, so an agent can quote the same id across tool calls
+without re-discovery.
 
 Each section also carries a ``provenance`` flag indicating how the
 boundary was derived (``toc_explicit`` from a real PDF outline,
@@ -55,7 +55,12 @@ _FENCE_PREFIXES = ("```", "~~~")
 
 Provenance = Literal["toc_explicit", "heading_extracted", "heuristic_split"]
 Confidence = Literal["high", "medium", "low"]
-UnitType = Literal["file", "section"]
+UnitType = Literal["file", "section", "page", "passage", "table_row"]
+# ``passage`` and ``table_row`` use sibling stores; the others come from
+# this inventory plus the underlying page_store directly.
+_WIRED_UNIT_TYPES: frozenset = frozenset(
+    {"file", "section", "page", "passage", "table_row"}
+)
 
 
 # Provenance → confidence mapping. Confidence is a derived field so we
@@ -131,11 +136,30 @@ class InventoryStore:
         self,
         page_store: PageStore,
         inventory_dir: Optional[Path] = None,
+        *,
+        atoms_dir: Optional[Path] = None,
     ):
         self.page_store = page_store
         self.inventory_dir = Path(inventory_dir) if inventory_dir else inventory_root()
         self._sections_by_file: Dict[str, List[Section]] = {}
         self._section_by_id: Dict[str, Section] = {}
+        # Sibling stores for sub-page units. Constructed eagerly here
+        # (cheap: just a wrapper around page_store), but read-only on
+        # the query path — caches are written exclusively by ingest
+        # via :func:`build_inventory_atoms_for_file`. ``atoms_dir``
+        # defaults to ``<STORAGE_PATH>/inventory_atoms``; callers
+        # (notably tests) can override to scope caches into a
+        # workdir.
+        from storage.passage_store import PassageStore
+        from storage.table_row_store import TableRowStore
+        passage_dir = Path(atoms_dir) / "passages" if atoms_dir else None
+        table_row_dir = Path(atoms_dir) / "table_rows" if atoms_dir else None
+        self.passage_store = PassageStore(
+            page_store, inventory=self, atoms_dir=passage_dir,
+        )
+        self.table_row_store = TableRowStore(
+            page_store, inventory=self, atoms_dir=table_row_dir,
+        )
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------- public API
@@ -259,8 +283,11 @@ class InventoryStore:
         partition. Returning a stable, sorted list keeps the partition
         diff cheap for diagnostics.
         """
-        if unit_type not in ("file", "section"):
-            raise ValueError(f"unit_type must be 'file' or 'section', got {unit_type!r}")
+        if unit_type not in _WIRED_UNIT_TYPES:
+            raise ValueError(
+                f"unit_type must be one of {sorted(_WIRED_UNIT_TYPES)!r}; "
+                f"got {unit_type!r}"
+            )
         if unit_type == "file":
             if file_ids:
                 return sorted({f for f in file_ids if f})
@@ -272,6 +299,38 @@ class InventoryStore:
                         derived.add(sec.file_id)
                 return sorted(derived)
             return []
+        if unit_type == "page":
+            # Page-level enumeration. ``file_ids`` and ``section_ids``
+            # gate which pages we return; section_ids dominate when
+            # both are supplied (section_ids ∩ file_ids is implied).
+            if section_ids:
+                pages: List[str] = []
+                for sid in section_ids:
+                    sec = self.get(sid)
+                    if sec is None:
+                        continue
+                    for p in range(sec.page_start, sec.page_end + 1):
+                        gid = f"{sec.file_id}/p_{p:04d}"
+                        if self.page_store.get(gid) is not None:
+                            pages.append(gid)
+                return sorted(set(pages))
+            if not file_ids:
+                return []
+            allowed = set(file_ids)
+            return sorted(
+                gid for gid in self.page_store.ids()
+                if "/" in gid and gid.split("/", 1)[0] in allowed
+            )
+        if unit_type == "passage":
+            return self._enumerate_atoms(
+                self.passage_store, "passage_id",
+                file_ids=file_ids, section_ids=section_ids,
+            )
+        if unit_type == "table_row":
+            return self._enumerate_atoms(
+                self.table_row_store, "table_row_id",
+                file_ids=file_ids, section_ids=section_ids,
+            )
         # unit_type == "section"
         if section_ids:
             cleaned = sorted({s for s in section_ids if s})
@@ -280,6 +339,46 @@ class InventoryStore:
         for fid in file_ids or []:
             for s in self.sections_for_file(fid):
                 out.append(s.section_id)
+        return sorted(out)
+
+    def _enumerate_atoms(
+        self,
+        store: Any,
+        id_attr: str,
+        *,
+        file_ids: Optional[List[str]],
+        section_ids: Optional[List[str]],
+    ) -> List[str]:
+        """Shared enumeration for passage / table_row stores.
+
+        ``section_ids`` dominates ``file_ids`` (section_ids ∩ file
+        is implied via the section's owning file). Each atom is
+        included iff its ``parent_section_id`` matches one of the
+        requested sections OR (when no section filter) its file
+        matches one of ``file_ids``.
+        """
+        if section_ids:
+            section_set = {sid for sid in section_ids if sid}
+            sec_files = set()
+            for sid in section_set:
+                sec = self.get(sid)
+                if sec is not None:
+                    sec_files.add(sec.file_id)
+            out: List[str] = []
+            for fid in sec_files:
+                for atom in store.passages_for_file(fid) if id_attr == "passage_id" else store.rows_for_file(fid):
+                    if atom.parent_section_id in section_set:
+                        out.append(getattr(atom, id_attr))
+            return sorted(out)
+        if not file_ids:
+            return []
+        out: List[str] = []
+        for fid in file_ids:
+            atoms = (
+                store.passages_for_file(fid) if id_attr == "passage_id"
+                else store.rows_for_file(fid)
+            )
+            out.extend(getattr(a, id_attr) for a in atoms)
         return sorted(out)
 
     # ------------------------------------------------------------- internals
@@ -296,8 +395,8 @@ class InventoryStore:
         ``page_count`` is a cheap re-ingest tripwire: a re-parse that
         adds or drops pages will update the stored count, which then
         mismatches the cached value and triggers a rebuild. Same-count
-        re-parses still hit a stale cache (acceptable for v1 — caller
-        can manually delete the file).
+        re-parses still hit a stale cache; the caller can delete the
+        file manually to force a rebuild.
         """
         path = self._cache_path(file_id)
         if not path.is_file():
@@ -449,12 +548,12 @@ def _compute_page_exclusivity(
     """``is_page_exclusive(s)`` iff *no* page in ``s.page_range`` is
     covered by any other section in the same file.
 
-    This is the property §6 / §13 require for section-level scan
-    certificates: any overlap with a sibling or descendant means a
-    page-hit cannot be unambiguously attributed to a single section,
-    so the section is unsafe as a closure unit. Nested headings —
-    where a parent's range contains a child's range — therefore yield
-    a non-exclusive parent, by design.
+    This is the property section-level scan certificates require: any
+    overlap with a sibling or descendant means a page-hit cannot be
+    unambiguously attributed to a single section, so the section is
+    unsafe as a closure unit. Nested headings — where a parent's range
+    contains a child's range — therefore yield a non-exclusive parent,
+    by design.
 
     Implementation: difference-array sweep. ``counts[p]`` = number of
     sections covering page p; build by ``+1`` at start and ``-1`` at
