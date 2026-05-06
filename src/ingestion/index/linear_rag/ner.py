@@ -4,8 +4,7 @@ Two responsibilities:
 
 1. **Semantic-type filter** — drop OntoNotes labels that almost always
    carry numeric / temporal / measurement content (CARDINAL / ORDINAL /
-   PERCENT / MONEY / QUANTITY / DATE / TIME). This replaces a stack of
-   hand-written regex patterns with the NER's own classifier.
+   PERCENT / MONEY / QUANTITY / DATE / TIME).
 2. **Language routing** — each passage is auto-detected as Chinese vs
    non-Chinese (via langdetect). Chinese passages go through
    ``zh_core_web_trf``, everything else through ``en_core_web_trf``. So
@@ -61,7 +60,7 @@ class SpacyNER:
 
     ``spacy_model`` is the path to the EN pipeline. ``zh_spacy_model`` is
     the optional ZH path; if unset the routing falls back to EN for every
-    passage (equivalent to the older single-pipeline behavior).
+    passage.
     """
 
     def __init__(
@@ -79,8 +78,7 @@ class SpacyNER:
 
     @property
     def spacy_model(self):
-        """Backwards-compat shim — defaults to the EN pipeline. Prefer
-        :meth:`pipeline_for` when the language matters."""
+        """The EN pipeline. Prefer :meth:`pipeline_for` when the language matters."""
         return self._pipelines["en"]
 
     def pipeline_for(self, lang: str):

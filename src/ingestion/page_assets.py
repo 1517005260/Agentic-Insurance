@@ -118,8 +118,8 @@ class PageAssetBuilder:
         PaddleOCR PP-StructureV3 returns blocks under
         ``prunedResult.parsing_res_list`` with keys ``block_label``,
         ``block_content``, ``block_bbox``, ``block_id``, ``block_order``,
-        ``group_id``. We fall back to a few legacy top-level keys for
-        forward-compat with older / different deployments.
+        ``group_id``. A handful of top-level keys are probed as
+        fallbacks for alternate deployment shapes.
         """
         pruned = res.get("prunedResult") or {}
         blocks = pruned.get("parsing_res_list")
@@ -134,8 +134,7 @@ class PageAssetBuilder:
 
     @staticmethod
     def _block_label(block: Dict[str, Any]) -> str:
-        """Layout-block label, normalized to lower-case. Probes the common
-        field names across PaddleOCR versions."""
+        """Layout-block label, normalized to lower-case."""
         return (
             block.get("block_label")
             or block.get("block_type")
@@ -246,10 +245,22 @@ class PageAssetBuilder:
 
 
 def build_page_assets(parse_result, persist: bool = True) -> List[PageAsset]:
-    """Convenience: build PageAssets from a ParseResult and (optionally) persist them.
+    """Build PageAssets from a ParseResult and (optionally) persist them.
 
-    The persisted file is ``STORAGE_PATH/page_assets/<file_id>.json`` which is
-    directly loadable by :class:`storage.PageStore`.
+    Persistence performs three steps in order:
+
+    1. Write ``STORAGE_PATH/page_assets/<file_id>.json`` (the canonical
+       PageStore source).
+    2. Eagerly warm the section :class:`InventoryStore` for the new
+       file (heading-derived).
+    3. Eagerly warm the sibling stores —
+       :class:`storage.PassageStore` and :class:`storage.TableRowStore`
+       — so the proof gate's read path is cache-only at agent-loop
+       time.
+
+    Steps 2-3 are deliberately part of ingest, not lazy-on-read,
+    because passage/table_row stores are read often during a single
+    agent run and the build cost belongs at index time.
     """
     builder = PageAssetBuilder.from_parse_result(parse_result)
     pages = builder.build()
@@ -259,6 +270,21 @@ def build_page_assets(parse_result, persist: bool = True) -> List[PageAsset]:
         out.write_text(
             json.dumps([_asset_to_dict(p) for p in pages], ensure_ascii=False, indent=2),
             encoding="utf-8",
+        )
+        # Warm the inventory + sibling stores. Construct fresh PageStore
+        # / InventoryStore against the directory we just wrote to so we
+        # don't depend on a global already-loaded instance.
+        from config.settings import page_assets_root
+        from storage import (
+            InventoryStore,
+            PageStore,
+            build_inventory_atoms_for_file,
+        )
+        page_store = PageStore(page_assets_root())
+        inventory = InventoryStore(page_store=page_store)
+        inventory.warm_up()
+        build_inventory_atoms_for_file(
+            parse_result.file_id, page_store, inventory,
         )
     return pages
 

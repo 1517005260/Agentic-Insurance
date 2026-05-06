@@ -1,14 +1,10 @@
 """LinearRAG build-time graph construction.
 
-Layout mirrors the upstream ``projects/LinearRAG/src/`` package (utils, ner,
-linear_rag) with three adaptations:
-
-* The local SentenceTransformer-backed ``EmbeddingStore`` is replaced by the
-  faiss-backed :class:`storage.EmbeddingStore` (global, cross-file).
-* Configuration moves to central ``config.LinearRAGConfig``.
-* Retrieval / PPR methods are not ported here — query path lives elsewhere.
-
-The graph algorithm and on-disk artifacts are otherwise unchanged.
+Wraps the LinearRAG algorithm onto local primitives: the faiss-backed
+:class:`storage.EmbeddingStore` (global, cross-file) replaces a
+SentenceTransformer-backed store, and configuration is centralised in
+``config.LinearRAGConfig``. Retrieval / PPR live with the query path,
+not here.
 """
 
 from ingestion.index.linear_rag.disambig import (
