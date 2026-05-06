@@ -89,4 +89,19 @@ line-length = 100
 target-version = "py310"
 
 [tool.pytest.ini_options]
+# pytest is anchored to ``tests/`` (the canonical home for unit tests).
+# Driver scripts under ``scripts/`` are runnable directly with ``python
+# scripts/<name>.py`` and do not follow the pytest discovery contract.
+# ``norecursedirs`` stops bare ``pytest`` from walking into reference
+# subprojects (``projects/arag``, ``projects/LinearRAG``) whose tests
+# import modules absent from this repo.
 testpaths = ["tests"]
+norecursedirs = [
+    "projects",
+    "local_storage",
+    "models",
+    ".venv",
+    "src",
+    "scripts",
+    "docs",
+]
