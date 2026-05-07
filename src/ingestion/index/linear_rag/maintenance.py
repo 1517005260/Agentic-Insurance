@@ -27,9 +27,14 @@ from config.settings import (
     faiss_graph_passage_dir,
     faiss_graph_sentence_dir,
     faiss_visual_dir,
+    inventory_path,
     page_assets_path,
     page_assets_root,
     paddle_ocr_root,
+    passage_atoms_path,
+    table_row_atoms_path,
+    upload_path,
+    uploads_root,
 )
 from ingestion.index.linear_rag.disambig import ALIAS_EDGE_TYPE, invalidate_clusters
 from storage import EmbeddingStore
@@ -112,25 +117,48 @@ def split_cluster(member_partition: Sequence[Sequence[str]]) -> int:
 
 # ------------------------------------------------------------- remove_file
 
-def remove_file(file_id: str) -> Dict[str, int]:
+def remove_file(
+    file_id: str,
+    *,
+    keep_upload: bool = False,
+    upload_suffix: str | None = None,
+) -> Dict[str, int]:
     """Wipe every artifact tagged with ``file_id``.
+
+    ``keep_upload=True`` preserves ``uploads/<file_id>.*`` so a re-ingest
+    can purge stale indexes and then re-feed the same original blob to
+    the parser. Default ``False`` is the full-delete path the web's
+    DELETE route wants.
+
+    ``upload_suffix`` (e.g. ``".pdf"``) makes the uploads-dir delete
+    EXACT — only ``uploads/<file_id><suffix>`` is removed. Without it
+    we fall back to a stem match that requires
+    ``entry.with_suffix("").name == file_id``, which is the only safe
+    inverse of ``upload_path()`` and avoids the prefix hazard where
+    purging ``abc_hash`` would otherwise also match
+    ``abc_hash.v2_<other>.pdf``.
 
     Steps (idempotent):
 
     1. Delete page_assets/<file_id>.json
-    2. Delete paddle_ocr/<file_id>/ (raw outputs)
-    3. Drop rows with file_id from dense + visual faiss stores
-    4. Drop passage rows with file_id from the graph passage store
-    5. Drop NER cache entries for those passage hashes; orphan-clean
+    2. Delete inventory/<file_id>.json + inventory_atoms/{passages,table_rows}/<file_id>.json
+       (lazy-built derivative caches; safe to drop, will rebuild on demand)
+    3. (unless keep_upload) Delete uploads/<file_id>.* — the cached original PDF.
+       Skipped during re-ingest because parse_and_index needs to read it.
+    4. Delete paddle_ocr/<file_id>/ (raw outputs)
+    5. Drop rows with file_id from dense + visual faiss stores
+    6. Drop passage rows with file_id from the graph passage store
+    7. Drop NER cache entries for those passage hashes; orphan-clean
        sentence_to_entities to surviving passage texts
-    6. Drop sentence and entity rows whose surface no longer appears in any
+    8. Drop sentence and entity rows whose surface no longer appears in any
        surviving passage (true orphans)
-    7. Delete graph vertices for the dropped passage hashes; sweep orphan
+    9. Delete graph vertices for the dropped passage hashes; sweep orphan
        entity vertices (no surviving passage edges)
-    8. Rebuild BM25 from the surviving page_assets
-    9. Invalidate clusters cache
+    10. Rebuild BM25 from the surviving page_assets
+    11. Invalidate clusters cache
 
-    Returns counts for telemetry.
+    Returns counts for telemetry. Each step is a no-op if the artifact
+    isn't present, so calling twice is harmless.
     """
     counts: Dict[str, int] = {}
 
@@ -140,26 +168,71 @@ def remove_file(file_id: str) -> Dict[str, int]:
         pa.unlink()
         counts["page_assets_json"] = 1
 
-    # 2. PaddleOCR output dir.
+    # 2. Lazy derivative caches. Each is a single per-file JSON; the
+    # store classes rebuild them from page_assets on next request, so
+    # leaving them around after a delete would surface stale rows.
+    inv = inventory_path(file_id)
+    if inv.exists():
+        inv.unlink()
+        counts["inventory_json"] = 1
+    pas_atoms = passage_atoms_path(file_id)
+    if pas_atoms.exists():
+        pas_atoms.unlink()
+        counts["passage_atoms_json"] = 1
+    trow_atoms = table_row_atoms_path(file_id)
+    if trow_atoms.exists():
+        trow_atoms.unlink()
+        counts["table_row_atoms_json"] = 1
+
+    # 3. Cached upload original. Caller-supplied ``upload_suffix``
+    # turns this into a single-file lookup; otherwise we iterate the
+    # uploads dir and only match files whose ``with_suffix("").name``
+    # equals ``file_id`` exactly. The naive ``startswith(f"{file_id}.")``
+    # approach would also match e.g. ``abc_hash.v2_<other>.pdf`` when
+    # purging ``abc_hash``, deleting an unrelated file's blob.
+    if not keep_upload:
+        n_uploads = 0
+        if upload_suffix is not None:
+            target = upload_path(file_id, upload_suffix)
+            if target.exists():
+                target.unlink()
+                n_uploads = 1
+        else:
+            up_root = uploads_root()
+            if up_root.exists():
+                for entry in up_root.iterdir():
+                    if not entry.is_file():
+                        continue
+                    if entry.name.startswith(".") and entry.suffix == ".part":
+                        continue
+                    # Inverse of ``upload_path(file_id, suffix)``: strip
+                    # the final extension and require an EXACT match.
+                    if entry.with_suffix("").name == file_id or entry.name == file_id:
+                        entry.unlink()
+                        n_uploads += 1
+        if n_uploads:
+            counts["uploads"] = n_uploads
+
+    # 4. PaddleOCR output dir.
     paddle_dir = paddle_ocr_root() / file_id
     if paddle_dir.exists():
         shutil.rmtree(paddle_dir)
         counts["paddle_ocr_dir"] = 1
 
-    # 3. Dense + visual stores: drop by file_id.
+    # 5. Dense + visual stores: drop by file_id.
     dense = EmbeddingStore(faiss_dense_dir(), namespace="dense")
     counts["dense_rows"] = _drop_store_rows(dense, file_id=file_id)
     visual = EmbeddingStore(faiss_visual_dir(), namespace="visual")
     counts["visual_rows"] = _drop_store_rows(visual, file_id=file_id)
 
-    # 4. Graph passage store: drop passages with this file_id, remember their hashes.
+    # 6. Graph passage store: drop passages with this file_id, remember their hashes.
     passage_store = EmbeddingStore(faiss_graph_passage_dir(), namespace="passage")
     dropped_passage_hashes = _list_store_rows_by_file(passage_store, file_id)
     counts["graph_passage_rows"] = _drop_store_rows(passage_store, file_id=file_id)
 
     surviving_passages = passage_store.hash_id_to_text  # after drop
 
-    # 5 + 6. NER cache + sentence/entity orphan cleanup.
+    # 7 + 8. NER cache + sentence/entity orphan cleanup.
     ner_path = faiss_graph_dir() / "ner_results.json"
     dropped_sentences: List[str] = []
     dropped_entities: List[str] = []
@@ -225,7 +298,7 @@ def remove_file(file_id: str) -> Dict[str, int]:
                 sentence_store, sent_drop_hashes
             )
 
-    # 7. Graph vertices.
+    # 9. Graph vertices.
     graphml_path = faiss_graph_dir() / "LinearRAG.graphml"
     if graphml_path.exists():
         graph = ig.Graph.Read_GraphML(str(graphml_path))
@@ -263,7 +336,7 @@ def remove_file(file_id: str) -> Dict[str, int]:
 
     invalidate_clusters(_clusters_path())
 
-    # 8. BM25 rebuild from surviving page_assets/.
+    # 10. BM25 rebuild from surviving page_assets/.
     counts["bm25_rebuild"] = _rebuild_bm25(skip_file_id=file_id)
 
     return counts

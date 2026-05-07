@@ -15,11 +15,18 @@ from storage.page_store import PageAsset
 
 @dataclass
 class IndexBuildResult:
+    """Outcome of one builder run. ``skipped_reason`` is overloaded: it
+    holds both *legitimate skips* (``no sentences extracted``, ``visual
+    model not configured``, ``file already indexed``) and *failures*
+    (``build raised``). The ``failed`` flag disambiguates so the
+    pipeline can mark the file failed only on real errors, not skips.
+    """
     index_name: str
     file_id: str
     output_dir: str
     item_count: int = 0
     skipped_reason: str | None = None
+    failed: bool = False
     extra: Dict[str, Any] = field(default_factory=dict)
 
 

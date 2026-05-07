@@ -14,8 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-import requests
-
+from config.http import make_retry_session
 from config.settings import (
     PADDLE_OCR_API_URL,
     PADDLE_OCR_FILE_TYPE_IMAGE,
@@ -64,6 +63,7 @@ class PaddleOCRClient:
         self.use_doc_orientation_classify = use_doc_orientation_classify
         self.use_doc_unwarping = use_doc_unwarping
         self.use_chart_recognition = use_chart_recognition
+        self._session = make_retry_session()
 
     # ------------------------------------------------------------------ public
 
@@ -107,7 +107,7 @@ class PaddleOCRClient:
             file_type,
             output_dir,
         )
-        response = requests.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
+        response = self._session.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
         response.raise_for_status()
         result = response.json().get("result")
         if result is None:
@@ -149,8 +149,7 @@ class PaddleOCRClient:
             if saved is not None:
                 materialized.image_paths.append(saved)
 
-    @staticmethod
-    def _save_image_payload(payload: Any, dest: Path) -> Optional[Path]:
+    def _save_image_payload(self, payload: Any, dest: Path) -> Optional[Path]:
         """Materialize a markdown.images / outputImages value to disk.
 
         The API may deliver either a remote URL or an inline base64 string;
@@ -166,7 +165,7 @@ class PaddleOCRClient:
                 # don't want the OCR step to spend minutes per image. The
                 # Markdown text is what the rest of the pipeline depends on;
                 # saved images are nice-to-have.
-                resp = requests.get(payload, timeout=15)
+                resp = self._session.get(payload, timeout=15)
                 if resp.status_code != 200:
                     logger.warning(
                         "Failed to download image %s (status %d)", payload, resp.status_code

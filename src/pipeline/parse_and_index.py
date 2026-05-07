@@ -15,9 +15,14 @@ Concurrency model (parse_and_index_many):
   ingesting at the same time would corrupt each other. We pipeline instead:
   as soon as a parse completes, its ingest starts on the main thread while
   the other parses keep running in the pool.
-* **Within one file, the four builders run concurrent** (the original
-  parse_and_index() shape) — they touch different stores.
+* **Within one file, the four builders run concurrent by default**, but
+  this can blow ~3 GB of resident memory (mostly the LinearRAG graph
+  builder loading en + zh transformer NER plus its embedding stores).
+  Pass ``parallel_builders=False`` to fold the four builders into a
+  serial loop with ``gc.collect`` between stages — required on 8 GB
+  WSL2 / small VMs to avoid an OOM kill mid-ingest.
 """
+import gc
 import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -70,41 +75,88 @@ def _default_builders() -> List[IndexBuilder]:
 def _ingest_one(
     parse: ParseResult,
     builders: Sequence[IndexBuilder],
+    *,
+    parallel_builders: bool = True,
 ) -> tuple[List[PageAsset], List[IndexBuildResult]]:
-    """Page-asset build + 4-way concurrent index build for a single parsed file."""
+    """Page-asset build + index build for a single parsed file.
+
+    ``parallel_builders=True`` (default) fans the four builders out onto
+    a thread pool — fastest path on a beefy host, but graph + dense +
+    visual concurrently can resident ~3 GB and OOMs on 8 GB WSL2.
+
+    ``parallel_builders=False`` runs the four builders serially with a
+    ``gc.collect`` between stages so each builder's working set is
+    released before the next one starts. Roughly 2× wall time but the
+    peak RSS stays bounded by the largest single builder (LinearRAG
+    graph). Use this on memory-constrained hosts and from web-app
+    background ingest tasks.
+    """
     pages = build_page_assets(parse, persist=True)
     logger.info("page assets built: %d pages (file_id=%s)", len(pages), parse.file_id)
 
+    builder_fn = _build_indexes_parallel if parallel_builders else _build_indexes_serial
+    return pages, builder_fn(parse.file_id, builders, pages)
+
+
+def _build_indexes_parallel(
+    file_id: str, builders: Sequence[IndexBuilder], pages: List[PageAsset]
+) -> List[IndexBuildResult]:
     results: List[IndexBuildResult] = []
     with ThreadPoolExecutor(max_workers=len(builders)) as pool:
-        future_to_name = {
-            pool.submit(b.build, parse.file_id, pages): b.name for b in builders
-        }
+        future_to_name = {pool.submit(b.build, file_id, pages): b.name for b in builders}
         for fut in as_completed(future_to_name):
             name = future_to_name[fut]
             try:
                 res = fut.result()
                 logger.info(
                     "index %s done: items=%d skipped=%s (file_id=%s)",
-                    name,
-                    res.item_count,
-                    res.skipped_reason,
-                    parse.file_id,
+                    name, res.item_count, res.skipped_reason, file_id,
                 )
                 results.append(res)
-            except Exception:
-                logger.exception(
-                    "index %s FAILED (file_id=%s)", name, parse.file_id
-                )
+            except Exception as exc:
+                logger.exception("index %s FAILED (file_id=%s)", name, file_id)
                 results.append(
                     IndexBuildResult(
                         index_name=name,
-                        file_id=parse.file_id,
+                        file_id=file_id,
                         output_dir="",
-                        skipped_reason="build raised",
+                        skipped_reason=f"build raised: {type(exc).__name__}: {exc}",
+                        failed=True,
                     )
                 )
-    return pages, results
+    return results
+
+
+def _build_indexes_serial(
+    file_id: str, builders: Sequence[IndexBuilder], pages: List[PageAsset]
+) -> List[IndexBuildResult]:
+    results: List[IndexBuildResult] = []
+    for b in builders:
+        try:
+            res = b.build(file_id, pages)
+            logger.info(
+                "index %s done: items=%d skipped=%s (file_id=%s)",
+                b.name, res.item_count, res.skipped_reason, file_id,
+            )
+            results.append(res)
+        except Exception as exc:
+            logger.exception("index %s FAILED (file_id=%s)", b.name, file_id)
+            results.append(
+                IndexBuildResult(
+                    index_name=b.name,
+                    file_id=file_id,
+                    output_dir="",
+                    skipped_reason=f"build raised: {type(exc).__name__}: {exc}",
+                    failed=True,
+                )
+            )
+        finally:
+            # Drop the builder's references (NER pipeline, embedding
+            # client buffers, igraph snapshots) before the next builder
+            # starts so peak RSS stays bounded by the largest single
+            # builder, not the sum.
+            gc.collect()
+    return results
 
 
 def parse_and_index(
@@ -114,8 +166,14 @@ def parse_and_index(
     overwrite: bool = False,
     parser: Optional[PdfParser] = None,
     builders: Optional[Sequence[IndexBuilder]] = None,
+    parallel_builders: bool = True,
 ) -> PipelineResult:
-    """Single-file pipeline. Backwards-compatible shape."""
+    """Single-file ingestion pipeline.
+
+    ``parallel_builders=False`` runs the four index builders serially
+    inside one file (see :func:`_ingest_one`); use this on memory-
+    constrained hosts where the default fan-out OOMs.
+    """
     t0 = time.perf_counter()
     src_str = str(source)
 
@@ -129,16 +187,21 @@ def parse_and_index(
     )
 
     builder_list = list(builders) if builders is not None else _default_builders()
-    pages, results = _ingest_one(parse, builder_list)
+    pages, results = _ingest_one(parse, builder_list, parallel_builders=parallel_builders)
 
+    failures = [r for r in results if r.failed]
     return PipelineResult(
         parse=parse,
         pages=pages,
         indexes=results,
         total_seconds=time.perf_counter() - t0,
         source=src_str,
-        ok=True,
-        error=None,
+        ok=not failures,
+        error=(
+            "builder(s) failed: " + ", ".join(f"{r.index_name} ({r.skipped_reason})" for r in failures)
+            if failures
+            else None
+        ),
     )
 
 
@@ -149,6 +212,7 @@ def parse_and_index_many(
     parser: Optional[PdfParser] = None,
     builders: Optional[Sequence[IndexBuilder]] = None,
     parse_workers: int = 4,
+    parallel_builders: bool = True,
 ) -> List[PipelineResult]:
     """Pipelined many-file pipeline.
 
@@ -156,6 +220,10 @@ def parse_and_index_many(
     ingest runs serially on the main thread, taking each parsed file as
     soon as it is ready (so ingest of file N runs while parses of files
     N+1, N+2 ... are still in flight).
+
+    ``parallel_builders`` controls within-file builder concurrency
+    (forwarded to :func:`_ingest_one`); set to False on memory-
+    constrained hosts.
     """
     sources = [Path(s) for s in sources]
     if not sources:
@@ -193,7 +261,9 @@ def parse_and_index_many(
                 src.name,
             )
             try:
-                pages, idx_results = _ingest_one(parse, builder_list)
+                pages, idx_results = _ingest_one(
+                    parse, builder_list, parallel_builders=parallel_builders
+                )
             except Exception as exc:
                 logger.exception("ingest FAILED for %s", src)
                 results[src] = PipelineResult(
@@ -204,14 +274,21 @@ def parse_and_index_many(
                     total_seconds=time.perf_counter() - file_t0,
                 )
                 continue
+            failures = [r for r in idx_results if r.failed]
             results[src] = PipelineResult(
                 parse=parse,
                 pages=pages,
                 indexes=idx_results,
                 total_seconds=time.perf_counter() - file_t0,
                 source=str(src),
-                ok=True,
-                error=None,
+                ok=not failures,
+                error=(
+                    "builder(s) failed: " + ", ".join(
+                        f"{r.index_name} ({r.skipped_reason})" for r in failures
+                    )
+                    if failures
+                    else None
+                ),
             )
 
     n_ok = sum(1 for r in results.values() if r.ok)

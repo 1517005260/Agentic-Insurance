@@ -7,6 +7,11 @@ SentenceTransformer-backed store, and configuration is centralised in
 not here.
 """
 
+from ingestion.index.linear_rag.backfill import (
+    build_gazetteer_automaton,
+    find_literal_matches,
+    literal_backfill_graph,
+)
 from ingestion.index.linear_rag.disambig import (
     add_alias_edges,
     compute_clusters,
@@ -45,4 +50,7 @@ __all__ = [
     "is_junk",
     "canonical_form",
     "normalize_for_hash",
+    "literal_backfill_graph",
+    "build_gazetteer_automaton",
+    "find_literal_matches",
 ]

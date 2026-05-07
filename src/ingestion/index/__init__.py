@@ -13,6 +13,7 @@ and per-file removal. Build-time the four builders are independent.
 from ingestion.index.base import IndexBuilder, IndexBuildResult
 from ingestion.index.bm25_tantivy import BM25IndexBuilder
 from ingestion.index.graph_linearrag import GraphIndexBuilder
+from ingestion.index.maintenance import indexed_file_ids, purge_file_artifacts
 from ingestion.index.text_dense import TextDenseIndexBuilder
 from ingestion.index.vision_dense import VisionDenseIndexBuilder
 
@@ -23,4 +24,6 @@ __all__ = [
     "GraphIndexBuilder",
     "TextDenseIndexBuilder",
     "VisionDenseIndexBuilder",
+    "purge_file_artifacts",
+    "indexed_file_ids",
 ]

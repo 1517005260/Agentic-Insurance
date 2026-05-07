@@ -238,6 +238,27 @@ class LinearRAG:
         #    entities. Physical nodes are NOT merged.
         added_alias_edges = self._add_alias_edges_for_new_entities(new_entity_hash_set)
 
+        # 9. Literal mention backfill (KAG-style "domain mount"). spaCy NER
+        #    is contextual, so the same surface gets tagged on the page that
+        #    introduces it but missed on later pages that refer back; this
+        #    pass closes that gap by sweeping every passage with the union
+        #    of all entity surfaces and emitting entity_passage edges for
+        #    word-boundary literal hits the NER pass missed. See
+        #    ingestion.index.linear_rag.backfill for the rationale.
+        added_backfill_edges = 0
+        if self.config.literal_backfill_enabled:
+            from ingestion.index.linear_rag.backfill import literal_backfill_graph
+
+            entity_surfaces = self.entity_embedding_store.hash_id_to_text
+            passage_text = self.passage_embedding_store.hash_id_to_text
+            added_backfill_edges = literal_backfill_graph(
+                self.graph,
+                entity_surfaces,
+                passage_text,
+                min_surface_chars=self.config.literal_backfill_min_chars,
+                multi_word_only=self.config.literal_backfill_multi_word_only,
+            )
+
         # Cluster cache is now stale — invalidate so it recomputes lazily.
         clusters_path = faiss_graph_dir() / "clusters.json"
         if added_alias_edges:
@@ -255,7 +276,7 @@ class LinearRAG:
 
         logger.info(
             "index() done for file_id=%s: graph=(%d v, %d e), "
-            "added passages=%d entities=%d sentences=%d alias_edges=%d",
+            "added passages=%d entities=%d sentences=%d alias_edges=%d backfill_edges=%d",
             file_id,
             self.graph.vcount(),
             self.graph.ecount(),
@@ -263,6 +284,7 @@ class LinearRAG:
             len(new_entity_hash_set),
             len(new_sentence_hash_set),
             added_alias_edges,
+            added_backfill_edges,
         )
 
         return {
@@ -270,6 +292,7 @@ class LinearRAG:
             "entities": len(new_entity_hash_set),
             "sentences": len(new_sentence_hash_set),
             "alias_edges": added_alias_edges,
+            "backfill_edges": added_backfill_edges,
         }
 
     # ------------------------------------------------------ disambiguation
