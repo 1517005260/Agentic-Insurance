@@ -2,7 +2,8 @@
 
 from config import settings
 from config.settings import *  # noqa: F401,F403
+from config.http import make_retry_session
 from config.linear_rag import LinearRAGConfig
 from config.rag import RAGConfig
 
-__all__ = ["settings", "LinearRAGConfig", "RAGConfig"]
+__all__ = ["settings", "LinearRAGConfig", "RAGConfig", "make_retry_session"]

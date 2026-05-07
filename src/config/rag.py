@@ -1,8 +1,8 @@
 """Query-time RAG pipeline configuration.
 
-Knobs for the four-channel retrieval flow defined in ``docs/rag_pipeline.md``.
-Storage paths and API endpoints come from :mod:`config.settings`; this struct
-only carries algorithmic / capacity parameters.
+Knobs for the four-channel retrieval flow. Storage paths and API endpoints
+come from :mod:`config.settings`; this struct only carries algorithmic /
+capacity parameters.
 """
 
 from dataclasses import dataclass

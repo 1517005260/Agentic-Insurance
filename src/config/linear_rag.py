@@ -40,3 +40,13 @@ class LinearRAGConfig:
     # time (OpenCC). Disable when the corpus is intentionally bilingual and
     # script distinctions carry meaning.
     fold_traditional: bool = True
+
+    # Literal-substring backfill (KAG-style "domain mount"). spaCy NER is
+    # contextual, so the same surface gets tagged on its introduction page
+    # but missed on later reference pages. This pass sweeps every page
+    # against the union of NER-discovered entity surfaces and adds the
+    # missing entity↔passage edges. See ingestion.index.linear_rag.backfill.
+    # TODO(config-center): expose these to the admin tunables panel.
+    literal_backfill_enabled: bool = True
+    literal_backfill_min_chars: int = 4          # drops "us", "irs"
+    literal_backfill_multi_word_only: bool = True  # drops "axa", "company"

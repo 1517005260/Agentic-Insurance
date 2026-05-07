@@ -40,6 +40,11 @@ dependencies = [
     "python-igraph>=0.11.0",
     "tantivy>=0.26.0",
     "faiss-cpu>=1.8.0",
+    # Aho-Corasick multi-pattern string matcher used by the LinearRAG
+    # literal-backfill pass (KAG-style "domain mount"). C-implemented; the
+    # alternative regex-alternation path scales O(text * patterns) and is
+    # noticeably slower once the entity vocabulary grows past ~50.
+    "pyahocorasick>=2.1.0",
     # spaCy NER (the local-model carve-out). The recent en/zh _trf models on
     # HuggingFace ship the curated-transformers factory; older spacy-
     # transformers is kept too because some downloaded models still
@@ -57,11 +62,28 @@ dependencies = [
     "dateparser>=1.4.0",
     "portion>=2.6.1",
     "pydantic>=2.13.3",
+    # ---- Web app (src/api/) ------------------------------------------------
+    # FastAPI backend that wraps the algorithm layer. SQLite-only; no Redis,
+    # no Celery, no broker — single-process app for the demo.
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.30",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.13.0",
+    "python-jose[cryptography]>=3.3.0",
+    # Direct bcrypt (no passlib): passlib is unmaintained and breaks
+    # against bcrypt >=4. See api/auth.py for the sha256-then-bcrypt
+    # wrapper that bypasses bcrypt's 72-byte input cap.
+    "bcrypt>=4.0.0",
+    "python-multipart>=0.0.9",
+    "pydantic-settings>=2.4.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
 ]
@@ -73,6 +95,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = [
     "src/agentic",
+    "src/api",
     "src/config",
     "src/ingestion",
     "src/model_client",
