@@ -23,7 +23,7 @@ Pre-warm:
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import tiktoken
 
@@ -81,8 +81,18 @@ class BaseAgent:
                 timings[name] = -1.0
         return timings
 
-    def _calculate_message_tokens(self, messages: List[Dict[str, Any]]) -> int:
-        total = len(self.tokenizer.encode(self.system_prompt))
+    def _calculate_message_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: Optional[str] = None,
+    ) -> int:
+        # The system prompt is intentionally double-counted: it is seeded
+        # here AND walked again as messages[0] below. The token-budget
+        # exhaustion thresholds calibrated against this behavior, so the
+        # double-count is part of the contract. ``is not None`` (rather
+        # than ``or``) lets a caller override to an empty string.
+        prompt = system_prompt if system_prompt is not None else self.system_prompt
+        total = len(self.tokenizer.encode(prompt))
         for msg in messages:
             content = msg.get("content", "")
             if content:
@@ -132,11 +142,45 @@ class BaseAgent:
         self,
         query: str,
         tracer: Optional[Tracer] = None,
+        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        *,
+        max_loops: Optional[int] = None,
+        max_token_budget: Optional[int] = None,
+        system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Run the tool-calling loop.
+
+        ``on_event`` (optional) is a sync callback invoked at every
+        observable boundary so a streaming consumer (e.g. SSE runner)
+        can mirror progress. Signature ``(event_name: str, data: dict)``.
+        Default ``None`` means no callbacks — experiment scripts and the
+        existing CLI path are unaffected.
+
+        ``max_loops`` / ``max_token_budget`` / ``system_prompt`` (all
+        optional) override the constructor values for this run only.
+        ``None`` falls back to the per-instance defaults so existing
+        call sites — every experiment script — keep their byte-identical
+        behavior.
+
+        Emitted events:
+        * ``status`` — phase transitions (``thinking`` per loop,
+          ``force_final`` on budget hit).
+        * ``tool_call`` / ``tool_result`` — one per tool execution.
+        * ``final`` — summary frame at the end (always emitted before
+          the runner closes the stream).
+        """
+        effective_max_loops = max_loops if max_loops is not None else self.max_loops
+        effective_max_tokens = (
+            max_token_budget if max_token_budget is not None else self.max_token_budget
+        )
+        effective_system_prompt = (
+            system_prompt if system_prompt is not None else self.system_prompt
+        )
+        emit = _make_emitter(on_event)
         session = tracer.session(query) if tracer is not None else None
         context = AgentContext()
         messages = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": effective_system_prompt},
             {"role": "user", "content": query},
         ]
 
@@ -159,10 +203,10 @@ class BaseAgent:
                 "setup",
                 {
                     "model": self.llm.model,
-                    "system_prompt": self.system_prompt,
+                    "system_prompt": effective_system_prompt,
                     "tool_schemas": tool_schemas,
-                    "max_loops": self.max_loops,
-                    "max_token_budget": self.max_token_budget,
+                    "max_loops": effective_max_loops,
+                    "max_token_budget": effective_max_tokens,
                 },
             )
 
@@ -174,16 +218,19 @@ class BaseAgent:
         early_exit_reason: Optional[str] = None
         final_answer: str = ""
 
-        for loop_idx in range(self.max_loops):
+        for loop_idx in range(effective_max_loops):
             loop_count = loop_idx + 1
 
-            current_tokens = self._calculate_message_tokens(messages)
-            if current_tokens > self.max_token_budget:
+            current_tokens = self._calculate_message_tokens(
+                messages, system_prompt=effective_system_prompt
+            )
+            if current_tokens > effective_max_tokens:
                 if self.verbose:
                     print(
-                        f"Token budget exceeded ({current_tokens} > {self.max_token_budget}), "
+                        f"Token budget exceeded ({current_tokens} > {effective_max_tokens}), "
                         f"forcing answer..."
                     )
+                emit("status", {"phase": "force_final", "reason": "token_budget_exceeded"})
                 final_answer, total_cost = self._force_final_answer(
                     messages, context, total_cost, "Token budget exceeded", session=session
                 )
@@ -192,9 +239,18 @@ class BaseAgent:
 
             if self.verbose:
                 print(
-                    f"Loop {loop_count}/{self.max_loops} "
-                    f"(Tokens: {current_tokens}/{self.max_token_budget})"
+                    f"Loop {loop_count}/{effective_max_loops} "
+                    f"(Tokens: {current_tokens}/{effective_max_tokens})"
                 )
+            emit(
+                "status",
+                {
+                    "phase": "thinking",
+                    "loop": loop_count,
+                    "max_loops": effective_max_loops,
+                    "tokens_used": current_tokens,
+                },
+            )
 
             try:
                 response = self.llm.chat(messages=messages, tools=tool_schemas)
@@ -242,6 +298,11 @@ class BaseAgent:
                     print(f"Tool: {func_name}")
                     print(f"  Args: {func_args}")
 
+                emit(
+                    "tool_call",
+                    {"loop": loop_count, "name": func_name, "args": func_args},
+                )
+
                 try:
                     tool_result, tool_log = self.tools.execute(func_name, context, **func_args)
                 except Exception as e:
@@ -280,11 +341,22 @@ class BaseAgent:
                 trajectory.append(turn_record)
                 if session is not None:
                     session.event("trajectory", turn_record)
+                emit(
+                    "tool_result",
+                    {
+                        "loop": loop_count,
+                        "name": func_name,
+                        "preview": tool_result[:300],
+                        "retrieved_tokens": tool_log.get("retrieved_tokens", 0),
+                        "error": tool_log.get("error"),
+                    },
+                )
 
         # Loop exited without natural break or early exit ⇒ max loops hit.
         if early_exit_reason is None:
             if self.verbose:
-                print(f"Max loops reached ({self.max_loops}), forcing answer...")
+                print(f"Max loops reached ({effective_max_loops}), forcing answer...")
+            emit("status", {"phase": "force_final", "reason": "max_loops_exceeded"})
             final_answer, total_cost = self._force_final_answer(
                 messages, context, total_cost, "Maximum loops exceeded", session=session
             )
@@ -325,8 +397,43 @@ class BaseAgent:
                 },
             )
 
+        emit(
+            "final",
+            {
+                "answer": final_answer,
+                "exit_reason": early_exit_reason,
+                "loops": loop_count,
+                "total_cost": total_cost,
+                "input_tokens_total": input_tokens_total,
+                "cached_tokens_total": cached_tokens_total,
+                "output_tokens_total": output_tokens_total,
+            },
+        )
+
         return result
 
+
+
+def _make_emitter(
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> Callable[[str, Dict[str, Any]], None]:
+    """Wrap an optional callback so call sites can fire events unconditionally.
+
+    A callback exception must NOT poison the agent loop — the consumer
+    side might disconnect mid-run. We log and swallow.
+    """
+    if on_event is None:
+        def _noop(_event: str, _data: Dict[str, Any]) -> None:
+            return
+        return _noop
+
+    def _emit(event: str, data: Dict[str, Any]) -> None:
+        try:
+            on_event(event, data)
+        except Exception:
+            logger.exception("on_event callback failed for %s", event)
+
+    return _emit
 
 
 def _llm_call_record(

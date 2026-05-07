@@ -29,8 +29,7 @@ comparable WITHIN a single request — never across calls.
 
 from typing import Any, Dict, List, Optional, Sequence
 
-import requests
-
+from config.http import make_retry_session
 from config.settings import RERANKER_API_BASE_URL, RERANKER_API_KEY, RERANKER_MODEL
 
 
@@ -53,6 +52,7 @@ class RerankClient:
         self.api_key = api_key or RERANKER_API_KEY
         self.base_url = (base_url or RERANKER_API_BASE_URL).rstrip("/")
         self.timeout = timeout
+        self._session = make_retry_session()
 
     def available(self) -> bool:
         return bool(self.model and self.api_key)
@@ -88,7 +88,7 @@ class RerankClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+        response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
         if response.status_code >= 400:
             # Surface the server's error body — DashScope returns useful
             # diagnostics (invalid_parameter, bad model name, …) that

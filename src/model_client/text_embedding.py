@@ -7,8 +7,8 @@ downstream. Batches requests to avoid hitting per-request size limits.
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
-import requests
 
+from config.http import make_retry_session
 from config.settings import (
     EMBEDDING_API_BASE_URL,
     EMBEDDING_API_KEY,
@@ -36,6 +36,8 @@ class EmbeddingClient:
                 "Embedding API key required. Set EMBEDDING_API_KEY in .env or pass api_key."
             )
 
+        self._session = make_retry_session()
+
     def encode(self, texts: Union[str, Sequence[str]]) -> np.ndarray:
         """Embed a string (1-D) or list of strings (2-D). L2-normalized."""
         single = isinstance(texts, str)
@@ -52,7 +54,7 @@ class EmbeddingClient:
         for start in range(0, len(texts), self.batch_size):
             batch = list(texts[start : start + self.batch_size])
             payload = {"model": self.model, "input": batch}
-            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json().get("data", [])
             data.sort(key=lambda d: d.get("index", 0))

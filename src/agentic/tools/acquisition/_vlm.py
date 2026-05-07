@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Optional
 import requests
 
 from agentic.tools.acquisition._common import safe_resolve_path
+from config.http import make_retry_session
 from config.settings import (
     VLM_API_BASE_URL,
     VLM_API_KEY,
@@ -33,6 +34,19 @@ from config.settings import (
     paddle_ocr_root,
 )
 from storage.page_store import PageAsset
+
+
+# Lazy module-level retry session — _vlm exports module-level functions
+# rather than a client class, so the session lives here. Built on first
+# call from any thread; subsequent calls reuse it.
+_session: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    global _session
+    if _session is None:
+        _session = make_retry_session()
+    return _session
 
 
 logger = logging.getLogger(__name__)
@@ -168,7 +182,7 @@ def _call_vlm(
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
     try:
-        resp = requests.post(
+        resp = _get_session().post(
             f"{base}/chat/completions", headers=headers, json=payload, timeout=timeout
         )
         resp.raise_for_status()

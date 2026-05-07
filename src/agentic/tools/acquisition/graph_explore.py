@@ -287,9 +287,19 @@ class GraphExploreTool(BaseTool):
             lang="",
             regexes=[],
             file_ids=list(scope.file_ids) if scope.file_ids else None,
+            # Agent path: PPR is the only signal here, so let the channel
+            # rescue NER misses with the gazetteer + question-embedding
+            # fallbacks. The 4-channel RAG path leaves this off.
+            enable_ppr_seed_fallback=True,
         )
         try:
-            channel_hits = self._channel.retrieve(ctx)
+            # Atomic ``hits + debug snapshot`` — the channel singleton
+            # is shared across all 3 agent kinds AND the RAG pipeline,
+            # so reading ``self._channel.last_debug`` after the call is
+            # racy: another concurrent retrieve() could overwrite it.
+            # ``retrieve_with_debug`` holds the channel's RLock for both
+            # the call and the snapshot.
+            channel_hits, debug_snapshot = self._channel.retrieve_with_debug(ctx)
         except Exception as exc:
             logger.exception("graph_explore[ppr] failed: %s", exc)
             return err(
@@ -319,7 +329,7 @@ class GraphExploreTool(BaseTool):
             if len(results) >= limit:
                 break
 
-        seeds_dbg = self._channel.last_debug.get("seeds", [])
+        seeds_dbg = debug_snapshot.get("seeds", [])
         log_meta = {
             "mode": "ppr",
             "question": question,
@@ -788,16 +798,20 @@ class GraphExploreTool(BaseTool):
         emb_arr = np.asarray(emb)
         if emb_arr.ndim == 2:
             emb_arr = emb_arr[0]
-        # No min-sim floor here: the disambiguator's 0.85 threshold is
-        # tuned for *adding* alias edges (high precision, low recall);
-        # query-time lookup wants the opposite — surface what *might*
-        # match, let the agent triage.
+        # The disambiguator's 0.85 threshold is tuned for *adding* alias
+        # edges (high precision, low recall); query-time lookup wants
+        # something looser, but 0.4 surfaces too much noise (e.g. a
+        # surface like "Premium Refund" matched a sim=0.4 product name).
+        # 0.6 is the empirical sweet spot on this corpus.
+        # TODO(config-center): expose `min_sim` and gradient `g` to the
+        # admin tunables panel — different corpora prefer different cutoffs.
+        _ENTITY_LOOKUP_MIN_SIM = 0.6
         cands = gradient_topk_candidates(
             emb_arr,
             store,
             k=limit,
             g=0.5,
-            min_sim=0.4,
+            min_sim=_ENTITY_LOOKUP_MIN_SIM,
         )
         if not cands:
             return (
@@ -806,7 +820,10 @@ class GraphExploreTool(BaseTool):
                     mode="entity_lookup",
                     surface=surface,
                     physical=[],
-                    note="No entity above min similarity 0.4 — try a different surface form.",
+                    note=(
+                        f"No entity above min similarity {_ENTITY_LOOKUP_MIN_SIM} "
+                        f"— try a different surface form."
+                    ),
                 ),
                 {"retrieved_tokens": 0, "physical_hits": 0},
             )

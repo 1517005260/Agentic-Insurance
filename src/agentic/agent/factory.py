@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.prompts import PROOF_SYSTEM_PROMPT, SYSTEM_PROMPT
+from agentic.agent.prompts import GRAPH_SYSTEM_PROMPT, PROOF_SYSTEM_PROMPT, SYSTEM_PROMPT
 from agentic.agent.proof_agent import ProofAgent
 from agentic.tools.acquisition import (
     Bm25SearchTool,
@@ -160,6 +160,60 @@ def build_proof_agent(
         page_store=page_store,
         inventory_store=inventory_store,
         system_prompt=system_prompt or PROOF_SYSTEM_PROMPT,
+        max_loops=max_loops,
+        max_token_budget=max_token_budget,
+        verbose=verbose,
+    )
+
+
+def build_graph_agent(
+    *,
+    llm_client: Optional[LLMClient] = None,
+    embedding_client: Optional[EmbeddingClient] = None,
+    page_store: Optional[PageStore] = None,
+    inventory: Optional[InventoryStore] = None,
+    graph_channel: Optional[GraphPPRChannel] = None,
+    page_assets_dir: Optional[Path] = None,
+    system_prompt: Optional[str] = None,
+    max_loops: int = 8,
+    max_token_budget: int = 64_000,
+    verbose: bool = False,
+) -> BaseAgent:
+    """Build a BaseAgent specialised for knowledge-graph navigation.
+
+    Tools registered: ``graph_explore`` (LinearRAG entity / passage
+    graph) and ``read_page`` (full-text page reader). The graph tool
+    surfaces *which* pages are relevant; the reader pulls the actual
+    Markdown so the LLM can quote and cite verbatim — this mirrors
+    upstream LinearRAG's "PPR retrieve → reader" split.
+
+    The system prompt (see :data:`GRAPH_SYSTEM_PROMPT`) walks the
+    model through the three graph_explore modes (entity_lookup /
+    neighbors / ppr) and the standard "navigate → read → cite"
+    trajectory.
+
+    Defaults are tighter than the multi-tool agent (``max_loops=8``,
+    ``max_token_budget=64k``): graph traversals are cheap but the loop
+    wastes budget quickly if it meanders. Override per call site.
+    """
+    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
+    inventory = inventory or InventoryStore(page_store=page_store)
+
+    embedding_client = embedding_client or EmbeddingClient()
+    llm_client = llm_client or LLMClient()
+
+    graph_channel = graph_channel or GraphPPRChannel(
+        embedding_client=embedding_client,
+    )
+
+    registry = ToolRegistry()
+    registry.register(GraphExploreTool(channel=graph_channel, inventory=inventory))
+    registry.register(ReadTool(page_store=page_store, inventory=inventory))
+
+    return BaseAgent(
+        llm_client=llm_client,
+        tools=registry,
+        system_prompt=system_prompt or GRAPH_SYSTEM_PROMPT,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,

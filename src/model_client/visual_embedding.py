@@ -26,8 +26,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
-import requests
 
+from config.http import make_retry_session
 from config.settings import (
     VISUAL_EMBEDDING_API_BASE_URL,
     VISUAL_EMBEDDING_API_KEY,
@@ -53,6 +53,7 @@ class VisualEmbeddingClient:
         self.base_url = (base_url or VISUAL_EMBEDDING_API_BASE_URL).rstrip("/")
         self.batch_size = max(1, batch_size)
         self.timeout = timeout
+        self._session = make_retry_session()
 
     def available(self) -> bool:
         return bool(self.model and self.api_key)
@@ -111,7 +112,7 @@ class VisualEmbeddingClient:
                 "input": {"contents": batch},
                 "parameters": {},
             }
-            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             embeddings = self._parse_embeddings(response.json())
             if len(embeddings) != len(batch):

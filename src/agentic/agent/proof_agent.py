@@ -16,10 +16,11 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import tiktoken
 
+from agentic.agent.base import _make_emitter
 from agentic.agent.prompts.proof_system import PROOF_SYSTEM_PROMPT
 from agentic.closure.budget import Budget
 from agentic.closure.inventory import Inventory, InventoryAdapter
@@ -102,11 +103,41 @@ class ProofAgent:
 
     # ------------------------------------------------------------- run
 
-    def run(self, query: str, tracer: Optional[Tracer] = None) -> ProofRunResult:
+    def run(
+        self,
+        query: str,
+        tracer: Optional[Tracer] = None,
+        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        *,
+        max_loops: Optional[int] = None,
+        max_token_budget: Optional[int] = None,
+        system_prompt: Optional[str] = None,
+    ) -> ProofRunResult:
+        """Run the proof loop.
+
+        ``on_event`` mirrors :meth:`BaseAgent.run`: optional sync
+        ``(event, data)`` callback. In addition to ``status`` /
+        ``tool_call`` / ``tool_result`` / ``final``, this loop emits
+        ``obligation`` / ``claim`` / ``gap`` deltas after every tool
+        call so a streaming UI can update the proof board.
+
+        ``max_loops`` / ``max_token_budget`` / ``system_prompt`` (all
+        optional, ``None`` → constructor value) let the web layer push
+        the admin-config overrides per request without rebuilding the
+        agent singleton.
+        """
+        effective_max_loops = max_loops if max_loops is not None else self.max_loops
+        effective_max_tokens = (
+            max_token_budget if max_token_budget is not None else self.max_token_budget
+        )
+        effective_system_prompt = (
+            system_prompt if system_prompt is not None else self.system_prompt
+        )
+        emit = _make_emitter(on_event)
         context = AgentContext()
         session = ProofSession.build(
             inventory=self.inventory,
-            budget=Budget(remaining_steps=self.max_loops, max_loops=self.max_loops),
+            budget=Budget(remaining_steps=effective_max_loops, max_loops=effective_max_loops),
         )
 
         proof_tools = ToolRegistry()
@@ -125,7 +156,7 @@ class ProofAgent:
 
         trace_session: Optional[TraceSession] = tracer.session(query) if tracer else None
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": effective_system_prompt},
             {"role": "user", "content": query},
         ]
         trajectory: List[Dict[str, Any]] = []
@@ -140,16 +171,34 @@ class ProofAgent:
         # inject a reminder.
         must_finalize_pending = False
 
-        for loop_idx in range(self.max_loops):
+        # State trackers for emitting obligation/claim/gap deltas. We
+        # snapshot status by id before each tool dispatch and diff after,
+        # rather than the agent code threading callbacks through every
+        # internal mutation site.
+        last_obligation_status: Dict[str, tuple] = {}
+        seen_claim_ids: set[str] = set()
+        last_gap_status: Dict[str, str] = {}
+
+        for loop_idx in range(effective_max_loops):
             loop_count = loop_idx + 1
             session.budget = Budget(
-                remaining_steps=self.max_loops - loop_idx,
-                max_loops=self.max_loops,
+                remaining_steps=effective_max_loops - loop_idx,
+                max_loops=effective_max_loops,
             )
 
-            if self._token_count(messages) > self.max_token_budget:
+            if self._token_count(messages, system_prompt=effective_system_prompt) > effective_max_tokens:
                 exit_reason = "token_budget_exceeded"
                 break
+
+            emit(
+                "status",
+                {
+                    "phase": "thinking",
+                    "loop": loop_count,
+                    "max_loops": effective_max_loops,
+                    "remaining_steps": session.budget.remaining_steps,
+                },
+            )
 
             if must_finalize_pending:
                 messages.append(
@@ -190,6 +239,11 @@ class ProofAgent:
                 except json.JSONDecodeError:
                     func_args = {}
 
+                emit(
+                    "tool_call",
+                    {"loop": loop_count, "name": func_name, "args": func_args},
+                )
+
                 tool_result, tool_log = all_tools.execute(func_name, context, **func_args)
 
                 # Record acquisition results as observations so claims can cite them.
@@ -224,6 +278,45 @@ class ProofAgent:
                 if trace_session is not None:
                     trace_session.event("trajectory", turn_record)
 
+                emit(
+                    "tool_result",
+                    {
+                        "loop": loop_count,
+                        "name": func_name,
+                        "preview": tool_result[:300],
+                        "observation_id": (
+                            f"obs_{observation_counter:04d}"
+                            if func_name not in {
+                                "proof_plan_init", "proof_gap_propose",
+                                "proof_claim_ingest", "proof_finalize",
+                            } else None
+                        ),
+                        "must_finalize_next": tool_log.get("must_finalize_next", False),
+                    },
+                )
+
+                # Re-plan wipes obligations / candidate_gaps in place;
+                # if it reuses an id with the same (status, failure_kind)
+                # the diff would emit nothing and the UI would keep
+                # stale kind/scope from the old plan. Force-reset the
+                # trackers so every post-replan obligation re-emits.
+                if func_name == "proof_plan_init":
+                    for oid in list(last_obligation_status):
+                        emit("obligation", {"id": oid, "status": "REMOVED"})
+                    last_obligation_status.clear()
+                    for cid in list(seen_claim_ids):
+                        emit("claim", {"id": cid, "status": "REMOVED"})
+                    seen_claim_ids.clear()
+                    for gid in list(last_gap_status):
+                        emit("gap", {"id": gid, "status": "REMOVED"})
+                    last_gap_status.clear()
+
+                # Diff session state after the tool ran. Emit one event
+                # per added/changed obligation, claim, or candidate gap.
+                _emit_session_deltas(
+                    emit, session, last_obligation_status, seen_claim_ids, last_gap_status
+                )
+
                 if func_name == "proof_finalize":
                     decision = tool_log.get("decision")
                     if decision in {"CERTIFIED", "ABSTAIN"}:
@@ -251,6 +344,20 @@ class ProofAgent:
                 },
             )
 
+        emit(
+            "final",
+            {
+                "answer": answer,
+                "decision": decision,
+                "exit_reason": exit_reason,
+                "loops": loop_count,
+                "total_cost": total_cost,
+                "obligations_total": len(session.obligations),
+                "claims_total": len(session.claims),
+                "candidate_gaps_total": len(session.candidate_gaps),
+            },
+        )
+
         return ProofRunResult(
             decision=decision,
             answer=answer,
@@ -263,8 +370,16 @@ class ProofAgent:
             exit_reason=exit_reason,
         )
 
-    def _token_count(self, messages: List[Dict[str, Any]]) -> int:
-        total = len(self.tokenizer.encode(self.system_prompt))
+    def _token_count(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: Optional[str] = None,
+    ) -> int:
+        # ``is not None`` (not ``or``) so an empty-string override is
+        # respected — symmetric with how ``run()`` decides which prompt
+        # to inject as messages[0].
+        prompt = system_prompt if system_prompt is not None else self.system_prompt
+        total = len(self.tokenizer.encode(prompt))
         for msg in messages:
             content = msg.get("content") or ""
             if isinstance(content, list):
@@ -277,6 +392,90 @@ class ProofAgent:
 
 
 # ---------------------------------------------------------------- helpers
+
+
+def _emit_session_deltas(
+    emit: Callable[[str, Dict[str, Any]], None],
+    session,
+    last_obligation_status: Dict[str, tuple],
+    seen_claim_ids: set,
+    last_gap_status: Dict[str, str],
+) -> None:
+    """Diff ProofSession state vs trackers and emit per-id change events.
+
+    Trackers are mutated in place so the next call only fires on real
+    deltas. Cheap because obligations / claims / gaps are O(few dozen)
+    per run.
+
+    ``proof_plan_init`` (and any future re-plan) wipes the obligation /
+    candidate_gap lists; we emit ``status='REMOVED'`` for any tracked id
+    that disappeared so a streaming UI can prune its proof board
+    instead of leaving stale rows.
+    """
+    # ----------------------------------------------------------- obligations
+    current_ob_ids = {ob.id for ob in session.obligations}
+    for removed_id in [oid for oid in last_obligation_status if oid not in current_ob_ids]:
+        del last_obligation_status[removed_id]
+        emit("obligation", {"id": removed_id, "status": "REMOVED"})
+
+    for ob in session.obligations:
+        key = (ob.status, ob.failure_kind)
+        if last_obligation_status.get(ob.id) != key:
+            last_obligation_status[ob.id] = key
+            emit(
+                "obligation",
+                {
+                    "id": ob.id,
+                    "kind": str(ob.kind),
+                    "status": ob.status,
+                    "required": ob.required,
+                    "failure_kind": ob.failure_kind,
+                },
+            )
+
+    # ---------------------------------------------------------------- claims
+    current_claim_ids = {cl.id for cl in session.claims}
+    for removed_id in list(seen_claim_ids - current_claim_ids):
+        seen_claim_ids.discard(removed_id)
+        emit("claim", {"id": removed_id, "status": "REMOVED"})
+
+    for cl in session.claims:
+        if cl.id in seen_claim_ids:
+            continue
+        seen_claim_ids.add(cl.id)
+        # Claims have heterogeneous shapes; pick a stable subset.
+        emit(
+            "claim",
+            {
+                "id": cl.id,
+                "kind": getattr(cl, "claim_type", type(cl).__name__),
+                "by": [getattr(cl, "citation", None).observation_id] if hasattr(cl, "citation") and cl.citation else [],
+            },
+        )
+
+    # ---------------------------------------------------------------- gaps
+    current_gap_ids = {
+        getattr(g, "id", None) for g in session.candidate_gaps if getattr(g, "id", None)
+    }
+    for removed_id in [gid for gid in last_gap_status if gid not in current_gap_ids]:
+        del last_gap_status[removed_id]
+        emit("gap", {"id": removed_id, "status": "REMOVED"})
+
+    for gap in session.candidate_gaps:
+        gap_id = getattr(gap, "id", None)
+        gap_status = getattr(gap, "status", "ACTIVE")
+        if gap_id is None:
+            continue
+        if last_gap_status.get(gap_id) != gap_status:
+            last_gap_status[gap_id] = gap_status
+            emit(
+                "gap",
+                {
+                    "id": gap_id,
+                    "kind": getattr(gap, "kind", None),
+                    "status": gap_status,
+                },
+            )
 
 
 def _annotate_with_observation_id(tool_result: str, observation_id: str) -> str:
