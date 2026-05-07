@@ -30,7 +30,7 @@ import logging
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import igraph as ig
 import numpy as np
@@ -42,6 +42,10 @@ from config.settings import (
     faiss_graph_passage_dir,
     faiss_graph_sentence_dir,
     models_root,
+)
+from ingestion.index.linear_rag.backfill import (
+    build_gazetteer_automaton,
+    find_literal_matches,
 )
 from ingestion.index.linear_rag.ner import SpacyNER
 from ingestion.index.linear_rag.normalize import normalize_for_hash
@@ -105,50 +109,89 @@ class GraphPPRChannel(BaseChannel):
         self._entity_to_sents: Optional[Dict[str, List[str]]] = None
         self._sent_to_entities: Optional[Dict[str, List[str]]] = None
 
+        # Lazy gazetteer Aho-Corasick automaton over entity surfaces, used
+        # as a query-side seed fallback when spaCy NER misses domain
+        # product names (e.g. "Heritage Protector Option"). Mirrors the
+        # HippoRAG-2 query-to-node seeding idea.
+        self._gazetteer_automaton = None
+
         # Debug snapshot — populated each retrieve() call. Inspect with
         # ``channel.last_debug`` after a query for tracing.
         self.last_debug: Dict[str, object] = {}
 
+        # Serializes any retrieve / retrieve_subgraph call that mutates
+        # ``last_debug`` so two concurrent agents (or the RAG pipeline +
+        # an agent) sharing the same channel can't interleave a tool's
+        # post-call ``self.last_debug`` read with another query's write.
+        # PPR is faiss + igraph + spaCy heavy; serializing has no
+        # measurable throughput cost on a single-process dev box.
+        import threading
+
+        self._call_lock = threading.RLock()
+
     # ----------------------------------------------------------- public API
 
     def retrieve(self, ctx: QueryContext) -> List[ChannelHit]:
-        self.last_debug = {}
-        if self.graph is None or len(self.passage_store) == 0:
-            self.last_debug["mode"] = "no_graph"
-            return []
+        # Hold ``_call_lock`` for the whole body so a downstream caller
+        # that reads ``self.last_debug`` after our return (the agent's
+        # GraphExploreTool does) cannot observe another concurrent
+        # query's debug payload. See :meth:`retrieve_with_debug` for the
+        # atomic (hits, debug) variant — agents should prefer it; the
+        # 4-channel RAG pipeline ignores last_debug, so plain
+        # ``retrieve()`` is fine for that path.
+        with self._call_lock:
+            self.last_debug = {}
+            if self.graph is None or len(self.passage_store) == 0:
+                self.last_debug["mode"] = "no_graph"
+                return []
 
-        question = (ctx.query + " " + (ctx.rewrite or "")).strip()
-        seeds = self._seed_entities(question)
+            question = (ctx.query + " " + (ctx.rewrite or "")).strip()
+            seeds = self._seed_entities(question, enable_fallback=ctx.enable_ppr_seed_fallback)
 
-        self.last_debug["seeds"] = [
-            {
-                "hash_id": hid,
-                "surface": self.entity_store.hash_id_to_text.get(hid, ""),
-                "sim": round(sim, 4),
-            }
-            for hid, _, sim in seeds
-        ]
+            self.last_debug["seeds"] = [
+                {
+                    "hash_id": hid,
+                    "surface": self.entity_store.hash_id_to_text.get(hid, ""),
+                    "sim": round(sim, 4),
+                }
+                for hid, _, sim in seeds
+            ]
 
-        # No seeds → return empty. LinearRAG (single-path) falls back to
-        # plain dense retrieval here, but in our 4-channel RRF setup that
-        # would just duplicate the semantic channel's ranking and bias the
-        # fusion. Letting the graph channel sit out keeps RRF's
-        # independence assumption intact.
-        if not seeds:
-            self.last_debug["mode"] = "no_seeds_skip"
-            return []
+            # No seeds → return empty. LinearRAG (single-path) falls back to
+            # plain dense retrieval here, but in our 4-channel RRF setup that
+            # would just duplicate the semantic channel's ranking and bias the
+            # fusion. Letting the graph channel sit out keeps RRF's
+            # independence assumption intact.
+            if not seeds:
+                self.last_debug["mode"] = "no_seeds_skip"
+                return []
 
-        self.last_debug["mode"] = "ppr"
-        question_emb = self.embedding_client.encode(question)
-        entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
-        passage_weights = self._calculate_passage_scores(
-            question, question_emb, actived
-        )
-        node_weights = entity_weights + passage_weights
-        self.last_debug["actived_entities"] = len(actived)
+            self.last_debug["mode"] = "ppr"
+            question_emb = self.embedding_client.encode(question)
+            entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
+            passage_weights = self._calculate_passage_scores(
+                question, question_emb, actived
+            )
+            node_weights = entity_weights + passage_weights
+            self.last_debug["actived_entities"] = len(actived)
 
-        ranked = self._run_ppr(node_weights)
-        return self._materialize_hits(ranked, ctx.file_ids)
+            ranked = self._run_ppr(node_weights)
+            return self._materialize_hits(ranked, ctx.file_ids)
+
+    def retrieve_with_debug(
+        self, ctx: QueryContext
+    ) -> Tuple[List[ChannelHit], Dict[str, Any]]:
+        """Atomic ``retrieve()`` + snapshot of ``last_debug``.
+
+        Use this from any consumer that reads ``self.last_debug`` after
+        the call (currently: the agent's ``graph_explore`` tool's PPR
+        mode). Holds the same RLock as :meth:`retrieve` for the call
+        AND the snapshot so a concurrent query can't overwrite the
+        debug payload between them.
+        """
+        with self._call_lock:
+            hits = self.retrieve(ctx)
+            return hits, dict(self.last_debug)
 
     # ----------------------------------------------------------- seeding
 
@@ -163,41 +206,128 @@ class GraphPPRChannel(BaseChannel):
             self._spacy = SpacyNER(str(spacy_path), zh_spacy_model=zh_path)
         return self._spacy
 
-    def _seed_entities(self, question: str) -> List[Tuple[str, int, float]]:
+    def _seed_entities(
+        self,
+        question: str,
+        *,
+        enable_fallback: bool = False,
+    ) -> List[Tuple[str, int, float]]:
         """Return ``[(hash_id, vertex_idx, sim), ...]`` — at most one per
         question entity, deduped by hash_id (best score wins).
+
+        When ``enable_fallback`` is True, also runs two query-side
+        recall boosters in order if the NER path produced no seeds:
+
+        1. **Gazetteer literal scan.** Aho-Corasick word-boundary match
+           of the question text against every known entity surface.
+           Catches "Heritage Protector Option" or "FATCA" that spaCy's
+           contextual NER fails to tag in question form.
+        2. **Whole-question embedding ➜ entity-store top-K.** Mirrors
+           HippoRAG-2's Query-to-Node fallback (+12.5 Recall@5 vs NER
+           seeding in their paper); the cost is one extra embedding
+           call per query.
+
+        Only enabled by the graph_explore agent tool (see
+        :class:`QueryContext.enable_ppr_seed_fallback`). The 4-channel
+        RAG pipeline keeps this off so the graph channel doesn't shadow
+        the dense semantic channel under RRF fusion.
         """
         try:
             spacy = self._ensure_spacy()
-        except Exception as exc:  # spaCy model missing → skip seeds, run dense-only
+        except Exception as exc:  # spaCy model missing → skip NER, may still fall back
             logger.warning("graph_ppr: NER unavailable (%s); falling back to dense-only", exc)
-            return []
-        raw_surfaces = spacy.question_ner(question)
+            spacy = None
+
         canonical_seen: List[str] = []
         seen_set: set = set()
-        for raw in raw_surfaces:
-            can = normalize_for_hash(
-                raw, fold_traditional=self.linear_config.fold_traditional
-            )
-            if can and can not in seen_set:
-                seen_set.add(can)
-                canonical_seen.append(can)
-        if not canonical_seen or len(self.entity_store) == 0:
-            return []
-
-        embs = self.embedding_client.encode(canonical_seen)
-        if embs.ndim == 1:
-            embs = embs.reshape(1, -1)
+        if spacy is not None:
+            raw_surfaces = spacy.question_ner(question)
+            for raw in raw_surfaces:
+                can = normalize_for_hash(
+                    raw, fold_traditional=self.linear_config.fold_traditional
+                )
+                if can and can not in seen_set:
+                    seen_set.add(can)
+                    canonical_seen.append(can)
 
         best: Dict[str, Tuple[int, float]] = {}
-        for vec in embs:
-            top1 = self.entity_store.topk(vec, 1)
-            if not top1:
-                continue
-            hid, score = top1[0]
-            if hid in self._name_to_vidx and (hid not in best or score > best[hid][1]):
-                best[hid] = (self._name_to_vidx[hid], float(score))
+
+        if canonical_seen and len(self.entity_store) > 0:
+            embs = self.embedding_client.encode(canonical_seen)
+            if embs.ndim == 1:
+                embs = embs.reshape(1, -1)
+            for vec in embs:
+                top1 = self.entity_store.topk(vec, 1)
+                if not top1:
+                    continue
+                hid, score = top1[0]
+                if hid in self._name_to_vidx and (hid not in best or score > best[hid][1]):
+                    best[hid] = (self._name_to_vidx[hid], float(score))
+
+        # Fallback path — only when caller asked AND NER produced nothing.
+        if enable_fallback and not best and len(self.entity_store) > 0:
+            best = self._fallback_seeds(question)
+
         return [(hid, vidx, sim) for hid, (vidx, sim) in best.items()]
+
+    def _fallback_seeds(self, question: str) -> Dict[str, Tuple[int, float]]:
+        """Two-stage no-NER seed recovery; see :meth:`_seed_entities`."""
+        # 1) Cheap word-boundary substring scan.
+        gaz = self._ensure_gazetteer()
+        if gaz is not None:
+            counts = find_literal_matches(question, gaz)
+            literal_hits: Dict[str, Tuple[int, float]] = {}
+            for hid, count in counts.items():
+                if hid in self._name_to_vidx:
+                    # Score = 1.0 (literal match is unambiguous); count
+                    # not used for ranking since each hit is a distinct
+                    # entity in the question.
+                    literal_hits[hid] = (self._name_to_vidx[hid], 1.0)
+            if literal_hits:
+                self.last_debug["fallback"] = "gazetteer_literal"
+                return literal_hits
+
+        # 2) Whole-question embedding ➜ entity-store top-K.
+        try:
+            q_emb = self.embedding_client.encode(question)
+        except Exception as exc:
+            logger.warning("graph_ppr: question embedding failed (%s); no fallback seeds", exc)
+            return {}
+        if q_emb.ndim == 2:
+            q_emb = q_emb[0]
+
+        top_k = max(3, self.config.ppr_topk // 2 if hasattr(self.config, "ppr_topk") else 3)
+        top = self.entity_store.topk(q_emb, top_k)
+        # Loose threshold — fallback only fires when NER found nothing,
+        # so we'd rather have low-confidence seeds than zero.
+        floor = 0.45
+        embed_hits: Dict[str, Tuple[int, float]] = {}
+        for hid, score in top:
+            if score < floor:
+                break  # topk is sorted desc
+            if hid in self._name_to_vidx:
+                embed_hits[hid] = (self._name_to_vidx[hid], float(score))
+        if embed_hits:
+            self.last_debug["fallback"] = "question_embedding"
+        return embed_hits
+
+    def _ensure_gazetteer(self):
+        """Lazily build the Aho-Corasick automaton over entity surfaces."""
+        if self._gazetteer_automaton is not None:
+            return self._gazetteer_automaton
+        if len(self.entity_store) == 0:
+            return None
+        surfaces = self.entity_store.hash_id_to_text
+        # Mirror the ingest-time backfill defaults: short / single-word
+        # surfaces get filtered to avoid spurious "us" / "irs" hits.
+        # TODO(config-center): expose these to admin tunables.
+        automaton, n_kept = build_gazetteer_automaton(
+            surfaces, min_surface_chars=4, multi_word_only=True
+        )
+        if n_kept == 0:
+            return None
+        self._gazetteer_automaton = automaton
+        return self._gazetteer_automaton
 
     # ----------------------------------------------------------- entity BFS
 
@@ -386,6 +516,73 @@ class GraphPPRChannel(BaseChannel):
             name = self.graph.vs[vidx]["name"]
             out.append((str(name), float(passage_scores[int(j)])))
         return out
+
+    # -------------------------------------------------- public — subgraph
+
+    def retrieve_subgraph(
+        self,
+        question: str,
+        file_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Run PPR end-to-end and return seeds + actived entities + ranked
+        passages — the data the web visualizer needs.
+
+        Independent of :meth:`retrieve` — the 4-channel RAG path keeps
+        its existing contract untouched. We share the same internal
+        helpers (``_seed_entities`` etc) so the algorithm is identical
+        modulo two intentional differences: (a) ``enable_fallback`` is
+        always True (graph workbench wants gazetteer + Q2N seeds, just
+        like the agent path), and (b) we return the structured
+        intermediate state instead of just the final ``ChannelHit`` list.
+
+        Empty graph or zero seeds returns an empty payload with
+        ``mode`` set so the caller can show "no graph match" instead of
+        a blank canvas.
+        """
+        # Same lock as :meth:`retrieve` — prevents the gazetteer /
+        # spaCy state from interleaving with a concurrent agent call
+        # on the shared channel singleton.
+        with self._call_lock:
+            if self.graph is None or len(self.passage_store) == 0:
+                return {"mode": "no_graph", "seeds": [], "actived_entities": {}, "passages": []}
+
+            seeds = self._seed_entities(question, enable_fallback=True)
+            if not seeds:
+                return {"mode": "no_seeds", "seeds": [], "actived_entities": {}, "passages": []}
+
+            question_emb = self.embedding_client.encode(question)
+            entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
+            passage_weights = self._calculate_passage_scores(
+                question, question_emb, actived
+            )
+            node_weights = entity_weights + passage_weights
+            ranked = self._run_ppr(node_weights)
+            passages = self._materialize_hits(ranked, file_ids)
+
+        # Surface form is in entity_store keyed by hash_id.
+        ent_text = self.entity_store.hash_id_to_text
+        return {
+            "mode": "ppr",
+            "seeds": [
+                {
+                    "hash_id": hid,
+                    "vertex_idx": vidx,
+                    "surface": ent_text.get(hid, ""),
+                    "sim": float(sim),
+                }
+                for hid, vidx, sim in seeds
+            ],
+            "actived_entities": {
+                hid: {
+                    "vertex_idx": vidx,
+                    "surface": ent_text.get(hid, ""),
+                    "score": float(score),
+                    "iteration_tier": int(tier),
+                }
+                for hid, (vidx, score, tier) in actived.items()
+            },
+            "passages": passages,  # List[ChannelHit] — has file_id / page_id / score
+        }
 
     # ----------------------------------------------------------- materialize
 

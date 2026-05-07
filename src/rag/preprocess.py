@@ -13,9 +13,10 @@ language" instructions: zh question → zh outputs; en → en; mixed → mixed.
 import json
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 import regex as ureg
 
@@ -105,6 +106,14 @@ class QueryContext:
     regexes: List[RegexSpec] = field(default_factory=list)
     file_ids: List[str] | None = None
 
+    # PPR-only knob: when True, GraphPPRChannel adds a query-side seed
+    # fallback (literal gazetteer scan ➜ entity-embedding top-K) for
+    # questions where spaCy NER finds no entity. The 4-channel RAG path
+    # leaves this off (returning empty preserves RRF channel
+    # independence). The graph_explore agent tool flips it on because
+    # PPR is the only signal available there. See graph_ppr._seed_entities.
+    enable_ppr_seed_fallback: bool = False
+
 
 # ------------------------------------------------------------ language ----
 
@@ -192,17 +201,98 @@ def rewrite_regex_call(query: str, llm: LLMClient) -> Dict[str, Any]:
 # ------------------------------------------------------------- preprocess ----
 
 
+# How many chars of the HyDE / rewrite outputs to ship in the SSE
+# events. Full HyDE can be 500+ chars; the frontend only needs enough
+# to show "what query rewrite the system is using" — a preview.
+_PREPROCESS_PREVIEW_CHARS = 240
+
+
 def preprocess(
     query: str,
     llm: LLMClient,
     file_ids: List[str] | None = None,
+    *,
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
 ) -> QueryContext:
-    """Run HyDE + rewrite/regex calls in parallel, then synthesize QueryContext."""
+    """Run HyDE + rewrite/regex calls in parallel, then synthesize QueryContext.
+
+    ``on_event`` (optional) receives one ``preprocess`` event per
+    sub-step transition so a streaming UI can show two parallel
+    spinners ("HyDE" and "rewrite + regex"), each reaching its own
+    completion independently. Default ``None`` keeps the experiment
+    path silent — same behavior as before.
+
+    Emitted events (raw signature; pipeline.py wraps it via the same
+    safe-emit helper used elsewhere):
+
+    * ``preprocess {"step":"hyde","phase":"start"}``
+    * ``preprocess {"step":"rewrite","phase":"start"}``
+    * ``preprocess {"step":"hyde","phase":"done","elapsed_ms":N,"hyde_preview":"..."}``
+    * ``preprocess {"step":"rewrite","phase":"done","elapsed_ms":N,
+        "lang":..., "rewrite":..., "regexes":[{"pattern","weight","rationale"}]}``
+    """
+    def _emit(event: str, data: Dict[str, Any]) -> None:
+        if on_event is None:
+            return
+        try:
+            on_event(event, data)
+        except Exception:
+            logger.exception("preprocess on_event failed")
+
     with ThreadPoolExecutor(max_workers=2) as pool:
+        # We push start events BEFORE submitting so the frontend can
+        # show "HyDE 启动 / rewrite 启动" right away — submit() is
+        # near-instant but the LLM round-trip is 1-3s, so seeing the
+        # spinners light up matters.
+        _emit("preprocess", {"step": "hyde", "phase": "start"})
+        _emit("preprocess", {"step": "rewrite", "phase": "start"})
+        t0_hyde = time.perf_counter()
+        t0_rewrite = time.perf_counter()
         fut_hyde = pool.submit(hyde_call, query, llm)
         fut_rewrite = pool.submit(rewrite_regex_call, query, llm)
-        hyde = fut_hyde.result()
-        meta = fut_rewrite.result()
+
+        # as_completed lets the faster path's "done" event fire as
+        # soon as it finishes, even if the slower one hasn't returned
+        # yet — that's the whole point of running them in parallel.
+        fut_to_step = {fut_hyde: "hyde", fut_rewrite: "rewrite"}
+        hyde: str = ""
+        meta: Dict[str, Any] = {}
+        for fut in as_completed([fut_hyde, fut_rewrite]):
+            step = fut_to_step[fut]
+            if step == "hyde":
+                elapsed_ms = int((time.perf_counter() - t0_hyde) * 1000)
+                hyde = fut.result()
+                _emit(
+                    "preprocess",
+                    {
+                        "step": "hyde",
+                        "phase": "done",
+                        "elapsed_ms": elapsed_ms,
+                        "hyde_preview": (hyde or "")[:_PREPROCESS_PREVIEW_CHARS],
+                        "hyde_chars": len(hyde or ""),
+                    },
+                )
+            else:
+                elapsed_ms = int((time.perf_counter() - t0_rewrite) * 1000)
+                meta = fut.result()
+                _emit(
+                    "preprocess",
+                    {
+                        "step": "rewrite",
+                        "phase": "done",
+                        "elapsed_ms": elapsed_ms,
+                        "lang": meta.get("lang"),
+                        "rewrite": meta.get("rewrite", ""),
+                        "regexes": [
+                            {
+                                "pattern": r.pattern,
+                                "weight": r.weight,
+                                "rationale": r.rationale,
+                            }
+                            for r in meta.get("regexes", [])
+                        ],
+                    },
+                )
 
     lang = sanity_check_lang(query, meta["lang"])
     return QueryContext(

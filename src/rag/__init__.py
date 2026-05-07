@@ -1,8 +1,7 @@
 """Single-shot RAG query pipeline.
 
 Four parallel retrieval channels (semantic / BM25 / graph PPR / regex) →
-RRF fusion → Qwen3 rerank → LLM answer. See ``docs/rag_pipeline.md`` for
-the design.
+RRF fusion → Qwen3 rerank → LLM answer.
 
 The ``agentic/`` package is a superset that adds tool-calling loops on top
 of the same primitives; this package is the single-pass version.

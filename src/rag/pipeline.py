@@ -1,13 +1,10 @@
-"""Top-level RAG orchestrator: query → preprocess → 4 channels → RRF → rerank → answer.
-
-See ``docs/rag_pipeline.md`` for the full design and parameter rationale.
-"""
+"""Top-level RAG orchestrator: query → preprocess → 4 channels → RRF → rerank → answer."""
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from config import RAGConfig
 from config.settings import page_assets_root
@@ -63,6 +60,7 @@ class RAGPipeline:
         rerank_client: Optional[RerankClient] = None,
         page_store: Optional[PageStore] = None,
         channels: Optional[Sequence[BaseChannel]] = None,
+        graph_channel: Optional[GraphPPRChannel] = None,
     ):
         self.config = config or RAGConfig()
         self.llm = llm or LLMClient()
@@ -72,6 +70,16 @@ class RAGPipeline:
         self.page_store = page_store or self._default_page_store()
 
         if channels is None:
+            # ``graph_channel`` lets the web layer share ONE
+            # GraphPPRChannel across the agent factories, GraphService,
+            # AND the RAG pipeline so the graph is mmap'd exactly once
+            # per process. The default-None path keeps the original
+            # standalone behavior (experiment scripts get their own
+            # channel as before).
+            graph_ch = graph_channel or GraphPPRChannel(
+                config=self.config,
+                embedding_client=self.embedding_client,
+            )
             channels = [
                 SemanticChannel(
                     config=self.config,
@@ -79,10 +87,7 @@ class RAGPipeline:
                     visual_client=self.visual_client,
                 ),
                 BM25Channel(config=self.config),
-                GraphPPRChannel(
-                    config=self.config,
-                    embedding_client=self.embedding_client,
-                ),
+                graph_ch,
                 RegexChannel(
                     config=self.config,
                     page_store=self.page_store,
@@ -128,7 +133,47 @@ class RAGPipeline:
         query: str,
         file_ids: Optional[List[str]] = None,
         tracer: Optional[Tracer] = None,
+        *,
+        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        stream: bool = False,
+        system_prompt: Optional[str] = None,
+        citation_legend_provider: Optional[Callable[[Sequence], str]] = None,
+        pages_block_provider: Optional[Callable[[Sequence], str]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        config_override: Optional[RAGConfig] = None,
     ) -> AnswerResult:
+        """Run the full RAG pipeline.
+
+        ``on_event`` (optional) is the streaming callback the API runner
+        passes in. It fires at every stage boundary so the client can
+        show "preprocessing → retrieving (4 channels) → reranking →
+        answering" rather than a blank screen for the 5-30 s a query
+        takes. Algorithm callers (rag_eval / scripts) leave it None.
+
+        ``stream`` controls the answer stage: ``True`` triggers the
+        ``LLMClient.chat_stream`` path, with each delta forwarded as a
+        ``token`` event via ``on_event``. The function still returns a
+        completed :class:`AnswerResult` once the stream drains.
+
+        ``system_prompt`` overrides the answer-stage system prompt.
+        ``citation_legend_provider`` is invoked AFTER rerank with the
+        reranked page list and must return the legend string to inject
+        into the user message — this is the seam the API runner uses
+        to number ``[^k]`` references against the actual top-N. Both
+        default None for algorithm callers.
+
+        ``config_override`` (optional) replaces ``self.config`` for the
+        duration of this call only — used by the web layer to apply
+        admin-tunable RRF / rerank knobs without rebuilding the
+        pipeline (which would re-load embedding stores). Passing
+        ``None`` keeps the constructor config so experiment scripts
+        continue to use the canonical ``RAGConfig()`` baseline.
+        Channel objects keep the constructor-time config (their topks
+        are static); we only override the cross-channel fusion + answer
+        knobs that the run actually reads from this scope.
+        """
+        effective_config = config_override or self.config
+        emit = _make_emitter(on_event)
         session = tracer.session(query) if tracer is not None else None
         if session is not None:
             # RAGConfig is static across runs; record once per day. The
@@ -139,8 +184,8 @@ class RAGPipeline:
                 {
                     "channels": [c.name for c in self.channels],
                     "rag_config": {
-                        k: getattr(self.config, k)
-                        for k in vars(self.config)
+                        k: getattr(effective_config, k)
+                        for k in vars(effective_config)
                         if not k.startswith("_")
                     },
                 },
@@ -148,8 +193,14 @@ class RAGPipeline:
         timings: Dict[str, float] = {}
         channel_timings: Dict[str, float] = {}
 
+        emit("status", {"phase": "preprocess"})
         t0 = time.perf_counter()
-        ctx = preprocess(query, llm=self.llm, file_ids=file_ids)
+        # Pass the raw on_event (not wrapped emit) so preprocess can
+        # short-circuit when no consumer is listening — same pattern
+        # used by _retrieve_all below.
+        ctx = preprocess(
+            query, llm=self.llm, file_ids=file_ids, on_event=on_event,
+        )
         timings["preprocess"] = time.perf_counter() - t0
         if session is not None:
             session.snapshot(
@@ -168,8 +219,23 @@ class RAGPipeline:
                 },
             )
 
+        emit(
+            "status",
+            {
+                "phase": "retrieve",
+                "channels": [c.name for c in self.channels],
+                "lang": ctx.lang,
+                "regexes": len(ctx.regexes),
+            },
+        )
         t0 = time.perf_counter()
-        channel_hits = self._retrieve_all(ctx, channel_timings=channel_timings)
+        # Pass the raw on_event through (not the wrapped emit). The
+        # default path with on_event=None gets None here, and
+        # _retrieve_all skips event payload construction entirely.
+        # Avoids per-channel JSON-shape work on the experiment hot path.
+        channel_hits = self._retrieve_all(
+            ctx, channel_timings=channel_timings, emit=on_event,
+        )
         timings["retrieve"] = time.perf_counter() - t0
         if session is not None:
             for name, hits in channel_hits.items():
@@ -195,16 +261,16 @@ class RAGPipeline:
         t0 = time.perf_counter()
         fused = rrf(
             list(channel_hits.values()),
-            k=self.config.rrf_k,
-            top_m=self.config.rrf_top_m,
+            k=effective_config.rrf_k,
+            top_m=effective_config.rrf_top_m,
         )
         timings["rrf"] = time.perf_counter() - t0
         if session is not None:
             session.snapshot(
                 "fused",
                 {
-                    "rrf_k": self.config.rrf_k,
-                    "top_m": self.config.rrf_top_m,
+                    "rrf_k": effective_config.rrf_k,
+                    "top_m": effective_config.rrf_top_m,
                     "results": [
                         {"rank": i + 1, "file_id": fid, "page_id": pid, "score": score}
                         for i, (fid, pid, score) in enumerate(fused)
@@ -231,18 +297,35 @@ class RAGPipeline:
                 },
             )
 
+        emit("status", {"phase": "rerank", "candidates": len(candidate_pages)})
         reranked = rerank_pages(
             query=query,
             pages=candidate_pages,
-            config=self.config,
+            config=effective_config,
             client=self.rerank_client,
         )
         timings["rerank"] = time.perf_counter() - t0
+        emit(
+            "reranked",
+            {
+                "elapsed_ms": int(timings["rerank"] * 1000),
+                "pages": [
+                    {
+                        "rank": i + 1,
+                        "file_id": r.page.file_id,
+                        "page_id": r.page.page_id,
+                        "page_number": r.page.page_number,
+                        "score": r.score,
+                    }
+                    for i, r in enumerate(reranked)
+                ],
+            },
+        )
         if session is not None:
             session.snapshot(
                 "rerank",
                 {
-                    "top_n": self.config.rerank_top_n,
+                    "top_n": effective_config.rerank_top_n,
                     "results": [
                         {
                             "rank": i + 1,
@@ -256,12 +339,37 @@ class RAGPipeline:
                 },
             )
 
+        legend: Optional[str] = None
+        if citation_legend_provider is not None:
+            try:
+                legend = citation_legend_provider(reranked)
+            except Exception:
+                logger.exception("citation_legend_provider failed; proceeding without legend")
+                legend = None
+
+        pages_block_override: Optional[str] = None
+        if pages_block_provider is not None:
+            try:
+                pages_block_override = pages_block_provider(reranked)
+            except Exception:
+                logger.exception(
+                    "pages_block_provider failed; falling back to default page formatter"
+                )
+                pages_block_override = None
+
+        emit("status", {"phase": "answering", "stream": stream})
         t0 = time.perf_counter()
         text = answer_call(
             query=query,
             pages=reranked,
-            config=self.config,
+            config=effective_config,
             llm=self.llm,
+            system_prompt=system_prompt,
+            citation_legend=legend,
+            pages_block_override=pages_block_override,
+            stream=stream,
+            on_event=on_event,
+            cancel_check=cancel_check,
         )
         timings["answer"] = time.perf_counter() - t0
 
@@ -296,9 +404,17 @@ class RAGPipeline:
         self,
         ctx: QueryContext,
         channel_timings: Optional[Dict[str, float]] = None,
+        emit: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> Dict[str, List[ChannelHit]]:
         """Run all channels in parallel; isolate failures so one channel's
-        crash doesn't kill the rest of the query."""
+        crash doesn't kill the rest of the query.
+
+        ``emit`` (when given) fires one ``retrieval`` event per channel
+        as soon as it finishes — channels finish out of order, so the
+        client sees progress sooner than waiting for the slowest. The
+        callback is the same ``_make_emitter``-wrapped one used by
+        :meth:`run`, so a None passed in is harmless.
+        """
 
         def _one(channel: BaseChannel) -> tuple[str, List[ChannelHit], float]:
             t0 = time.perf_counter()
@@ -309,15 +425,39 @@ class RAGPipeline:
                 hits = []
             return channel.name, hits, time.perf_counter() - t0
 
+        # Stage results by channel name as they finish (so ``retrieval``
+        # events fire eagerly), then assemble the returned dict in the
+        # original ``self.channels`` order. Downstream rrf() and trace
+        # snapshots depend on this deterministic ordering.
+        emit_safe = _make_emitter(emit)  # no-op if emit is None
+        staged: Dict[str, List[ChannelHit]] = {}
         with ThreadPoolExecutor(max_workers=max(4, len(self.channels))) as pool:
-            results = list(pool.map(_one, self.channels))
-
-        out: Dict[str, List[ChannelHit]] = {}
-        for name, hits, elapsed in results:
-            out[name] = hits
-            if channel_timings is not None:
-                channel_timings[name] = elapsed
-        return out
+            futures = [pool.submit(_one, ch) for ch in self.channels]
+            for fut in as_completed(futures):
+                name, hits, elapsed = fut.result()
+                staged[name] = hits
+                if channel_timings is not None:
+                    channel_timings[name] = elapsed
+                # Skip JSON-shape construction entirely when no
+                # consumer is listening — keeps the experiment path's
+                # ``timings["retrieve"]`` comparable to pre-streaming.
+                if emit is not None:
+                    emit_safe(
+                        "retrieval",
+                        {
+                            "channel": name,
+                            "elapsed_ms": int(elapsed * 1000),
+                            "hits": [
+                                {
+                                    "file_id": h.file_id,
+                                    "page_id": h.page_id,
+                                    "score": h.score,
+                                }
+                                for h in hits
+                            ],
+                        },
+                    )
+        return {ch.name: staged[ch.name] for ch in self.channels}
 
     def _load_pages(self, fused: Sequence[FusedHit]) -> List[PageAsset]:
         if self.page_store is None:
@@ -340,3 +480,26 @@ def answer_query(
     """Convenience: run a single query against a default pipeline."""
     pipe = pipeline or RAGPipeline()
     return pipe.run(query, file_ids=file_ids, tracer=tracer)
+
+
+def _make_emitter(
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]],
+) -> Callable[[str, Dict[str, Any]], None]:
+    """No-op when ``on_event`` is None; otherwise swallow callback errors.
+
+    Mirrors :func:`agentic.agent.base._make_emitter`. We re-implement
+    locally rather than importing across the algorithm-layer boundary
+    so ``rag/`` has no dependency on ``agentic/``.
+    """
+    if on_event is None:
+        def _noop(_event: str, _data: Dict[str, Any]) -> None:
+            return
+        return _noop
+
+    def _emit(event: str, data: Dict[str, Any]) -> None:
+        try:
+            on_event(event, data)
+        except Exception:
+            logger.exception("on_event callback failed for %s", event)
+
+    return _emit
