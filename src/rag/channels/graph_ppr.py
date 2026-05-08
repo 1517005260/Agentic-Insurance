@@ -353,11 +353,11 @@ class GraphPPRChannel(BaseChannel):
         # Pre-compute sentence similarity once so the BFS can index in O(1).
         sentence_hash_ids = self.sentence_store.hash_ids
         sentence_idx_lookup = {h: i for i, h in enumerate(sentence_hash_ids)}
-        sent_emb = self.sentence_store.embeddings
-        if sent_emb.shape[0] == 0:
+        if not sentence_hash_ids:
             return entity_weights, actived
-        q = question_emb if question_emb.ndim == 2 else question_emb.reshape(-1, 1)
-        sentence_similarities = np.dot(sent_emb, q).flatten()
+        # faiss search instead of reconstruct + np.dot — avoids a per-
+        # request (N_sent, D) temporary; identical IP arithmetic.
+        sentence_similarities = self.sentence_store.all_similarities(question_emb)
 
         used_sentences: set = set()
         current = dict(actived)
@@ -443,11 +443,11 @@ class GraphPPRChannel(BaseChannel):
         n_vertices = self.graph.vcount()
         passage_weights = np.zeros(n_vertices, dtype=np.float64)
 
-        passage_emb = self.passage_store.embeddings
-        if passage_emb.shape[0] == 0:
+        if len(self.passage_store) == 0:
             return passage_weights
-        q = question_emb if question_emb.ndim == 2 else question_emb.reshape(-1, 1)
-        sims = np.dot(passage_emb, q).flatten()
+        # faiss search instead of reconstruct + np.dot — saves a per-
+        # request (N_passage, D) temporary on large corpora.
+        sims = self.passage_store.all_similarities(question_emb)
 
         # Min-max normalize so the dpr term lives on [0, 1] before being
         # combined with the log entity bonus. When all values are equal

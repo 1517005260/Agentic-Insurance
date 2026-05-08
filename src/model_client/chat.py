@@ -73,6 +73,7 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 16384,
         reasoning_effort: Optional[str] = None,
+        disable_thinking: bool = True,
     ):
         self.model = model or CHAT_MODEL or "gpt-4o-mini"
         self.api_key = api_key or CHAT_API_KEY
@@ -80,6 +81,13 @@ class LLMClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.reasoning_effort = reasoning_effort
+        # DeepSeek / Qwen and many self-hosted vLLM relays default to
+        # emitting ``reasoning_content`` (chain-of-thought) on every
+        # token; for our task surfaces that's bandwidth + cost waste
+        # AND triggers the malformed-frame path on CJK-heavy SSE. We
+        # opt out at the API boundary; callers that want reasoning
+        # (proof-style audits) can pass ``disable_thinking=False``.
+        self.disable_thinking = disable_thinking
 
         if not self.api_key:
             raise ValueError(
@@ -158,6 +166,8 @@ class LLMClient:
             payload["tool_choice"] = "auto"
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.disable_thinking:
+            _apply_thinking_off(payload)
 
         response = self._session.post(url, headers=headers, json=payload, timeout=300)
         response.raise_for_status()
@@ -237,6 +247,8 @@ class LLMClient:
         }
         if self.reasoning_effort:
             payload["reasoning_effort"] = self.reasoning_effort
+        if self.disable_thinking:
+            _apply_thinking_off(payload)
 
         saw_done = False
         saw_finish_reason = False
@@ -245,6 +257,14 @@ class LLMClient:
             url, headers=headers, json=payload, timeout=300, stream=True
         ) as response:
             response.raise_for_status()
+            # Some relays send ``Content-Type: text/event-stream`` without an
+            # explicit charset; requests then defaults to ISO-8859-1. With
+            # ``decode_unicode=True`` ``iter_lines`` calls ``str.splitlines``,
+            # which splits on U+0085 (NEL) — and the third byte of many CJK
+            # UTF-8 sequences is 0x85 (e.g. ``待`` = E5 BE 85). That fragments
+            # otherwise-valid frames and breaks every CJK-heavy stream. Force
+            # UTF-8: every OpenAI-style SSE relay we use is UTF-8 in practice.
+            response.encoding = "utf-8"
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
@@ -315,6 +335,22 @@ class LLMClient:
                 "chat completion stream contained malformed data frame(s); "
                 "assembled text may be corrupt"
             )
+
+
+# ----------------------------------------------------- thinking-off helper ----
+
+
+def _apply_thinking_off(payload: Dict[str, Any]) -> None:
+    """Mute chain-of-thought across the relays we hit.
+
+    DeepSeek / Qwen / vLLM use different field names; sending all three
+    is the cheapest way to be portable. OpenAI strict APIs ignore
+    unknown ``extra_body`` keys, and a strict relay that rejects extras
+    would have already failed every other workbench.
+    """
+    payload["enable_thinking"] = False
+    payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
+    payload.setdefault("extra_body", {})["enable_thinking"] = False
 
 
 # ----------------------------------------------------- module-level cache ----

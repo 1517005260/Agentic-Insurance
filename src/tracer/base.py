@@ -40,7 +40,12 @@ from config.settings import STORAGE_PATH
 logger = logging.getLogger(__name__)
 
 
-_VALID_FLAVORS = {"rag", "agentic"}
+# ``rag`` / ``agentic`` are the local-corpus flavors; ``web_rag`` /
+# ``web_agent`` segregate web-only chat runs into their own subdir
+# so audit can grep without crossing into the local-corpus traces.
+# This set is the only place to whitelist a new subdir; everything
+# else (tracer.session, run_dir, etc.) infers from it.
+_VALID_FLAVORS = {"rag", "agentic", "web_rag", "web_agent"}
 
 
 @dataclass

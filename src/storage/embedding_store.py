@@ -314,6 +314,28 @@ class EmbeddingStore:
             return np.zeros((0, self.dim or 0), dtype=np.float32)
         return self._index.reconstruct_n(0, self._index.ntotal)
 
+    def all_similarities(self, query_embedding: np.ndarray) -> np.ndarray:
+        """Inner product of ``query_embedding`` against every stored vector,
+        aligned to ``self.hash_ids`` row order.
+
+        Equivalent to ``self.embeddings @ query`` but routes through
+        ``IndexFlatIP.search`` so we never materialize the full (N, D)
+        embedding matrix in user code — for the PPR hot path that meant
+        a per-request ~60 MB temporary on a 10K-passage corpus, lifted
+        to GB-scale on bigger ones. faiss does the same arithmetic in
+        C++ with BLAS without the round-trip allocation.
+        """
+        if self._index is None or self._index.ntotal == 0:
+            return np.zeros((0,), dtype=np.float32)
+        q = np.ascontiguousarray(query_embedding.reshape(1, -1).astype(np.float32))
+        n = self._index.ntotal
+        scores, indices = self._index.search(q, n)
+        aligned = np.zeros(n, dtype=np.float32)
+        # IndexFlatIP returns one score per stored row — every position is
+        # filled, no -1 sentinels possible at k == ntotal.
+        aligned[indices[0]] = scores[0]
+        return aligned
+
     @property
     def hash_id_to_text(self) -> Dict[str, str]:
         return dict(zip(self._meta["hash_id"].tolist(), self._meta["text"].tolist()))
@@ -337,9 +359,13 @@ class EmbeddingStore:
             return np.zeros((0, self.dim or 0), dtype=np.float32)
         if self._index is None or self._index.ntotal == 0:
             return np.zeros((0, self.dim or 0), dtype=np.float32)
-        rows = np.asarray([self._hash_id_to_idx[h] for h in ids], dtype=np.int64)
-        all_emb = self._index.reconstruct_n(0, self._index.ntotal)
-        return all_emb[rows]
+        # Per-row reconstruct beats a full ``reconstruct_n`` + advanced
+        # indexing whenever ``len(ids) << ntotal`` (which is the common
+        # case — agent / RAG callers typically pass a handful of seeds).
+        out = np.empty((len(ids), self._index.d), dtype=np.float32)
+        for i, h in enumerate(ids):
+            out[i] = self._index.reconstruct(int(self._hash_id_to_idx[h]))
+        return out
 
     # ----------------------------------------------------- meta column access
 
