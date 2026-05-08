@@ -166,6 +166,16 @@ class ChatSession(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="New chat")
     mode: Mapped[str] = mapped_column(String(16), nullable=False)
     agent_kind: Mapped[Optional[str]] = mapped_column(String(16))
+    # ``web`` is an orthogonal toggle on top of (mode, agent_kind):
+    #   mode=rag,   web=0 → local RAG
+    #   mode=rag,   web=1 → Tavily-based web RAG (single LLM call)
+    #   mode=agent, web=0 → BaseAgent / ProofAgent / GraphAgent (per agent_kind)
+    #   mode=agent, web=1 → WebAgent (only valid when agent_kind='base')
+    # Forbidden combos:
+    #   mode=agent + agent_kind in {proof,graph} + web=1
+    web: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -192,6 +202,12 @@ class ChatSession(Base):
             "(mode = 'agent' AND agent_kind IS NOT NULL) OR "
             "(mode = 'rag' AND agent_kind IS NULL)",
             name="ck_sessions_mode_kind",
+        ),
+        # `web` is bool 0/1; `web=1` only with rag OR agent+base.
+        CheckConstraint("web IN (0, 1)", name="ck_sessions_web_bool"),
+        CheckConstraint(
+            "web = 0 OR mode = 'rag' OR (mode = 'agent' AND agent_kind = 'base')",
+            name="ck_sessions_web_compatible",
         ),
         Index("ix_sessions_user_updated", "user_id", "updated_at"),
     )

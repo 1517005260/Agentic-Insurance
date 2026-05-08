@@ -46,11 +46,19 @@ class EventType:
     CITATIONS = "citations"       # final list[CitationItem]
 
     # Agent-specific
+    THOUGHT = "thought"           # 中间 LLM content (推理 / 计划)，非 final answer
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     OBLIGATION = "obligation"     # proof
     CLAIM = "claim"               # proof
     GAP = "gap"                   # proof
+
+    # Graph-agent live replay — emitted by agent_runner.py when a graph
+    # kind agent's graph_explore tool returns. Carries enough metadata
+    # for GraphPage to re-render the canvas around what the agent just
+    # discovered (extracted from the tool envelope so the frontend
+    # sees the agent's actual hits, not a separate /graph/expand call).
+    GRAPH_SUBGRAPH = "graph_subgraph"
 
 
 # Default 15s — comfortably under nginx 60s default proxy_read_timeout.

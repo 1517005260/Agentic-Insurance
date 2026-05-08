@@ -18,10 +18,11 @@ AgentKindLiteral = Literal["base", "proof", "graph"]
 
 
 class SessionCreate(BaseModel):
-    """Create-time payload. mode + agent_kind are immutable post-create."""
+    """Create-time payload. mode + agent_kind + web are immutable post-create."""
 
     mode: ModeLiteral
     agent_kind: Optional[AgentKindLiteral] = None
+    web: bool = False
     title: str = Field(default="New chat", max_length=255)
 
     @model_validator(mode="after")
@@ -32,6 +33,15 @@ class SessionCreate(BaseModel):
             raise ValueError("agent_kind is required when mode='agent'")
         if self.mode == "rag" and self.agent_kind is not None:
             raise ValueError("agent_kind must be omitted when mode='rag'")
+        # web=1 forbidden with proof/graph; chat UI never offers them
+        # alongside the web toggle, so a request like that is almost
+        # certainly a buggy client.
+        if self.web and self.mode == "agent" and self.agent_kind in ("proof", "graph"):
+            raise ValueError(
+                "web=true is only valid with mode='rag' or "
+                "(mode='agent' AND agent_kind='base'); proof / graph "
+                "agents do not have a web variant"
+            )
         return self
 
 
@@ -46,10 +56,22 @@ class SessionOut(BaseModel):
     title: str
     mode: ModeLiteral
     agent_kind: Optional[AgentKindLiteral]
+    web: bool = False
     created_at: datetime
     updated_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("web", mode="before")
+    @classmethod
+    def _coerce_web(cls, v: Any) -> bool:
+        # SQLite stores the column as int 0/1; translate to a real bool
+        # for the API surface so clients see ``"web": true`` not ``1``.
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return bool(v)
 
 
 # ---------------------------------------------------------- message ----
@@ -101,3 +123,21 @@ class AgentStreamRequest(BaseModel):
 
     query: str = Field(..., min_length=1, max_length=8000)
     kind: AgentKindLiteral = "base"
+    web: bool = False
+
+    @model_validator(mode="after")
+    def _enforce_web_compat(self) -> "AgentStreamRequest":
+        if self.web and self.kind in ("proof", "graph"):
+            raise ValueError(
+                "web=true is only valid with kind='base'; proof / graph "
+                "agents do not have a web variant"
+            )
+        return self
+
+
+class WebRagStreamRequest(BaseModel):
+    """Body for ``POST /web-rag/stream`` (session-less smoke)."""
+
+    query: str = Field(..., min_length=1, max_length=8000)
+    include_domains: Optional[list[str]] = Field(default=None, max_length=20)
+    exclude_domains: Optional[list[str]] = Field(default=None, max_length=20)

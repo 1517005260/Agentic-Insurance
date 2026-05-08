@@ -67,13 +67,46 @@ async def init_db() -> None:
     Bootstrap path only — uses ``Base.metadata.create_all`` which adds
     missing tables but cannot evolve column / constraint changes. Once
     the schema starts changing in production, switch to alembic
-    (``alembic init`` + autogenerate). The dependency is already in
-    pyproject.toml; nothing prevents adding it later. TODO(B5).
+    (``alembic init`` + autogenerate); the dependency is already in
+    ``pyproject.toml``.
+
+    A tiny ad-hoc dev-mode top-up runs after ``create_all`` to add the
+    ``chat_sessions.web`` column to dev DBs that don't have it yet, so
+    the operator doesn't have to wipe ``app.db`` by hand. The column
+    is ``NOT NULL DEFAULT 0`` so existing rows get a safe value;
+    SQLite ignores model-level CHECK constraints on a late-added
+    column, so the Pydantic layer rejects forbidden combos at request
+    time instead.
     """
     from api.models import Base  # local import to break cyclic init
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_chat_sessions_web_column(conn)
+
+
+async def _ensure_chat_sessions_web_column(conn) -> None:
+    """Add ``chat_sessions.web`` (default 0) if the table lacks it.
+
+    SQLite's ``ALTER TABLE ADD COLUMN`` is the cheap path; we don't
+    rebuild the table because re-creating CHECK constraints requires
+    a 12-step dance that's overkill for a single dev-machine concern.
+    Production migrations should use alembic.
+    """
+    from sqlalchemy import text
+
+    cols = (
+        await conn.execute(text("PRAGMA table_info(chat_sessions)"))
+    ).fetchall()
+    have_web = any(row[1] == "web" for row in cols)
+    if have_web:
+        return
+    await conn.execute(
+        text(
+            "ALTER TABLE chat_sessions "
+            "ADD COLUMN web INTEGER NOT NULL DEFAULT 0"
+        )
+    )
 
 
 @asynccontextmanager

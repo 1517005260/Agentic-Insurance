@@ -32,6 +32,7 @@ async def create_session(
     mode: str,
     agent_kind: Optional[str],
     title: str,
+    web: bool = False,
 ) -> ChatSession:
     """Insert a new session. Validation matches DB CHECK constraints."""
     session = ChatSession(
@@ -39,6 +40,7 @@ async def create_session(
         title=title,
         mode=mode,
         agent_kind=agent_kind,
+        web=1 if web else 0,
     )
     db.add(session)
     await db.flush()  # gives us session.id without an extra round trip
@@ -210,8 +212,13 @@ def build_agent_assistant_metadata(
     model: Optional[str] = None,
     error: Optional[str] = None,
     original_exit_reason: Optional[str] = None,
+    citations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Compose the metadata dict for any agent assistant message (base/proof/graph)."""
+    """Compose the metadata dict for any agent assistant message (base/proof/graph/web).
+
+    ``citations`` is populated for web-agent runs (kind="web"); other
+    kinds leave it None so the stored JSON stays compact.
+    """
     out: Dict[str, Any] = {"exit_reason": exit_reason, "loops": loops}
     for k, v in (
         ("trace_path", trace_path),
@@ -223,6 +230,7 @@ def build_agent_assistant_metadata(
         ("model", model),
         ("error", error),
         ("original_exit_reason", original_exit_reason),
+        ("citations", citations),
     ):
         if v is not None:
             out[k] = v

@@ -26,6 +26,7 @@ from api.deps import get_current_user, get_session
 from api.models import User
 from api.runners.agent_runner import stream_agent
 from api.runners.rag_runner import stream_rag
+from api.runners.web_rag_runner import stream_web_rag
 from api.schemas.chat import (
     AgentStreamRequest,
     MessageOut,
@@ -34,6 +35,7 @@ from api.schemas.chat import (
     SessionCreate,
     SessionOut,
     SessionUpdate,
+    WebRagStreamRequest,
 )
 from api.services import chat as chat_svc
 from tracer import Tracer
@@ -67,6 +69,7 @@ async def create_session(
         mode=body.mode,
         agent_kind=body.agent_kind,
         title=body.title,
+        web=body.web,
     )
     # get_session dependency commits at request end; the row is visible
     # to subsequent requests but we still return the full row now (id
@@ -174,7 +177,10 @@ async def post_session_message(
     # ``session`` will close when the route returns, and the streaming
     # generator below outlives that.
     session_snapshot = _SessionSnapshot(
-        id=session.id, mode=session.mode, agent_kind=session.agent_kind
+        id=session.id,
+        mode=session.mode,
+        agent_kind=session.agent_kind,
+        web=bool(session.web),
     )
 
     return StreamingResponse(
@@ -201,6 +207,7 @@ class _SessionSnapshot:
     id: int
     mode: str
     agent_kind: Optional[str]
+    web: bool
 
 
 async def _persist_after_stream(
@@ -222,11 +229,16 @@ async def _persist_after_stream(
     """
     loop = asyncio.get_running_loop()
     result_future: "asyncio.Future" = loop.create_future()
-    flavor = "rag" if session.mode == "rag" else "agentic"
+    # Trace flavor segregates web runs from local runs so audit
+    # doesn't have to grep across mixed trees.
+    if session.mode == "rag":
+        flavor = "web_rag" if session.web else "rag"
+    else:
+        flavor = "web_agent" if session.web else "agentic"
     tracer = Tracer(flavor=flavor)
 
     cfg = getattr(request.app.state, "config", None)
-    if session.mode == "rag":
+    if session.mode == "rag" and not session.web:
         gen = stream_rag(
             query=content,
             file_ids=None,
@@ -235,11 +247,27 @@ async def _persist_after_stream(
             tracer=tracer,
             result_future=result_future,
         )
+    elif session.mode == "rag" and session.web:
+        gen = stream_web_rag(
+            query=content,
+            llm=request.app.state.rag_pipeline.llm,
+            tavily=request.app.state.tavily_client,
+            config=cfg,
+            tracer=tracer,
+            result_future=result_future,
+        )
     else:
-        agent = _resolve_agent(request, session.agent_kind or "")
+        # mode='agent'. web=True forces the dedicated web agent
+        # singleton (ChatSchema already enforces kind='base' here).
+        if session.web:
+            agent = request.app.state.web_agent
+            stream_kind = "web"
+        else:
+            agent = _resolve_agent(request, session.agent_kind or "")
+            stream_kind = session.agent_kind or "base"
         gen = stream_agent(
             query=content,
-            kind=session.agent_kind or "base",
+            kind=stream_kind,
             agent=agent,
             config=cfg,
             tracer=tracer,
@@ -351,6 +379,9 @@ async def _persist_assistant(*, session: "_SessionSnapshot", payload: dict) -> N
             output_tokens_total=payload.get("output_tokens_total"),
             error=payload.get("error"),
             original_exit_reason=payload.get("original_exit_reason"),
+            # Web-agent runs accumulate WebCitation list; other kinds
+            # leave it None and the metadata builder drops the key.
+            citations=payload.get("citations"),
         )
 
     async with session_scope() as db:
@@ -405,14 +436,45 @@ async def agent_stream(
     request: Request,
     _user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Smoke endpoint: streams a base/proof/graph agent run, no persistence."""
-    agent = _resolve_agent(request, body.kind)
+    """Smoke endpoint: streams a base/proof/graph/web agent run, no persistence.
+
+    ``body.web=True`` swaps in the dedicated web agent singleton with
+    its own kwargs map. Schema validation already rejected the
+    forbidden combos (web=True + proof/graph).
+    """
+    if body.web:
+        agent = request.app.state.web_agent
+        kind = "web"
+    else:
+        agent = _resolve_agent(request, body.kind)
+        kind = body.kind
     return StreamingResponse(
         stream_agent(
             query=body.query,
-            kind=body.kind,
+            kind=kind,
             agent=agent,
             config=getattr(request.app.state, "config", None),
+        ),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
+@router.post("/web-rag/stream")
+async def web_rag_stream(
+    body: WebRagStreamRequest,
+    request: Request,
+    _user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Smoke endpoint: streams a single-call web RAG, no persistence."""
+    return StreamingResponse(
+        stream_web_rag(
+            query=body.query,
+            llm=request.app.state.rag_pipeline.llm,
+            tavily=request.app.state.tavily_client,
+            config=getattr(request.app.state, "config", None),
+            include_domains=body.include_domains,
+            exclude_domains=body.exclude_domains,
         ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
