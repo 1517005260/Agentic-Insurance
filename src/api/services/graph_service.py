@@ -20,6 +20,8 @@ the agent's ``graph_explore`` tool already emits ``candidate_*`` /
 ``paths`` directly into the SSE ``tool_result`` payload.
 """
 import logging
+import random
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import igraph as ig
@@ -45,6 +47,13 @@ _SEED_MIN_SIM = 0.4               # matches GraphExploreTool.entity_lookup floor
 _EXPAND_DEFAULT_TOP_K = 50
 _EXPAND_MAX_HOPS = 3
 _NODE_DETAIL_NEIGHBOR_FILES = 5
+
+# /graph/sample defaults — tight bounds keep the canvas usable on small
+# screens. The lower floor (10) avoids a degenerate single-node demo;
+# the cap (500) avoids melting G6's force layout in the browser.
+_SAMPLE_DEFAULT_N = 100
+_SAMPLE_MIN_N = 10
+_SAMPLE_MAX_N = 500
 
 
 def _guess_vertex_type(hash_id: str) -> str:
@@ -96,6 +105,14 @@ class GraphService:
         self._passage_meta_by_hash: Optional[
             Dict[str, Tuple[Optional[str], Optional[int]]]
         ] = None
+        # /graph/sample cache: keyed by n. Locks in the initial random
+        # draw so mode-switches in GraphPage don't jitter the canvas;
+        # restart the process to reshuffle.
+        self._sample_cache: Dict[int, Dict[str, Any]] = {}
+        # Guards concurrent first-call races (two clients hitting
+        # /graph/sample at boot would each compute before the other
+        # writes). Cheap; the lock is uncontested after first hit.
+        self._sample_cache_lock = threading.Lock()
 
     # --------------------------------------------------- helpers ----
 
@@ -440,7 +457,63 @@ class GraphService:
             out["page_number"] = page_n
         return out
 
-    # -------------------------------------------------- 5. ppr subgraph ----
+    # -------------------------------------------------- 5. sample ----
+
+    def sample(self, n: int = _SAMPLE_DEFAULT_N) -> Dict[str, Any]:
+        """Random vertex sample (entity-first) + induced edges.
+
+        Drives the GraphPage's first paint and mode-switch fallback so
+        the canvas always has *something* to draw before the user picks
+        a seed. Stratification: take entities until budget exhausts,
+        then fall back to sentence + passage padding. We deliberately
+        prefer entities — they carry semantic labels the user can
+        recognise; raw passage hashes are noise on a cold canvas.
+
+        Cached per ``n`` for the process lifetime: a stable random draw
+        avoids the "graph reshuffles every time I switch tabs" UX trap.
+        """
+        n_clamped = max(_SAMPLE_MIN_N, min(int(n), _SAMPLE_MAX_N))
+        with self._sample_cache_lock:
+            cached = self._sample_cache.get(n_clamped)
+            if cached is not None:
+                return cached
+
+            g = self.graph
+            by_type: Dict[str, List[int]] = {"entity": [], "sentence": [], "passage": []}
+            for v in g.vs:
+                t = self._vertex_type(v)
+                if t in by_type:
+                    by_type[t].append(v.index)
+
+            rng = random.Random()
+            picked: List[int] = []
+            # Entity-first: take up to budget. shuffle in-place is fine —
+            # the lists live only in this method.
+            rng.shuffle(by_type["entity"])
+            picked.extend(by_type["entity"][:n_clamped])
+            for fill_type in ("sentence", "passage"):
+                remaining = n_clamped - len(picked)
+                if remaining <= 0:
+                    break
+                rng.shuffle(by_type[fill_type])
+                picked.extend(by_type[fill_type][:remaining])
+
+            nodes_out = [
+                {
+                    "id": g.vs[vidx]["name"],
+                    "label": self._vertex_label(g.vs[vidx]),
+                    "vertex_type": self._vertex_type(g.vs[vidx]),
+                    "hop": 0,
+                    "score": 0.0,
+                }
+                for vidx in picked
+            ]
+            edges_out = self._induced_edges(g, set(picked))
+            result = {"nodes": nodes_out, "edges": edges_out}
+            self._sample_cache[n_clamped] = result
+            return result
+
+    # -------------------------------------------------- 6. ppr subgraph ----
 
     def ppr_subgraph(
         self,

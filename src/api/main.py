@@ -20,19 +20,25 @@ from api.auth import hash_password
 from api.db import SessionLocal, init_db
 from api.models import User
 from api.routes import admin as admin_routes
+from api.routes import admin_users as admin_users_routes
 from api.routes import audit as audit_routes
 from api.routes import auth as auth_routes
 from api.routes import chat as chat_routes
 from api.routes import files as files_routes
 from api.routes import graph as graph_routes
+from api.routes import insurance as insurance_routes
+from api.routes import trace as trace_routes
+from api.routes import search as search_routes
 from api.services.files import reconcile_after_restart, sweep_orphan_uploads
 from api.services.graph_service import GraphService
 from agentic.agent.factory import (
     build_default_agent,
     build_graph_agent,
     build_proof_agent,
+    build_web_agent,
 )
 from config.config_store import ConfigStore
+from model_client.web_search import TavilyClient
 from rag.pipeline import RAGPipeline
 from config.settings import (
     ALLOW_INSECURE_JWT,
@@ -157,9 +163,32 @@ async def lifespan(_app: FastAPI):
     shared_inventory = InventoryStore(page_store=shared_page_store)
     shared_graph_channel = GraphPPRChannel(embedding_client=shared_embedding)
 
+    # Pre-warm spaCy NER as part of singleton init. Without this the
+    # first /insurance/fraud-ppr/stream (or any agent path that calls
+    # graph_explore mode='ppr') triggers ``spacy.load(en_core_web_trf
+    # + zh_core_web_trf)`` synchronously inside the request thread —
+    # those models pull torch + CUDA libs and add ~2 GB anon heap, which
+    # OOM-kills the worker on 8 GB hosts.
+    import time
+    t0 = time.monotonic()
+    try:
+        shared_graph_channel._ensure_spacy()
+        logger.info(
+            "spaCy NER pre-warmed in %.1fs (en + zh transformer pipelines loaded)",
+            time.monotonic() - t0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Missing model files / disk error → surface a warning but don't
+        # abort startup; PPR paths will lazy-load on demand and the
+        # warning makes the trade-off visible in the log.
+        logger.warning(
+            "spaCy NER pre-warm skipped (%s); first PPR call will pay the "
+            "cold-load cost (~2 GB heap, ~30s)",
+            exc,
+        )
+
     # Build the RAG pipeline AFTER shared resources so it shares the
     # same GraphPPRChannel instance (the new ``graph_channel`` kwarg).
-    # Channels lazily load NER / the graph; we don't pre-warm here.
     _app.state.rag_pipeline = RAGPipeline(
         llm=shared_llm,
         embedding_client=shared_embedding,
@@ -192,8 +221,27 @@ async def lifespan(_app: FastAPI):
         inventory=shared_inventory,
         graph_channel=shared_graph_channel,
     )
+
+    # Tavily client + web agent. The Tavily client is fail-soft when
+    # TAVILY_API_KEY is missing — :meth:`available` lets routes / the
+    # tool short-circuit, so the lifespan still boots cleanly without
+    # a key (the regulation / web-rag / web-agent surfaces will then
+    # respond 503 / "unavailable" envelopes until the key is set).
+    shared_tavily = TavilyClient()
+    _app.state.tavily_client = shared_tavily
+    if not shared_tavily.available():
+        logger.warning(
+            "TAVILY_API_KEY missing — web search / regulation surfaces will return "
+            "503 until the key is provided in the env"
+        )
+
+    _app.state.web_agent = build_web_agent(
+        llm_client=shared_llm,
+        tavily_client=shared_tavily,
+        config_store=_app.state.config,
+    )
     logger.info(
-        "base / proof / graph agent singletons constructed (shared PageStore + GraphPPRChannel)"
+        "base / proof / graph / web agent singletons constructed (shared PageStore + GraphPPRChannel + Tavily)"
     )
 
     # Web-side facade over the same GraphPPRChannel — no extra mmap;
@@ -201,7 +249,42 @@ async def lifespan(_app: FastAPI):
     # are immutable post-ingest).
     _app.state.graph_service = GraphService(channel=shared_graph_channel)
     logger.info("graph service constructed")
-    yield
+    try:
+        yield
+    finally:
+        # Best-effort close of the long-lived ``requests.Session``
+        # objects held by the model clients + the web tool. They are
+        # thread-safe but leaking connection pools on shutdown is
+        # sloppy under repeated reload cycles (uvicorn dev). Each
+        # candidate either IS a session or wraps one as ``_session``.
+        # Lookups via ``getattr(default=None)`` so test paths that
+        # don't build a particular client don't crash teardown.
+        rag_pipeline = getattr(_app.state, "rag_pipeline", None)
+        web_agent = getattr(_app.state, "web_agent", None)
+        web_fetch_tool = None
+        if web_agent is not None:
+            try:
+                web_fetch_tool = web_agent.tools.get("web_fetch")
+            except Exception:
+                web_fetch_tool = None
+        candidates = [
+            getattr(_app.state, "tavily_client", None),
+            shared_llm,
+            shared_embedding,
+            shared_visual,
+            getattr(rag_pipeline, "rerank_client", None) if rag_pipeline else None,
+            web_fetch_tool,
+        ]
+        for client in candidates:
+            if client is None:
+                continue
+            sess = getattr(client, "_session", None) or client
+            close = getattr(sess, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("client session close raised", exc_info=True)
 
 
 app = FastAPI(
@@ -223,7 +306,11 @@ app.include_router(files_routes.router)
 app.include_router(audit_routes.router)
 app.include_router(chat_routes.router)
 app.include_router(admin_routes.router)
+app.include_router(admin_users_routes.router)
 app.include_router(graph_routes.router)
+app.include_router(insurance_routes.router)
+app.include_router(trace_routes.router)
+app.include_router(search_routes.router)
 
 
 @app.get("/health", tags=["meta"])

@@ -42,7 +42,7 @@ from api.services.files import (
     run_parse_index,
     run_reingest,
 )
-from config.settings import upload_path
+from config.settings import paddle_ocr_root, upload_path
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +167,58 @@ async def download_original(
         )
     media_type = "application/pdf" if rec.suffix == ".pdf" else "application/octet-stream"
     return FileResponse(path=path, media_type=media_type, filename=rec.original_filename)
+
+
+@router.get("/{file_id}/preview")
+async def first_page_preview(
+    file_id: str,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> FileResponse:
+    """First-page thumbnail for FilesPage cards.
+
+    Reuses paddleocr's layout_det_res_0.jpg — already rendered during
+    ingest, no extra dep / runtime render needed.
+    """
+    # file_id flows from URL into a filesystem join; reject any token
+    # that could escape the paddle root before touching disk.
+    if "/" in file_id or "\\" in file_id or ".." in file_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid file_id",
+        )
+    rec = await find_file(db, file_id)
+    if rec is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+    root = paddle_ocr_root().resolve()
+    preview = (
+        root
+        / file_id
+        / "raw"
+        / "batch_000"
+        / "output_images"
+        / "layout_det_res_0.jpg"
+    )
+    resolved = preview.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid file_id",
+        )
+    if not resolved.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="preview not available (paddle output missing)",
+        )
+    # ``private`` so reverse proxies / CDNs do not cache this auth-gated
+    # response into a shared cache that other users could hit.
+    return FileResponse(
+        path=resolved,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 # ------------------------------------------------------------------ upload

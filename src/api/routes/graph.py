@@ -83,6 +83,26 @@ async def search_seed(
     return [SeedHit(**hit) for hit in hits]
 
 
+@router.get("/sample", response_model=GraphSubgraphResponse)
+async def sample_graph(
+    request: Request,
+    n: int = Query(100, ge=10, le=500),
+) -> GraphSubgraphResponse:
+    """Random vertex sample (entity-first) — first-paint canvas filler.
+
+    Cached per-n for the process lifetime so mode switches in the
+    GraphPage don't reshuffle the underlying canvas under the user.
+    """
+    svc = _service(request)
+    try:
+        payload = await run_in_threadpool(svc.sample, n)
+    except GraphServiceUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    return GraphSubgraphResponse(**payload)
+
+
 @router.get("/expand", response_model=GraphSubgraphResponse)
 async def expand_node(
     request: Request,

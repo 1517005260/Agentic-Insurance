@@ -65,15 +65,21 @@ async def _admin_and_analyst(app_harness) -> AsyncIterator[tuple]:
 # =====================================================================
 
 
-async def test_get_config_returns_15_keys_and_schema(app_harness):
-    """GET /admin/config returns the snapshot dict + schema entries."""
+async def test_get_config_returns_29_keys_and_schema(app_harness):
+    """GET /admin/config returns the full snapshot + schema.
+
+    The 29 keys break down as: rag/rerank/agent core (15) +
+    agent.web.* (2) + tavily.* (4) + prompt.* (8). This test pins the
+    total so adding or removing a key without updating
+    ``config_store/schema.py`` fails loudly.
+    """
     async with _client_for(app_harness) as (client, _app, headers):
         r = await client.get("/admin/config", headers=headers)
         assert r.status_code == 200, r.text
         body = r.json()
         assert set(body.keys()) == {"snapshot", "schema"}
-        assert len(body["snapshot"]) == 15
-        assert len(body["schema"]) == 15
+        assert len(body["snapshot"]) == 29
+        assert len(body["schema"]) == 29
 
         keys_in_schema = {entry["key"] for entry in body["schema"]}
         assert keys_in_schema == set(body["snapshot"].keys())
