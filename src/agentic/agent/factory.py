@@ -16,10 +16,19 @@ Centralizing construction here keeps three properties straight:
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from config.config_store import ConfigStore
+    from model_client.web_search import TavilyClient
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.prompts import GRAPH_SYSTEM_PROMPT, PROOF_SYSTEM_PROMPT, SYSTEM_PROMPT
+from agentic.agent.prompts import (
+    GRAPH_SYSTEM_PROMPT,
+    PROOF_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    WEB_AGENT_SYSTEM_PROMPT,
+)
 from agentic.agent.proof_agent import ProofAgent
 from agentic.tools.acquisition import (
     Bm25SearchTool,
@@ -30,6 +39,8 @@ from agentic.tools.acquisition import (
     ReadTool,
     SemanticSearchTool,
     TocTool,
+    WebFetchTool,
+    WebSearchTool,
 )
 from agentic.closure.inventory import InventoryAdapter
 from agentic.tools.registry import ToolRegistry
@@ -214,6 +225,52 @@ def build_graph_agent(
         llm_client=llm_client,
         tools=registry,
         system_prompt=system_prompt or GRAPH_SYSTEM_PROMPT,
+        max_loops=max_loops,
+        max_token_budget=max_token_budget,
+        verbose=verbose,
+    )
+
+
+def build_web_agent(
+    *,
+    llm_client: Optional[LLMClient] = None,
+    tavily_client: Optional["TavilyClient"] = None,
+    config_store: Optional["ConfigStore"] = None,
+    system_prompt: Optional[str] = None,
+    max_loops: int = 8,
+    max_token_budget: int = 64_000,
+    verbose: bool = False,
+) -> BaseAgent:
+    """Build a BaseAgent specialised for public-web research.
+
+    Toolset is intentionally narrow: ``web_search`` (Tavily) and
+    ``web_fetch`` (HTML stripper). No local-corpus or graph access —
+    the web agent must answer purely from public sources, cite URLs,
+    and abstain when the web doesn't cover the question.
+
+    Why a separate agent (not a ``base_agent`` with extra tools): the
+    cite contract differs (URL vs file_id+page_id), the abstain rule
+    differs (no local fallback), and the system prompt needs to keep
+    those rules visible in every turn. Splitting at factory level
+    rather than at runner level keeps each agent's contract local.
+
+    Defaults match the graph agent: 8 loops / 64 k tokens. Tavily +
+    a single fetch returns enough text to answer most questions in
+    2-4 turns; the budget mostly guards against pathological loops.
+    """
+    from model_client.web_search import TavilyClient
+
+    llm_client = llm_client or LLMClient()
+    tavily_client = tavily_client or TavilyClient()
+
+    registry = ToolRegistry()
+    registry.register(WebSearchTool(tavily_client=tavily_client, config_store=config_store))
+    registry.register(WebFetchTool())
+
+    return BaseAgent(
+        llm_client=llm_client,
+        tools=registry,
+        system_prompt=system_prompt or WEB_AGENT_SYSTEM_PROMPT,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,

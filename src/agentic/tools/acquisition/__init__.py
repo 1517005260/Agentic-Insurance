@@ -8,6 +8,8 @@ from agentic.tools.acquisition.pattern_search import PatternSearchTool
 from agentic.tools.acquisition.read import ReadTool
 from agentic.tools.acquisition.semantic_search import SemanticSearchTool
 from agentic.tools.acquisition.toc import TocTool
+from agentic.tools.acquisition.web_fetch import WebFetchTool
+from agentic.tools.acquisition.web_search import WebSearchTool
 
 __all__ = [
     "Bm25SearchTool",
@@ -18,4 +20,6 @@ __all__ = [
     "ReadTool",
     "SemanticSearchTool",
     "TocTool",
+    "WebFetchTool",
+    "WebSearchTool",
 ]

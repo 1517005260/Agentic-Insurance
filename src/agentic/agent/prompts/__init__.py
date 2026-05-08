@@ -22,6 +22,21 @@ from agentic.agent.prompts.graph_system import (
 
 from agentic.agent.prompts.rag_business import RAG_BUSINESS_SYSTEM_PROMPT
 
+from agentic.agent.prompts.web_system import (
+    WEB_AGENT_SYSTEM_PROMPT,
+    WEB_RAG_SYSTEM_PROMPT,
+)
+
+from agentic.agent.prompts.insurance import (
+    CLAIM_CHECK_SYSTEM_PROMPT,
+    COMPARE_SYSTEM_PROMPT,
+    EXCLUSION_AUDIT_SYSTEM_PROMPT,
+    FRAUD_PPR_SYSTEM_PROMPT,
+    POLICY_CALC_SYSTEM_PROMPT,
+    RECOMMEND_SYSTEM_PROMPT,
+    REGULATION_SUMMARIZER_SYSTEM_PROMPT,
+)
+
 __all__ = [
     "SYSTEM_PROMPT",
     "TOOL_OVERVIEW",
@@ -34,4 +49,13 @@ __all__ = [
     "GRAPH_SYSTEM_PROMPT",
     "build_graph_system_prompt",
     "RAG_BUSINESS_SYSTEM_PROMPT",
+    "WEB_AGENT_SYSTEM_PROMPT",
+    "WEB_RAG_SYSTEM_PROMPT",
+    "CLAIM_CHECK_SYSTEM_PROMPT",
+    "COMPARE_SYSTEM_PROMPT",
+    "EXCLUSION_AUDIT_SYSTEM_PROMPT",
+    "FRAUD_PPR_SYSTEM_PROMPT",
+    "POLICY_CALC_SYSTEM_PROMPT",
+    "RECOMMEND_SYSTEM_PROMPT",
+    "REGULATION_SUMMARIZER_SYSTEM_PROMPT",
 ]

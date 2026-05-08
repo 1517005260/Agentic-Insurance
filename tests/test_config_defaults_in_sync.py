@@ -13,12 +13,21 @@ from agentic.agent.factory import (
     build_default_agent,
     build_graph_agent,
     build_proof_agent,
+    build_web_agent,
 )
 from agentic.agent.prompts import (
+    CLAIM_CHECK_SYSTEM_PROMPT,
+    COMPARE_SYSTEM_PROMPT,
+    EXCLUSION_AUDIT_SYSTEM_PROMPT,
     GRAPH_SYSTEM_PROMPT,
+    POLICY_CALC_SYSTEM_PROMPT,
     PROOF_SYSTEM_PROMPT,
     RAG_BUSINESS_SYSTEM_PROMPT,
+    RECOMMEND_SYSTEM_PROMPT,
+    REGULATION_SUMMARIZER_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
+    WEB_AGENT_SYSTEM_PROMPT,
+    WEB_RAG_SYSTEM_PROMPT,
 )
 from api.services.citation import DEFAULT_PREVIEW_CHARS
 from config.config_store.schema import CONFIG_ENTRIES_BY_KEY
@@ -48,6 +57,8 @@ def test_agent_factory_defaults_mirrored_in_schema():
         ("agent.proof.max_token_budget", build_proof_agent, "max_token_budget"),
         ("agent.graph.max_loops", build_graph_agent, "max_loops"),
         ("agent.graph.max_token_budget", build_graph_agent, "max_token_budget"),
+        ("agent.web.max_loops", build_web_agent, "max_loops"),
+        ("agent.web.max_token_budget", build_web_agent, "max_token_budget"),
     ]
     for key, fn, param in expectations:
         assert (
@@ -60,11 +71,27 @@ def test_prompt_defaults_match_module_constants():
     assert CONFIG_ENTRIES_BY_KEY["prompt.base_agent"].default is SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.proof_agent"].default is PROOF_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.graph_agent"].default is GRAPH_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.web_rag"].default is WEB_RAG_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.web_agent"].default is WEB_AGENT_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.regulation"].default is REGULATION_SUMMARIZER_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.compare"].default is COMPARE_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.exclusion_audit"].default is EXCLUSION_AUDIT_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.recommend"].default is RECOMMEND_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.claim_check"].default is CLAIM_CHECK_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.policy_calc"].default is POLICY_CALC_SYSTEM_PROMPT
 
 
 def test_citation_default_matches_module_constant():
     assert CONFIG_ENTRIES_BY_KEY["citation.preview_chars"].default == DEFAULT_PREVIEW_CHARS
 
 
-def test_entry_count_is_15():
-    assert len(CONFIG_ENTRIES_BY_KEY) == 15
+def test_tavily_defaults():
+    assert CONFIG_ENTRIES_BY_KEY["tavily.max_results"].default == 5
+    assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
+    assert "ia.org.hk" in CONFIG_ENTRIES_BY_KEY["tavily.include_domains_hk"].default
+    assert "nfra.gov.cn" in CONFIG_ENTRIES_BY_KEY["tavily.include_domains_cn"].default
+
+
+def test_entry_count_is_29():
+    # rag/rerank/agent core (15) + agent.web (2) + tavily (4) + prompt (8) = 29.
+    assert len(CONFIG_ENTRIES_BY_KEY) == 29

@@ -66,6 +66,11 @@ _AGENT_KEY_TABLE: Dict[str, Dict[str, str]] = {
         "max_token_budget": "agent.graph.max_token_budget",
         "system_prompt": "prompt.graph_agent",
     },
+    "web": {
+        "max_loops": "agent.web.max_loops",
+        "max_token_budget": "agent.web.max_token_budget",
+        "system_prompt": "prompt.web_agent",
+    },
 }
 
 

@@ -227,6 +227,16 @@ class ProofAgent:
             messages.append(message)
 
             tool_calls = message.get("tool_calls") or []
+            # 仅在「有 tool_calls + 有 content」时 emit thought —— ProofAgent
+            # 在 strict 模式下「没有 tool_call 即停」，那种 content 不是
+            # reasoning 而是被 abstain 的尾声，应该走 final.answer 不该
+            # 进时间线。
+            content_str = (message.get("content") or "").strip()
+            if content_str and tool_calls:
+                emit(
+                    "thought",
+                    {"loop": loop_count, "text": content_str},
+                )
             if not tool_calls:
                 # Strict mode: if the LLM produced free text without finalize, we treat it as a stop and abstain.
                 exit_reason = "no_tool_calls"
@@ -292,6 +302,10 @@ class ProofAgent:
                             } else None
                         ),
                         "must_finalize_next": tool_log.get("must_finalize_next", False),
+                        # Internal-only: full tool result for runner-side
+                        # citation extraction. Stripped by the SSE runner
+                        # before frames hit the wire — see BaseAgent.run.
+                        "_full_result": tool_result,
                     },
                 )
 

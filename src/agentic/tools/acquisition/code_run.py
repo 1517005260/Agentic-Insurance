@@ -46,13 +46,27 @@ if TYPE_CHECKING:
     from agentic.core.context import AgentContext
 
 
+# Cap concurrent code_run subprocesses across the whole process. A
+# single ``code_run`` is bounded at 2 GiB virtual address (the bump
+# below) and 5 s CPU; without an outer cap, N concurrent agent loops
+# could each spawn one and stack 2N GiB of address pressure under
+# concurrent compare / policy-calc traffic. Two slots is a sweet
+# spot for the demo: every workbench can still run code_run in
+# parallel with another, but a fork-bomb agent can't pile up.
+import threading as _threading
+_CODE_RUN_CONCURRENCY = _threading.BoundedSemaphore(value=2)
+
+
 _DEFAULT_CPU_SECONDS = 5
 _DEFAULT_WALL_SECONDS = 10
-# numpy / sympy reserve a lot of virtual address up-front (OpenBLAS thread
-# pool, mmap arenas) so anything tighter than ~1 GiB SIGKILLs them on
-# import. The number is "won't crash a typical laptop" rather than a
-# tight bound — the wall + CPU clocks are the real DoS guard.
-_DEFAULT_MEM_BYTES = 1024 * 1024 * 1024
+# numpy / scipy / sympy reserve a lot of virtual address up-front
+# (OpenBLAS thread pool, scipy submodule mmap arenas) so anything
+# tighter than ~2 GiB SIGKILLs them somewhere between import and the
+# first call. 1 GiB used to be enough for plain numpy + sympy but
+# scipy.optimize / scipy.sparse push past that on first lazy-load.
+# The number is "won't crash a typical laptop" rather than a tight
+# bound — the wall + CPU clocks are the real DoS guard.
+_DEFAULT_MEM_BYTES = 2 * 1024 * 1024 * 1024
 _DEFAULT_NOFILE = 256
 _STREAM_LIMIT_BYTES = 16 * 1024
 # stdin is bounded so an oversized ``inputs`` payload cannot deadlock
@@ -78,6 +92,8 @@ _DOCUMENTED_IMPORTS = (
     "re",
     "datetime",
     "numpy",
+    "numpy_financial",
+    "scipy",
     "sympy",
 )
 
@@ -198,7 +214,11 @@ class CodeRunTool(BaseTool):
             )
 
         runner = self._build_runner_script(str(code))
-        with tempfile.TemporaryDirectory(prefix="code_run_") as workdir:
+        # Acquire the process-wide concurrency slot inside the
+        # context (so a panicking exec releases it). The semaphore is
+        # bounded so repeated agent loops can't queue indefinitely;
+        # contention shows up as a wait, not a timeout.
+        with tempfile.TemporaryDirectory(prefix="code_run_") as workdir, _CODE_RUN_CONCURRENCY:
             wd = Path(workdir)
             (wd / "runner.py").write_text(runner, encoding="utf-8")
             stdout_bytes, stderr_bytes, returncode, status, elapsed_ms = self._run_bounded(
@@ -385,7 +405,13 @@ class CodeRunTool(BaseTool):
             _USER_CODE = {body!r}
 
             try:
-                exec(compile(_USER_CODE, '<code_run>', 'exec'), {{'INPUTS': INPUTS, 'OUTPUT': None}}, _ns := {{}})
+                # Single dict for both globals + locals — passing two dicts
+                # to exec breaks comprehensions / generator expressions
+                # (PEP 227 implicit function scope can't see the outer
+                # locals frame), which made `sum(c/(1+r)**t for t,c in ...)`
+                # fail with NameError on `r`.
+                _ns = {{'INPUTS': INPUTS, 'OUTPUT': None}}
+                exec(compile(_USER_CODE, '<code_run>', 'exec'), _ns)
                 OUTPUT = _ns.get('OUTPUT', None)
             except SystemExit:
                 raise

@@ -282,6 +282,17 @@ class BaseAgent:
                 print(f"Assistant: {message['content'][:200]}...")
 
             tool_calls = message.get("tool_calls")
+            # 仅在「有 tool_calls + 有 content」时把 content 作为 "thought" 发出 ——
+            # 这是 LLM 在调用工具前的 reasoning。如果 message 没有 tool_calls，
+            # 那它的 content 就是最终答案，会通过 final 事件 + answer 字段
+            # 流到前端答案区，不能也塞进时间线，否则会跟答案区重复。
+            content_str = (message.get("content") or "").strip()
+            if content_str and tool_calls:
+                emit(
+                    "thought",
+                    {"loop": loop_count, "text": content_str},
+                )
+
             if not tool_calls:
                 final_answer = message.get("content", "")
                 early_exit_reason = "natural"
@@ -349,6 +360,14 @@ class BaseAgent:
                         "preview": tool_result[:300],
                         "retrieved_tokens": tool_log.get("retrieved_tokens", 0),
                         "error": tool_log.get("error"),
+                        # Full tool result envelope for runner-side
+                        # consumers (e.g. citation extraction). The
+                        # underscore prefix flags it as internal: the
+                        # streaming runner strips it before pushing the
+                        # frame to the SSE bus, since the JSON can be
+                        # tens of KB and the SSE client only needs the
+                        # 300-char preview.
+                        "_full_result": tool_result,
                     },
                 )
 
