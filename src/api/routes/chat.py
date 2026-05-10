@@ -38,6 +38,7 @@ from api.schemas.chat import (
     WebRagStreamRequest,
 )
 from api.services import chat as chat_svc
+from api.services.history import load_recent_turns
 from tracer import Tracer
 
 
@@ -173,6 +174,15 @@ async def post_session_message(
     # mid-stream and roll the user message back.
     await db.commit()
 
+    # Multi-turn: load prior (user, assistant) pairs from
+    # chat_messages + trace files now, while ``db`` is still open.
+    # The streaming generator below outlives ``get_session``'s tail-
+    # commit teardown, so the loader has to run on the *handler*
+    # session — closing-over the resulting list is safe.
+    cfg = getattr(request.app.state, "config", None)
+    n_turns = cfg.chat_history_turns() if cfg is not None else 0
+    history = await load_recent_turns(db, session_id=session.id, n_turns=n_turns)
+
     # Capture only scalar session info — the ORM session attached to
     # ``session`` will close when the route returns, and the streaming
     # generator below outlives that.
@@ -189,10 +199,24 @@ async def post_session_message(
             session=session_snapshot,
             user_message_id=user_msg.id,
             content=body.content,
+            history=history,
         ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+def _is_done_frame(chunk: bytes) -> bool:
+    """Detect the SSE ``event: done`` frame.
+
+    Used by ``_persist_after_stream`` to gate the terminal frame
+    behind assistant persistence. Cheap byte-prefix check; the SSE
+    encoder (api/sse.py:format_event) always emits exactly
+    ``event: done\\ndata: {}\\n\\n`` so a literal prefix match is
+    safe. Heartbeats are comment-prefixed (``: keepalive``) and
+    won't false-match.
+    """
+    return chunk.startswith(b"event: done\n")
 
 
 @dataclass(frozen=True)
@@ -216,6 +240,7 @@ async def _persist_after_stream(
     session: "_SessionSnapshot",
     user_message_id: int,
     content: str,
+    history: Optional[List[tuple]] = None,
 ) -> AsyncIterator[bytes]:
     """Stream bytes; on exit, persist the assistant message in a fresh session.
 
@@ -238,6 +263,7 @@ async def _persist_after_stream(
     tracer = Tracer(flavor=flavor)
 
     cfg = getattr(request.app.state, "config", None)
+    history_arg = list(history) if history else None
     if session.mode == "rag" and not session.web:
         gen = stream_rag(
             query=content,
@@ -246,6 +272,7 @@ async def _persist_after_stream(
             config=cfg,
             tracer=tracer,
             result_future=result_future,
+            history=history_arg,
         )
     elif session.mode == "rag" and session.web:
         gen = stream_web_rag(
@@ -255,6 +282,7 @@ async def _persist_after_stream(
             config=cfg,
             tracer=tracer,
             result_future=result_future,
+            history=history_arg,
         )
     else:
         # mode='agent'. web=True forces the dedicated web agent
@@ -272,30 +300,68 @@ async def _persist_after_stream(
             config=cfg,
             tracer=tracer,
             result_future=result_future,
+            history=history_arg,
         )
 
+    # Buffer the terminal ``done`` frame so we can await
+    # persistence BEFORE the client sees done. Otherwise the
+    # client (frontend useSSE) parses done → cancels the reader →
+    # cancels this generator → ``CancelledError`` interrupts the
+    # awaited persist, falling back to the detached path and
+    # reintroducing the immediate-follow-up history race.
+    pending_done: Optional[bytes] = None
     disconnected = False
     try:
         async for chunk in gen:
+            if pending_done is not None:
+                yield pending_done
+                pending_done = None
+            if _is_done_frame(chunk):
+                pending_done = chunk
+                continue
             yield chunk
     except asyncio.CancelledError:
-        # Client disconnected mid-stream. Re-raise after scheduling
-        # the persistence task so FastAPI's response task can fully
-        # unwind, but keep the worker + future independent.
+        # Client disconnected mid-stream. Detach the persistence
+        # task so FastAPI's response task can fully unwind without
+        # cancelling the writer.
         disconnected = True
-        raise
-    finally:
-        # Spawn an independent task for the post-stream persistence.
-        # Using create_task on the running loop (rather than awaiting
-        # in this finally) decouples it from the response task — a
-        # CancelledError propagating up here doesn't kill the writer.
         asyncio.create_task(
             _persist_assistant_when_ready(
                 session=session,
                 result_future=result_future,
-                disconnected=disconnected,
+                disconnected=True,
             )
         )
+        raise
+    # Clean stream completion. Order matters:
+    #   1) await persist — assistant row commits
+    #   2) yield done    — only now can the client safely fire a
+    #                      follow-up POST that loads multi-turn
+    #                      history (the just-finished assistant row
+    #                      is guaranteed visible).
+    #
+    # If the client disconnects DURING the persist await (tab close
+    # in the ~tens of ms between drain and yield), CancelledError
+    # tears the await down. Detach a fresh writer task so the row
+    # still lands; otherwise that tail-disconnect would silently
+    # drop the assistant row.
+    try:
+        await _persist_assistant_when_ready(
+            session=session,
+            result_future=result_future,
+            disconnected=False,
+        )
+    except asyncio.CancelledError:
+        asyncio.create_task(
+            _persist_assistant_when_ready(
+                session=session,
+                result_future=result_future,
+                disconnected=True,
+            )
+        )
+        raise
+    if pending_done is not None:
+        yield pending_done
 
 
 async def _persist_assistant_when_ready(
@@ -366,6 +432,11 @@ async def _persist_assistant(*, session: "_SessionSnapshot", payload: dict) -> N
             reranked_count=payload.get("reranked_count"),
             error=payload.get("error"),
             original_exit_reason=payload.get("original_exit_reason"),
+            # Only the web_rag runner populates these; local-RAG payload
+            # leaves them absent → metadata builder drops them.
+            search_query=payload.get("search_query"),
+            original_query=payload.get("original_query"),
+            rewrite_error=payload.get("rewrite_error"),
         )
     else:
         metadata = chat_svc.build_agent_assistant_metadata(

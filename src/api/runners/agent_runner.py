@@ -15,10 +15,16 @@ Same EventBus pattern as :mod:`api.runners.rag_runner`. Adds:
   for the canonical sup → url legend, and emit one canonical
   ``citations`` SSE event before the runner's own ``final`` (the
   agent-internal ``final`` is swallowed to keep ``citations → final
-  → done`` ordering, mirroring :mod:`api.runners._workbench`). Other
-  kinds keep the existing chat contract (no citations event; frontend
-  reverse-derives evidence chips from ``is_evidence=true`` tool_result
-  frames).
+  → done`` ordering, mirroring :mod:`api.runners._workbench`).
+* for ``kind in {base, proof, graph}``: same ``_accumulate_read_citations``
+  pattern as :mod:`api.runners._workbench` — every ``read`` envelope
+  contributes its ``units`` to a deduped sup-numbered list emitted as
+  one ``citations`` event before ``final``. The default chat prompts
+  use ``[file_id#page]`` markers (so the citations frame is metadata-
+  only); admin-supplied prompts that switch to ``[^k]`` style get
+  clickable sup → drawer just like workbench pages do. The frontend's
+  evidence-chip path also still works (reverse-derived from
+  ``is_evidence=true`` tool_results) — both surfaces are additive.
 """
 import asyncio
 import json
@@ -29,7 +35,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 from agentic.agent.base import BaseAgent
 from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners._tracing import CapturingTracer
+from api.runners._workbench import _accumulate_read_citations
 from api.runners.events import EventBus, EventType
+from api.services.citation import CitationItem
 from config.config_store import ConfigStore
 from config.settings import relativize_trace_dir
 from tracer import Tracer
@@ -96,6 +104,32 @@ def _make_base_final_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _compose_query_with_history(
+    history: List[Tuple[str, str]], current_query: str
+) -> str:
+    """Stitch prior (query, answer) pairs in front of ``current_query``.
+
+    Agent runs are message-list-driven (``[system, user(query)]`` →
+    iterate); rather than reach into BaseAgent / ProofAgent and rebuild
+    a multi-turn message list with role=assistant turns (which would
+    drag tool_call / tool_result accounting along), we keep each agent
+    invocation as a self-contained "long internal conversation" and
+    inject prior context as a multi-paragraph user prefix.
+
+    The model treats the prior turns as background context against
+    which to answer the *current* turn — same effect, simpler plumbing,
+    and trace files (one per agent.run) stay independent so audit /
+    replay still work per-turn.
+    """
+    if not history:
+        return current_query
+    blocks = [
+        f"--- previous turn ---\nUser: {q}\n\nAssistant: {a}"
+        for q, a in history
+    ]
+    return "\n\n".join(blocks) + f"\n\n--- current turn ---\nUser: {current_query}"
+
+
 async def stream_agent(
     *,
     query: str,
@@ -104,6 +138,8 @@ async def stream_agent(
     config: Optional[ConfigStore] = None,
     tracer: Optional[Tracer] = None,
     result_future: Optional["asyncio.Future[Dict[str, Any]]"] = None,
+    history: Optional[List[Tuple[str, str]]] = None,
+    system_prompt_override: Optional[str] = None,
 ) -> AsyncIterator[bytes]:
     """Stream one agent run as SSE bytes.
 
@@ -118,6 +154,13 @@ async def stream_agent(
     ``total_cost`` / ``trace_path``? once the agent returns. The route
     handler awaits it after the bus drains to write the assistant
     message inside the request's async DB session.
+
+    ``system_prompt_override`` (when not ``None``) replaces the prompt
+    that ``materialize_agent_kwargs`` would have pulled from
+    ``prompt.<kind>_agent``. Used by wrapper runners (e.g.
+    ``risk_predict_runner``) that drive the same kind=``graph`` engine
+    but want a workbench-specific instruction set without registering a
+    new agent kind.
     """
     if kind not in ("base", "proof", "graph", "web"):
         raise ValueError(f"unsupported agent kind: {kind!r}")
@@ -130,7 +173,14 @@ async def stream_agent(
     # PATCH cannot half-apply mid-run.
     effective_config = config if config is not None else ConfigStore.defaults_only()
     agent_overrides = effective_config.materialize_agent_kwargs(kind)
+    if system_prompt_override is not None:
+        agent_overrides["system_prompt"] = system_prompt_override
     preview_chars = effective_config.citation_preview_chars()
+
+    # Multi-turn: prepend prior (q, a) pairs to the user query as
+    # context. trace files still record only the *current* (query,
+    # answer) — see _compose_query_with_history docstring.
+    composed_query = _compose_query_with_history(history or [], query)
 
     # Web-agent citation pool. Indexed by canonical URL → WebCitation
     # field dict (no sup yet). Sup is assigned at flush time by parsing
@@ -143,6 +193,13 @@ async def stream_agent(
     # differ from the envelope's ``final_url`` (HTTP redirect). When
     # the result lands we union the two so the LLM can cite either.
     pending_fetch_url: Optional[str] = None
+    # Local-agent (base / proof / graph) citation pool: same shape as
+    # the workbench accumulator — each ``read`` envelope contributes
+    # its ``units`` deduped by (file_id, page_id), sup is first-seen
+    # order. Emitted once before ``final`` so the chat ``citations``
+    # frame matches the ``citations → final → done`` contract.
+    local_cited_units: List[CitationItem] = []
+    local_seen_keys: Set[Tuple[str, str]] = set()
 
     def wrapped_on_event(event_name: str, data: Dict[str, Any]) -> None:
         nonlocal pending_fetch_url
@@ -187,6 +244,18 @@ async def stream_agent(
                 )
                 if tool_name == "web_fetch":
                     pending_fetch_url = None
+            # Local kinds: feed every ``read`` envelope into the same
+            # citation accumulator the workbench runners use. Frontend
+            # gets a sup-numbered legend regardless of whether the
+            # admin-tuned prompt actually emits ``[^k]`` markers.
+            if (
+                kind in ("base", "proof", "graph")
+                and tool_name == "read"
+                and isinstance(full_result, str)
+            ):
+                _accumulate_read_citations(
+                    full_result, local_cited_units, local_seen_keys, preview_chars
+                )
             # Graph kind: pull a canvas-shaped projection out of the
             # graph_explore envelope and emit it on a side channel. The
             # GraphPage subscribes to GRAPH_SUBGRAPH frames to keep its
@@ -203,11 +272,13 @@ async def stream_agent(
                 if projected is not None:
                     bus.push(EventType.GRAPH_SUBGRAPH, projected)
 
-        # Web agent: swallow the agent-internal ``final`` frame so the
-        # runner can emit its own canonical ``final`` AFTER citations.
-        # Other kinds forward final unchanged (they don't emit a second
-        # final from the runner side).
-        if kind == "web" and event_name == EventType.FINAL:
+        # Swallow the agent-internal ``final`` frame for kinds that
+        # emit their own canonical ``final`` AFTER ``citations``:
+        # web (URL pool flush) and the local kinds (read-units flush).
+        # Forwarding the agent's final would put it BEFORE citations
+        # and break the ``citations → final → done`` ordering the
+        # frontend latches onto.
+        if event_name == EventType.FINAL and kind in ("web", "base", "proof", "graph"):
             return
 
         bus.push(event_name, data)
@@ -219,9 +290,10 @@ async def stream_agent(
                 if not isinstance(agent, ProofAgent):
                     raise TypeError("proof kind requires ProofAgent instance")
                 proof_result = agent.run(
-                    query,
+                    composed_query,
                     tracer=capturing,
                     on_event=wrapped_on_event,
+                    cancel_check=lambda: bus.is_closed,
                     **agent_overrides,
                 )
                 result_payload = _make_proof_final_payload(proof_result)
@@ -229,9 +301,10 @@ async def stream_agent(
                 if not isinstance(agent, BaseAgent):
                     raise TypeError(f"{kind!r} kind requires BaseAgent instance")
                 base_result = agent.run(
-                    query,
+                    composed_query,
                     tracer=capturing,
                     on_event=wrapped_on_event,
+                    cancel_check=lambda: bus.is_closed,
                     **agent_overrides,
                 )
                 result_payload = _make_base_final_payload(base_result)
@@ -250,13 +323,10 @@ async def stream_agent(
                         capturing.last_run_dir,
                     )
 
-            # Web agent: resolve sup → url legend from the answer's
-            # ``## Sources`` section, fall back to first-seen tool
-            # order when the model didn't write one. Always emit the
-            # frame (even empty) so the frontend can clear stale
-            # Drawer state from a previous run on the same session.
             # Order is ``citations → final → done`` to match the
-            # workbench / RAG runner contract.
+            # workbench / RAG runner contract. Always emit ``citations``
+            # (even when empty) so the frontend can clear stale Drawer
+            # state from a previous run on the same session.
             if kind == "web":
                 answer_text = str(result_payload.get("answer") or "")
                 citation_items = _resolve_web_citation_legend(
@@ -265,21 +335,31 @@ async def stream_agent(
                 bus.push(EventType.CITATIONS, {"items": citation_items})
                 result_payload["citations"] = citation_items
                 bus.push(EventType.FINAL, dict(result_payload))
+            elif kind in ("base", "proof", "graph"):
+                citation_items = [c.to_dict() for c in local_cited_units]
+                bus.push(EventType.CITATIONS, {"items": citation_items})
+                result_payload["citations"] = citation_items
+                bus.push(EventType.FINAL, dict(result_payload))
         except Exception as exc:
             logger.exception("agent runner failed (kind=%s)", kind)
-            # Web agent: flush whatever URLs were accumulated so the
-            # frontend's CitationDrawer can drop stale state. Best-
-            # effort; never raises, never blocks the close path.
-            if kind == "web":
-                try:
+            # Flush whatever citations accumulated so the frontend's
+            # CitationDrawer can drop stale state from a previous run.
+            # Best-effort; never raises, never blocks the close path.
+            try:
+                if kind == "web":
                     fallback_items = _resolve_web_citation_legend(
                         "", url_pool, pool_order
                     )
                     bus.push(EventType.CITATIONS, {"items": fallback_items})
-                except Exception:
-                    logger.exception(
-                        "agent runner: failed to push web citations during error path"
+                elif kind in ("base", "proof", "graph"):
+                    bus.push(
+                        EventType.CITATIONS,
+                        {"items": [c.to_dict() for c in local_cited_units]},
                     )
+            except Exception:
+                logger.exception(
+                    "agent runner: failed to push citations during error path"
+                )
             _schedule_future_exception(loop, result_future, exc)
             bus.close(error=f"{type(exc).__name__}: {exc}", error_type=type(exc).__name__)
             return
@@ -602,6 +682,15 @@ def _project_graph_explore(
         seed_surfaces = [
             s.get("surface") for s in (payload.get("seeds") or []) if s.get("surface")
         ]
+        # PPR mode envelope today carries seeds + candidate_pages but no
+        # entity / passage hash_ids — frontends that want to drive a
+        # /graph/expand call (RiskExploreCanvas, GraphPage agent mode)
+        # need ids. Surface seed_ids when the algorithm-layer envelope
+        # exposes them in future without breaking older callers (the
+        # field is optional on the FE side).
+        seed_ids = [
+            s.get("hash_id") for s in (payload.get("seeds") or []) if s.get("hash_id")
+        ]
         page_refs = [
             {"file_id": p.get("file_id"), "page_id": p.get("page_id")}
             for p in (payload.get("candidate_pages") or [])
@@ -612,6 +701,7 @@ def _project_graph_explore(
             "mode": "ppr",
             "question": payload.get("question"),
             "seed_surfaces": seed_surfaces,
+            "seed_ids": seed_ids,
             "page_refs": page_refs,
         }
     if mode == "entity_lookup":

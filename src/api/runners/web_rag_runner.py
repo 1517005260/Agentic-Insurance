@@ -7,7 +7,7 @@ sources block we built into the prompt).
 """
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from api.runners._tracing import CapturingTracer
 from api.runners.events import EventBus, EventType
@@ -22,7 +22,7 @@ from tracer import Tracer
 logger = logging.getLogger(__name__)
 
 
-_KNOWN_EVENTS = {"status", "retrieval", "token", "citations", "final"}
+_KNOWN_EVENTS = {"status", "rewrite", "retrieval", "token", "citations", "final"}
 
 
 async def stream_web_rag(
@@ -35,13 +35,13 @@ async def stream_web_rag(
     exclude_domains: Optional[Sequence[str]] = None,
     tracer: Optional[Tracer] = None,
     result_future: Optional["asyncio.Future[Dict[str, Any]]"] = None,
+    history: Optional[List[Tuple[str, str]]] = None,
 ) -> AsyncIterator[bytes]:
     """Stream one web-RAG run as SSE bytes.
 
-    ``include_domains`` / ``exclude_domains`` are exposed so the
-    regulation-search endpoint (which goes through the same service)
-    can hard-pin the jurisdiction domain set; the chat path leaves
-    them ``None`` so the LLM can search the open web.
+    ``include_domains`` / ``exclude_domains`` are exposed for callers
+    that want to hard-pin a domain set; the chat path leaves them
+    ``None`` so the LLM can search the open web.
     """
     loop = asyncio.get_running_loop()
     bus = EventBus(loop=loop)
@@ -95,6 +95,7 @@ async def stream_web_rag(
                 system_prompt=str(system_prompt) if system_prompt else None,
                 max_tokens=int(answer_max_tokens),
                 cancel_check=lambda: bus.is_closed,
+                history=history,
             )
             for event_name, data in generator:
                 if event_name == "__assembled__":
@@ -112,23 +113,36 @@ async def stream_web_rag(
 
         if trace_session is not None:
             try:
-                trace_session.event(
-                    "web_rag_summary",
-                    {
-                        "answer_chars": len(assembled.get("answer", "")),
+                # finalize writes ``final.json`` with {query, answer, ...}.
+                # The history loader (api/services/history.py) reads
+                # ``final.json.answer`` to reconstruct multi-turn pairs;
+                # without this call the assistant side of every web-RAG
+                # turn would be silently skipped on the next request.
+                trace_session.finalize(
+                    answer=assembled.get("answer", ""),
+                    summary={
                         "n_sources": len(assembled.get("sources", [])),
                         "n_cited": len(assembled.get("cited", [])),
                     },
                 )
-                trace_session.close()
             except Exception:
-                logger.debug("trace_session close failed", exc_info=True)
+                logger.debug("trace_session.finalize failed", exc_info=True)
 
         payload: Dict[str, Any] = {
             "answer": assembled.get("answer", ""),
             "exit_reason": "ok",
             "citations": assembled.get("cited", []),
             "n_results": len(assembled.get("sources", [])),
+            # Forward stage timings + the rewritten search query +
+            # original user query + any rewrite error so the
+            # session-persist layer (chat.py) can stash them in
+            # ``chat_messages.metadata_json`` for the audit / trace UI.
+            # All four are best-effort — they exist when stream_chat
+            # ran cleanly and are absent on fail-fast paths above.
+            "timings_ms": assembled.get("timings_ms"),
+            "search_query": assembled.get("search_query"),
+            "original_query": assembled.get("original_query"),
+            "rewrite_error": assembled.get("rewrite_error"),
         }
         if capturing is not None and capturing.last_run_dir is not None:
             try:

@@ -1,22 +1,24 @@
 """Insurance workbench routes.
 
-Six endpoints, three transports:
+Seven SSE endpoints powering the user-facing workbenches; the
+frontend's Risk-Prediction page tabs four of them so they share a UI
+shell while keeping their backend contracts independent:
 
-* ``POST /insurance/regulation-search``       — JSON (Tavily + LLM)
 * ``POST /insurance/compare/stream``          — SSE (BaseAgent)
 * ``POST /insurance/exclusion-audit/stream``  — SSE (ProofAgent)
 * ``POST /insurance/recommend/stream``        — SSE (BaseAgent)
 * ``POST /insurance/claim-check/stream``      — SSE (BaseAgent)
 * ``POST /insurance/policy-calc/stream``      — SSE (BaseAgent + code_run)
+* ``POST /insurance/fraud-ppr/stream``        — SSE (PPR + LLM, no loop)
+* ``POST /insurance/risk-predict/stream``     — SSE (GraphAgent + Sankey side-channel)
 
 All routes go through ``get_current_user`` (analyst-accessible —
-these are the analyst's main tools). Heavy synchronous work (Tavily
-+ LLM, agent loop kickoff) is wrapped in ``run_in_threadpool``.
+these are the analyst's main tools). Agent kickoff is async; the
+streamer pumps the SSE bus directly.
 """
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from api.deps import get_current_user
@@ -27,7 +29,7 @@ from api.runners.exclusion_runner import stream_exclusion_audit
 from api.runners.fraud_ppr_runner import stream_fraud_ppr
 from api.runners.policy_calc_runner import stream_policy_calc
 from api.runners.recommend_runner import stream_recommend
-from api.runners.regulation_runner import run_regulation_search
+from api.runners.risk_predict_runner import stream_risk_predict
 from api.schemas.insurance import (
     ClaimCheckRequest,
     CompareRequest,
@@ -35,8 +37,7 @@ from api.schemas.insurance import (
     FraudPPRRequest,
     PolicyCalcRequest,
     RecommendRequest,
-    RegulationSearchRequest,
-    RegulationSearchResponse,
+    RiskPredictRequest,
 )
 
 
@@ -55,37 +56,6 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
     "Connection": "keep-alive",
 }
-
-
-# ---------------------------------------------------------- regulation
-
-
-@router.post(
-    "/regulation-search",
-    response_model=RegulationSearchResponse,
-)
-async def regulation_search(
-    body: RegulationSearchRequest,
-    request: Request,
-) -> RegulationSearchResponse:
-    """Single-call Tavily + LLM regulatory summary card."""
-    state = request.app.state
-    tavily = state.tavily_client
-    if not tavily.available():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Tavily client not configured (TAVILY_API_KEY missing).",
-        )
-    return await run_in_threadpool(
-        run_regulation_search,
-        query=body.query,
-        jurisdiction=body.jurisdiction,
-        llm=state.rag_pipeline.llm,
-        tavily=tavily,
-        config=state.config,
-        max_results=body.max_results,
-        days=body.days,
-    )
 
 
 # ---------------------------------------------------------- compare
@@ -142,6 +112,7 @@ async def recommend_stream(
     return StreamingResponse(
         stream_recommend(
             customer=body.customer,
+            held_policies_file_ids=body.held_policies_file_ids,
             agent=request.app.state.base_agent,
             config=request.app.state.config,
         ),
@@ -204,10 +175,13 @@ async def fraud_ppr_stream(
 ) -> StreamingResponse:
     """Single PPR retrieval + streamed LLM analysis.
 
-    Used by GraphPage's anti-fraud mode. The runner pre-fetches the
-    PPR subgraph (so the model never calls a tool) and streams its
-    triage as token frames; passages cited via [^k] resolve to the
-    same CitationDrawer the chat surface uses.
+    Used by the Policy Review workbench's "hidden risk" tab. The
+    runner pre-fetches the PPR subgraph (no tool loop) and streams
+    its analysis of the surrounding semantic neighborhood as token
+    frames; passages cited via [^k] resolve to the same
+    CitationDrawer the chat surface uses. URL retained for backward
+    compat with persisted trace history under
+    ``${STORAGE_PATH}/fraud_ppr/...``.
     """
     state = request.app.state
     graph_service = getattr(state, "graph_service", None)
@@ -222,6 +196,44 @@ async def fraud_ppr_stream(
             file_ids=body.file_ids,
             graph_service=graph_service,
             llm=state.rag_pipeline.llm,
+            config=state.config,
+        ),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
+# ---------------------------------------------------------- risk predict
+
+
+@router.post("/risk-predict/stream")
+async def risk_predict_stream(
+    body: RiskPredictRequest,
+    request: Request,
+    _user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Pre-issuance risk prediction (GraphAgent + PPR-anchored Sankey).
+
+    Wraps the graph agent runner: drives a fixed PPR → neighbors →
+    read pipeline behind the ``prompt.risk_predict`` system prompt and
+    augments the agent's ``final`` SSE event with a ``risk_subgraph``
+    payload (3-layer ``customer_fields → risk_factors →
+    triggered_clauses`` adjacency the frontend Sankey consumes).
+    """
+    state = request.app.state
+    graph_service = getattr(state, "graph_service", None)
+    if graph_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="graph service not initialized",
+        )
+    return StreamingResponse(
+        stream_risk_predict(
+            file_id=body.file_id,
+            customer=body.customer,
+            scenario=body.scenario,
+            agent=state.graph_agent,
+            graph_service=graph_service,
             config=state.config,
         ),
         media_type="text/event-stream",

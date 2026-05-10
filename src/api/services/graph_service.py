@@ -33,7 +33,7 @@ from ingestion.index.linear_rag.disambig import (
     gradient_topk_candidates,
     get_clusters,
 )
-from config.settings import faiss_graph_dir
+from config.settings import app_db_path, faiss_graph_dir
 
 
 logger = logging.getLogger(__name__)
@@ -105,6 +105,13 @@ class GraphService:
         self._passage_meta_by_hash: Optional[
             Dict[str, Tuple[Optional[str], Optional[int]]]
         ] = None
+        # ``file_id → display_name`` map for hover cards / passage
+        # vertex labels. Populated lazily by querying the API SQLite
+        # via :func:`_load_file_labels` (sync sqlite3, no SQLAlchemy
+        # dependency injection because GraphService runs sync from a
+        # threadpool). ``invalidate_caches`` resets it to None so a
+        # rename or new ingest is picked up next access.
+        self._file_labels: Optional[Dict[str, str]] = None
         # /graph/sample cache: keyed by n. Locks in the initial random
         # draw so mode-switches in GraphPage don't jitter the canvas;
         # restart the process to reshuffle.
@@ -113,6 +120,39 @@ class GraphService:
         # /graph/sample at boot would each compute before the other
         # writes). Cheap; the lock is uncontested after first hit.
         self._sample_cache_lock = threading.Lock()
+
+    # ---------------------------------------------------- invalidate ----
+
+    def invalidate_caches(self) -> None:
+        """Drop all per-instance derived state.
+
+        ``GraphPPRChannel.reload()`` refreshes the underlying
+        passage/entity/sentence stores + igraph; that turns this
+        service's ``_passage_meta_by_hash`` / ``_cluster_index`` /
+        ``_sample_cache`` into stale views (passage hash → file_id
+        map, cluster json, and the locked-in random sample frozen
+        at first draw). Without invalidation a freshly-ingested
+        file's passages render as ``unknown p?`` and ``/graph/sample``
+        keeps returning the boot-time empty graph forever.
+
+        Also resets ``_file_labels`` so a rename / new file picks up
+        a fresh display_name on the next hover card.
+        """
+        self._passage_meta_by_hash = None
+        self._cluster_index = None
+        self._file_labels = None
+        with self._sample_cache_lock:
+            self._sample_cache.clear()
+
+    def _file_label(self, file_id: Optional[str]) -> str:
+        """Resolve ``file_id`` to its ``display_name``; fall back to
+        the id itself when the row is missing or the labels probe
+        failed (so the UI still gets *something* readable)."""
+        if not file_id:
+            return ""
+        if self._file_labels is None:
+            self._file_labels = _load_file_labels()
+        return self._file_labels.get(file_id) or file_id
 
     # --------------------------------------------------- helpers ----
 
@@ -185,7 +225,7 @@ class GraphService:
         if vtype == "passage":
             file_id, page_n = self._passage_meta_lookup().get(name, (None, None))
             if file_id and page_n is not None:
-                return f"{file_id} p{page_n}"
+                return f"{self._file_label(file_id)} p{page_n}"
             return name
         return name
 
@@ -450,10 +490,19 @@ class GraphService:
                         file_ids_seen[file_id] = file_ids_seen.get(file_id, 0) + 1
             out["mention_count"] = mention_count
             top_files = sorted(file_ids_seen.items(), key=lambda kv: kv[1], reverse=True)
-            out["neighboring_files"] = [fid for fid, _ in top_files[:_NODE_DETAIL_NEIGHBOR_FILES]]
+            # Each entry now carries display_name so the frontend hover
+            # card can render the human-friendly name instead of a
+            # truncated file_id stem (the previous list[str] form
+            # surfaced "_b8c2aa1a" style hashes which the user
+            # complained look like garbage).
+            out["neighboring_files"] = [
+                {"file_id": fid, "display_name": self._file_label(fid)}
+                for fid, _ in top_files[:_NODE_DETAIL_NEIGHBOR_FILES]
+            ]
         elif vt == "passage":
             file_id, page_n = self._passage_meta_lookup().get(hash_id, (None, None))
             out["file_id"] = file_id
+            out["display_name"] = self._file_label(file_id)
             out["page_number"] = page_n
         return out
 
@@ -534,50 +583,58 @@ class GraphService:
           - ``no_seeds``  — query had no entity match (fallback included)
           - ``no_graph``  — graphml missing on disk
         """
-        result = self._channel.retrieve_subgraph(
-            question=query,
-            file_ids=list(file_ids) if file_ids else None,
-        )
-        mode = result.get("mode", "ppr")
-        if mode != "ppr":
-            return {
-                "mode": mode,
-                "seeds": [],
-                "actived_entities": [],
-                "passages": [],
-                "edges": [],
-            }
-
-        g = self.graph
-        seeds_raw = result["seeds"]
-        actived_raw = result["actived_entities"]   # {hash_id: {vidx, surface, score, tier}}
-        passages_raw = result["passages"]          # List[ChannelHit]
-
-        # Collect every vidx involved so we can render the induced
-        # subgraph: seeds ∪ actived ∪ passages (the latter via name lookup).
-        kept_vidx: Dict[int, str] = {}             # vidx → role tag for the response
-        for s in seeds_raw:
-            kept_vidx[s["vertex_idx"]] = "seed"
-        for hid, info in actived_raw.items():
-            if info["vertex_idx"] not in kept_vidx:
-                kept_vidx[info["vertex_idx"]] = "actived"
-        passage_payload: List[Dict[str, Any]] = []
-        for hit in passages_raw:
-            # ChannelHit has evidence=[{passage_hash_id: hid}]; pull it
-            # back out so we can locate the vertex.
-            phash = None
-            if hit.evidence:
-                phash = hit.evidence[0].get("passage_hash_id")
-            if phash and phash in self._channel._name_to_vidx:
-                kept_vidx.setdefault(self._channel._name_to_vidx[phash], "passage")
-            passage_payload.append(
-                {
-                    "hash_id": phash,
-                    "file_id": hit.file_id,
-                    "page_id": hit.page_id,
-                    "score": float(hit.score),
-                }
+        # Hold the channel's call_lock around BOTH the retrieve_subgraph
+        # call AND the induced-edge / passage-vertex lookups below.
+        # ``retrieve_subgraph`` returns vertex indices that are only
+        # meaningful relative to the graph that was loaded inside the
+        # lock; if a concurrent ``GraphPPRChannel.reload()`` swapped
+        # the graph between the two reads, the kept_vidx set below
+        # would mix indices from the old graph with the new graph (the
+        # `_induced_edges` walk over `g.vs[vidx]` would then point at
+        # different vertices than `_name_to_vidx` resolved). Same lock
+        # the retrieve_subgraph helper takes — RLock is reentrant, so
+        # the nested acquire is free.
+        with self._channel._call_lock:
+            result = self._channel.retrieve_subgraph(
+                question=query,
+                file_ids=list(file_ids) if file_ids else None,
             )
+            mode = result.get("mode", "ppr")
+            if mode != "ppr":
+                return {
+                    "mode": mode,
+                    "seeds": [],
+                    "actived_entities": [],
+                    "passages": [],
+                    "edges": [],
+                }
+
+            g = self.graph
+            seeds_raw = result["seeds"]
+            actived_raw = result["actived_entities"]
+            passages_raw = result["passages"]
+
+            kept_vidx: Dict[int, str] = {}
+            for s in seeds_raw:
+                kept_vidx[s["vertex_idx"]] = "seed"
+            for hid, info in actived_raw.items():
+                if info["vertex_idx"] not in kept_vidx:
+                    kept_vidx[info["vertex_idx"]] = "actived"
+            passage_payload: List[Dict[str, Any]] = []
+            for hit in passages_raw:
+                phash = None
+                if hit.evidence:
+                    phash = hit.evidence[0].get("passage_hash_id")
+                if phash and phash in self._channel._name_to_vidx:
+                    kept_vidx.setdefault(self._channel._name_to_vidx[phash], "passage")
+                passage_payload.append(
+                    {
+                        "hash_id": phash,
+                        "file_id": hit.file_id,
+                        "page_id": hit.page_id,
+                        "score": float(hit.score),
+                    }
+                )
 
         seeds_payload = [
             {
@@ -606,3 +663,35 @@ class GraphService:
             "passages": passage_payload,
             "edges": edges_out,
         }
+
+
+# --------------------------------------------------------------- helpers
+
+def _load_file_labels() -> Dict[str, str]:
+    """Read ``files.file_id → files.display_name`` via raw sqlite3.
+
+    GraphService runs in a sync threadpool (FastAPI ``run_in_threadpool``)
+    and we don't want to add an async-DB dependency just to render hover
+    cards. ``sqlite3`` is in stdlib, the file lives at the same path
+    SQLAlchemy uses, and we open + close per call (cached one level up
+    on the GraphService instance, invalidated by the lifespan refresh
+    hook). Empty dict on any failure so the caller gracefully falls
+    back to file_id strings.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(app_db_path()))
+    except Exception:
+        logger.warning("graph_service: file-label sqlite open failed", exc_info=True)
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT file_id, display_name FROM files"
+        ).fetchall()
+        return {str(fid): str(name) for fid, name in rows if fid}
+    except sqlite3.DatabaseError:
+        # Table may not exist yet (lifespan hadn't created it on a
+        # blank deploy when this is reached). Treat as empty.
+        return {}
+    finally:
+        conn.close()

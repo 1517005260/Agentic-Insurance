@@ -177,6 +177,13 @@ def build_rag_assistant_metadata(
     model: Optional[str] = None,
     error: Optional[str] = None,
     original_exit_reason: Optional[str] = None,
+    # Web RAG 多轮重写产物 — 用户原 query 与最终送给 Tavily 的
+    # standalone search query 通常不同；同时记录 rewrite_error 让
+    # 审计/answer detail UI 能解释"为什么这一轮的 search query 没
+    # 被重写"。本地 RAG 路径不会传这几项，全为 None → 全跳过。
+    search_query: Optional[str] = None,
+    original_query: Optional[str] = None,
+    rewrite_error: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compose the metadata dict for a RAG assistant message.
 
@@ -193,6 +200,9 @@ def build_rag_assistant_metadata(
         ("model", model),
         ("error", error),
         ("original_exit_reason", original_exit_reason),
+        ("search_query", search_query),
+        ("original_query", original_query),
+        ("rewrite_error", rewrite_error),
     ):
         if v is not None:
             out[k] = v

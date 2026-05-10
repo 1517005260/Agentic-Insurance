@@ -126,6 +126,7 @@ async def stream_workbench_agent(
                     user_prompt,
                     tracer=capturing,
                     on_event=wrapped_on_event,
+                    cancel_check=lambda: bus.is_closed,
                     **agent_overrides,
                 )
                 result_payload = {
@@ -140,6 +141,7 @@ async def stream_workbench_agent(
                     user_prompt,
                     tracer=capturing,
                     on_event=wrapped_on_event,
+                    cancel_check=lambda: bus.is_closed,
                     **agent_overrides,
                 )
                 result_payload = {

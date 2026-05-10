@@ -7,7 +7,7 @@ output straight to the client.
 """
 import asyncio
 import logging
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
 
 from api.runners._tracing import CapturingTracer
 from api.runners.events import EventBus, EventType
@@ -29,6 +29,7 @@ async def stream_rag(
     config: Optional[ConfigStore] = None,
     tracer: Optional[Tracer] = None,
     result_future: Optional["asyncio.Future[Dict[str, Any]]"] = None,
+    history: Optional[List[Tuple[str, str]]] = None,
 ) -> AsyncIterator[bytes]:
     """Yield SSE-encoded bytes for one RAG query.
 
@@ -123,6 +124,7 @@ async def stream_rag(
                 citation_legend_provider=legend_provider,
                 pages_block_provider=pages_block_provider,
                 cancel_check=lambda: bus.is_closed,
+                history=history,
             )
             builder_holder["answer"] = result.answer
             # Parse the assembled answer against the legend and emit

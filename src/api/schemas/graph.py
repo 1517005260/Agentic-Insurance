@@ -88,11 +88,19 @@ class GraphSubgraphResponse(BaseModel):
 # ---------------------------------------------------------- /nodes/{id}
 
 
+class NeighborFile(BaseModel):
+    """One entry of ``neighboring_files`` — file_id + readable name."""
+    file_id: str
+    display_name: str
+
+
 class NodeDetailResponse(BaseModel):
     """Hover-card payload — no hash_id field (the URL already names it).
 
     For passages, ``file_id`` + ``page_number`` are surfaced so the
     card can offer a "open in PDF" link without a second round trip.
+    ``display_name`` accompanies any file_id so the UI can render the
+    human-readable label instead of a sha-prefixed slug.
     """
 
     surface: str
@@ -100,8 +108,9 @@ class NodeDetailResponse(BaseModel):
     degree: int
     logical_cluster: Optional[ClusterBrief] = None
     mention_count: Optional[int] = None
-    neighboring_files: Optional[List[str]] = None
+    neighboring_files: Optional[List[NeighborFile]] = None
     file_id: Optional[str] = None
+    display_name: Optional[str] = None
     page_number: Optional[int] = None
 
 

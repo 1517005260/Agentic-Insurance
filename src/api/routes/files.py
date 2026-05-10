@@ -6,30 +6,38 @@ Permission model (matches the project-wide RBAC):
 * admin   — everything analyst can do, plus upload, delete, reingest
 
 Background work (parse + index, delete, reingest) is dispatched via
-``BackgroundTasks`` after the request returns 202; clients poll the
-file status to know when it's done.
+detached ``asyncio.create_task`` (NOT FastAPI ``BackgroundTasks``):
+the latter wraps the work into the response lifecycle, which means a
+long ingest stays attached to the upload-POST coroutine and starves
+the response loop's ability to service short requests like
+``/auth/me`` or ``/chat/sessions/...``. With detached tasks the bg
+work runs independently of any caller's HTTP handler, and
+``register_bus`` is the only handle the SSE route needs.
 """
+import asyncio
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Coroutine, Optional
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_current_user, get_session, require_admin
 from api.models import AuditLog, FileRecord, IngestJob, User
+from api.runners.events import EventType
+from api.runners.ingestion_runner import wait_for_bus
 from api.services.files import (
     begin_ingest_job,
     cleanup_committed_upload,
@@ -42,9 +50,35 @@ from api.services.files import (
     run_parse_index,
     run_reingest,
 )
-from config.settings import paddle_ocr_root, upload_path
+from api.services.preview import page_count as pdf_page_count, render_pdf_page_to_cache
+from api.sse import format_event
+from config.settings import upload_path
 
 logger = logging.getLogger(__name__)
+
+
+def _spawn_ingest_task(coro: Coroutine) -> None:
+    """Detach an ingest coroutine from the response lifecycle.
+
+    ``asyncio.create_task`` on the running loop, with a callback that
+    logs any unhandled exception so a crashed bg task can't silently
+    rot. We deliberately do NOT use FastAPI's ``BackgroundTasks``: it
+    runs after the response *body* finishes, but the body for an
+    ingest 202 is empty, so the work would still be tied to the
+    response task and can starve the loop's request handling.
+    """
+    task = asyncio.create_task(coro)
+
+    def _log_crash(t: "asyncio.Task") -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.exception(
+                "ingest bg task crashed", exc_info=(type(exc), exc, exc.__traceback__)
+            )
+
+    task.add_done_callback(_log_crash)
 
 router = APIRouter(prefix="/files", tags=["files"])
 
@@ -148,6 +182,168 @@ async def list_jobs(
     ]
 
 
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+
+
+async def _replay_terminal_job(job: IngestJob):
+    """Synthesize a single ``final`` + ``done`` for a job already at rest.
+
+    Used when the SSE caller arrives after ``run_*`` finished and the
+    bus has been unregistered. Lets the frontend collapse the timeline
+    to the final state without a separate REST round-trip.
+    """
+    yield format_event(
+        EventType.FINAL,
+        {
+            "file_id": job.file_id,
+            "status": "ready" if job.status == "done" else "failed",
+            "job_status": job.status,
+            "error": job.error_msg,
+            "log_tail": job.log_tail,
+        },
+    )
+    yield format_event(EventType.DONE, {})
+
+
+async def _replay_terminal_file(rec: FileRecord):
+    """Same shape as :func:`_replay_terminal_job` but driven by the file row.
+
+    Fallback when the ``ingest_jobs`` row leaked into ``running``
+    despite the file row reaching ``ready`` / ``failed`` (job-close is
+    best-effort in the service layer; a transient SQLite write failure
+    can leave the bookkeeping inconsistent).
+    """
+    yield format_event(
+        EventType.FINAL,
+        {
+            "file_id": rec.file_id,
+            "status": rec.status,
+            "error": rec.error_msg,
+            "page_count": rec.page_count,
+        },
+    )
+    yield format_event(EventType.DONE, {})
+
+
+@router.get("/{file_id}/jobs/stream")
+async def stream_jobs(
+    file_id: str,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Subscribe to the latest ingest job's stage progress.
+
+    Three terminal cases:
+
+    1. Latest job is ``running`` and a bus is registered — stream live
+       ``stage`` / ``final`` / ``done`` frames from the bg task.
+    2. Latest job is ``running`` but the bus has not registered yet
+       (race against ``BackgroundTasks`` scheduling) — short poll up
+       to 2 s, then stream live frames.
+    3. Latest job is already terminal (``done`` / ``failed``) — synthesize
+       a single ``final`` + ``done`` from the row so the client always
+       sees a closed stream.
+
+    The "wait timed out AND row is still nonterminal" path refetches the
+    row before falling back to terminal replay so we don't synthesize a
+    spurious ``failed`` for a job whose bg task is just slow to schedule.
+
+    Multi-subscriber: the bus is constructed with
+    ``replay_buffered=True`` so each ``stream()`` call gets its own
+    queue, seeded with the full event history. The FilesPage
+    minimized-ingest chip and any extra browser tabs all see the
+    same timeline.
+    """
+    rec = await find_file(db, file_id)
+    if rec is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+    res = await db.execute(
+        select(IngestJob)
+        .where(IngestJob.file_id == file_id)
+        .order_by(IngestJob.id.desc())
+        .limit(1)
+    )
+    latest: Optional[IngestJob] = res.scalar_one_or_none()
+    if latest is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no jobs for file",
+        )
+
+    if latest.status in ("done", "failed"):
+        return StreamingResponse(
+            _replay_terminal_job(latest),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
+    # Snapshot the id and release the read transaction BEFORE polling
+    # the bus. ``db.refresh()`` on stale ORM objects re-reads from the
+    # SAME open transaction, which under SQLite WAL means we keep
+    # seeing the snapshot taken at the start of this request — the
+    # background task may have committed ``ready``/``done`` 1.5 s ago
+    # but ``refresh()`` would still report ``running``, and we'd 503.
+    # Issuing fresh selects via ``session_scope()`` reads the latest
+    # committed state, which is what the polling client expects.
+    latest_job_id = latest.id
+    await db.rollback()
+
+    bus = await wait_for_bus(latest_job_id, timeout=2.0)
+    if bus is None:
+        # Bus never registered. Three real causes:
+        #   (a) the bg task finished + unregistered between our row
+        #       query and the wait — refetch and replay terminal.
+        #   (b) job-close telemetry raised but the file row already
+        #       made it to ``ready`` / ``failed`` (job-close is
+        #       best-effort by design — see service _close_job
+        #       try/except); the job row stays ``running`` but the
+        #       file is at rest. Trust the file row in that case.
+        #   (c) ``_spawn_ingest_task`` hasn't yielded to the loop yet
+        #       (rare but possible under load burst) — return 503 so
+        #       the client retries with backoff rather than seeing a
+        #       fake "failed" from the still-pending row.
+        from api.db import session_scope as _scope
+        async with _scope() as fresh_db:
+            latest_fresh = await fresh_db.get(IngestJob, latest_job_id)
+            rec_fresh = await fresh_db.get(FileRecord, file_id)
+        if latest_fresh is not None and latest_fresh.status in ("done", "failed"):
+            return StreamingResponse(
+                _replay_terminal_job(latest_fresh),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        if rec_fresh is not None and rec_fresh.status in ("ready", "failed"):
+            # File row is terminal but job row leaked. Synthesize
+            # from the file row directly so the client sees a closed
+            # stream without polling /jobs forever.
+            return StreamingResponse(
+                _replay_terminal_file(rec_fresh),
+                media_type="text/event-stream",
+                headers=_SSE_HEADERS,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"ingest job {latest_job_id} pending dispatch; retry shortly",
+            headers={"Retry-After": "2"},
+        )
+
+    # Bus is multi-consumer with replay (see api/services/files.py
+    # constructing with replay_buffered=True). Multiple subscribers
+    # are legal: each ``bus.stream()`` call gets its own queue,
+    # seeded with the full event history so a late client (e.g. the
+    # FilesPage minimized-ingest chip reopening the drawer) sees
+    # exactly what the original consumer saw.
+    return StreamingResponse(
+        bus.stream(),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
 @router.get("/{file_id}/download")
 async def download_original(
     file_id: str,
@@ -170,18 +366,82 @@ async def download_original(
 
 
 @router.get("/{file_id}/preview")
-async def first_page_preview(
+async def page_preview(
     file_id: str,
+    page: int = 1,
     db: AsyncSession = Depends(get_session),
     _: User = Depends(get_current_user),
 ) -> FileResponse:
-    """First-page thumbnail for FilesPage cards.
+    """Render-on-demand JPG of any 1-based ``page`` of the cached PDF.
 
-    Reuses paddleocr's layout_det_res_0.jpg — already rendered during
-    ingest, no extra dep / runtime render needed.
+    Default ``page=1`` powers the FilesPage card thumbnail; the
+    full-file preview drawer scrolls through ``?page=N`` for each
+    visible page. Output is cached under
+    ``local_storage/preview/<file_id>/p_NNNN.jpg`` and re-served on
+    subsequent hits. Re-ingest invalidates the cache (see
+    ``purge_file_artifacts``).
+
+    The previous implementation served PaddleOCR's layout-detection
+    visualization (``layout_det_res_0.jpg``) which had bounding boxes
+    overlaid — visually it looked like a CV debug screenshot rather
+    than a page thumbnail. We now render via pypdfium2 (PDFium, the
+    same engine Chromium uses).
     """
     # file_id flows from URL into a filesystem join; reject any token
-    # that could escape the paddle root before touching disk.
+    # that could escape the storage root before touching disk.
+    if "/" in file_id or "\\" in file_id or ".." in file_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="invalid file_id",
+        )
+    if page < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="page must be >= 1",
+        )
+    rec = await find_file(db, file_id)
+    if rec is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
+    src = upload_path(file_id, rec.suffix)
+    if not src.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="original blob no longer cached",
+        )
+
+    import asyncio
+    loop = asyncio.get_running_loop()
+    rendered = await loop.run_in_executor(
+        None,
+        lambda: render_pdf_page_to_cache(src, file_id=file_id, page_number=page),
+    )
+    if rendered is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"page {page} could not be rendered",
+        )
+    # ``private`` so reverse proxies / CDNs do not cache this auth-gated
+    # response into a shared cache that other users could hit.
+    return FileResponse(
+        path=rendered,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+@router.get("/{file_id}/page-count")
+async def page_count_endpoint(
+    file_id: str,
+    db: AsyncSession = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> dict[str, int]:
+    """Cheap page-count probe for the full-file preview drawer.
+
+    Reads the PDF's xref via pypdfium2 — no rendering, returns within a
+    few ms even for hundred-page documents. Falls back to the
+    ``files.page_count`` row column when the PDF is unreadable so the
+    UI still gets a usable bound.
+    """
     if "/" in file_id or "\\" in file_id or ".." in file_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -190,35 +450,11 @@ async def first_page_preview(
     rec = await find_file(db, file_id)
     if rec is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="file not found")
-    root = paddle_ocr_root().resolve()
-    preview = (
-        root
-        / file_id
-        / "raw"
-        / "batch_000"
-        / "output_images"
-        / "layout_det_res_0.jpg"
-    )
-    resolved = preview.resolve()
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="invalid file_id",
-        )
-    if not resolved.is_file():
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="preview not available (paddle output missing)",
-        )
-    # ``private`` so reverse proxies / CDNs do not cache this auth-gated
-    # response into a shared cache that other users could hit.
-    return FileResponse(
-        path=resolved,
-        media_type="image/jpeg",
-        headers={"Cache-Control": "private, max-age=86400"},
-    )
+    src = upload_path(file_id, rec.suffix)
+    n = pdf_page_count(src) if src.is_file() else 0
+    if n <= 0 and rec.page_count:
+        n = int(rec.page_count)
+    return {"page_count": n}
 
 
 # ------------------------------------------------------------------ upload
@@ -230,7 +466,7 @@ async def first_page_preview(
     dependencies=[Depends(require_admin)],
 )
 async def upload(
-    background: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
     display_name: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_session),
@@ -320,7 +556,18 @@ async def upload(
             cleanup_committed_upload(staged)
         raise
 
-    background.add_task(run_parse_index, rec.file_id, staged.path, job_id=job_id)
+    cfg = getattr(request.app.state, "config", None)
+    linear_config = cfg.materialize_linear_rag_config() if cfg is not None else None
+    parse_workers = cfg.ingest_parallel_workers() if cfg is not None else 1
+    _spawn_ingest_task(
+        run_parse_index(
+            rec.file_id,
+            staged.path,
+            job_id=job_id,
+            linear_config=linear_config,
+            parse_workers=parse_workers,
+        )
+    )
     return FileOut.from_row(rec)
 
 
@@ -334,7 +581,7 @@ async def upload(
 )
 async def reingest(
     file_id: str,
-    background: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> FileOut:
@@ -370,7 +617,17 @@ async def reingest(
     # on get_session's tail-commit.
     await db.commit()
     await db.refresh(rec)
-    background.add_task(run_reingest, file_id, job_id=job_id)
+    cfg = getattr(request.app.state, "config", None)
+    linear_config = cfg.materialize_linear_rag_config() if cfg is not None else None
+    parse_workers = cfg.ingest_parallel_workers() if cfg is not None else 1
+    _spawn_ingest_task(
+        run_reingest(
+            file_id,
+            job_id=job_id,
+            linear_config=linear_config,
+            parse_workers=parse_workers,
+        )
+    )
     return FileOut.from_row(rec)
 
 
@@ -382,7 +639,6 @@ async def reingest(
 )
 async def delete_one(
     file_id: str,
-    background: BackgroundTasks,
     db: AsyncSession = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> FileOut:
@@ -417,5 +673,5 @@ async def delete_one(
     # on get_session's tail-commit.
     await db.commit()
     await db.refresh(rec)
-    background.add_task(run_delete, file_id, job_id=job_id)
+    _spawn_ingest_task(run_delete(file_id, job_id=job_id))
     return FileOut.from_row(rec)

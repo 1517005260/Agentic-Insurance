@@ -29,7 +29,12 @@ from api.routes import graph as graph_routes
 from api.routes import insurance as insurance_routes
 from api.routes import trace as trace_routes
 from api.routes import search as search_routes
-from api.services.files import reconcile_after_restart, sweep_orphan_uploads
+from api.services.files import (
+    reconcile_after_restart,
+    register_refresh_hook,
+    sweep_orphan_uploads,
+    unregister_refresh_hook,
+)
 from api.services.graph_service import GraphService
 from agentic.agent.factory import (
     build_default_agent,
@@ -129,7 +134,7 @@ async def lifespan(_app: FastAPI):
     # (read-only) — admin patches mutate the same object and the next
     # request sees the new value.
     _app.state.config = await ConfigStore.from_app_db(SessionLocal)
-    logger.info("config store loaded (15 keys)")
+    logger.info("config store loaded (34 keys)")
 
     # Three agent singletons, one per chat session ``agent_kind``.
     # Each instance is per-process state-free (``run()`` builds fresh
@@ -145,15 +150,25 @@ async def lifespan(_app: FastAPI):
     # during the first /rag/stream smoke; sharing keeps memory + warm
     # time linear AND ensures the graph_service drawer visualizes the
     # SAME channel instance the RAG pipeline used.
-    from model_client import EmbeddingClient, LLMClient, VisualEmbeddingClient
+    from model_client import (
+        LLMClient,
+        get_cached_embedding_client,
+        get_cached_visual_embedding_client,
+    )
     from rag.channels.graph_ppr import GraphPPRChannel
     from storage.inventory_store import InventoryStore
     from storage.page_store import PageStore
     from config.settings import page_assets_root
 
     shared_llm = LLMClient()
-    shared_embedding = EmbeddingClient()
-    shared_visual = VisualEmbeddingClient()
+    # Use the cached factories so the lifespan-pinned client objects
+    # are byte-identical to what ingest builders / RAG channels reach
+    # for via their default-arg fallback. Without this, lifespan held
+    # a "version A" instance and ingest got "version B" from the
+    # cache — same underlying session pool but two Python wrappers,
+    # making the singleton story confusing to reason about.
+    shared_embedding = get_cached_embedding_client()
+    shared_visual = get_cached_visual_embedding_client()
     # Ensure the page_assets dir exists before PageStore touches it —
     # on a fresh deploy with no uploads yet the directory hasn't been
     # created by the ingest pipeline, and PageStore would crash trying
@@ -161,31 +176,33 @@ async def lifespan(_app: FastAPI):
     page_assets_root().mkdir(parents=True, exist_ok=True)
     shared_page_store = PageStore(page_assets_root())
     shared_inventory = InventoryStore(page_store=shared_page_store)
-    shared_graph_channel = GraphPPRChannel(embedding_client=shared_embedding)
+    # Materialize the LinearRAG config from admin overrides so the
+    # query-time PPR gazetteer (built lazily inside GraphPPRChannel)
+    # honours the same literal_backfill_* knobs the admin tunes.
+    # Note: hot-reload of these specific knobs requires a backend
+    # restart since the gazetteer automaton is built once and cached
+    # on first use.
+    shared_linear_config = _app.state.config.materialize_linear_rag_config()
+    shared_graph_channel = GraphPPRChannel(
+        embedding_client=shared_embedding,
+        linear_config=shared_linear_config,
+    )
 
-    # Pre-warm spaCy NER as part of singleton init. Without this the
-    # first /insurance/fraud-ppr/stream (or any agent path that calls
-    # graph_explore mode='ppr') triggers ``spacy.load(en_core_web_trf
-    # + zh_core_web_trf)`` synchronously inside the request thread —
-    # those models pull torch + CUDA libs and add ~2 GB anon heap, which
-    # OOM-kills the worker on 8 GB hosts.
-    import time
-    t0 = time.monotonic()
-    try:
-        shared_graph_channel._ensure_spacy()
-        logger.info(
-            "spaCy NER pre-warmed in %.1fs (en + zh transformer pipelines loaded)",
-            time.monotonic() - t0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        # Missing model files / disk error → surface a warning but don't
-        # abort startup; PPR paths will lazy-load on demand and the
-        # warning makes the trade-off visible in the log.
-        logger.warning(
-            "spaCy NER pre-warm skipped (%s); first PPR call will pay the "
-            "cold-load cost (~2 GB heap, ~30s)",
-            exc,
-        )
+    # Pre-warm spaCy at lifespan so EN+ZH ``_trf`` pipelines land in
+    # the GPU once and every subsequent ingest / PPR query reuses the
+    # same ``Language`` object via ``shared_spacy``. Without prewarm
+    # the first PPR query (or the first ingest) pays ~10 s of model
+    # load on top of its own latency, and on small hosts the
+    # transient peak during load can race the rest of the process for
+    # memory.
+    #
+    # GPU activation is handled inside ``_spacy_cached``
+    # (``spacy.prefer_gpu()`` after preloading torch's libcudart);
+    # falling back to CPU is automatic when no usable GPU is
+    # available. A single resident copy of EN+ZH trf is ~2.9 GB host
+    # / ~3.4 GB VRAM (CPU mode) or ~600 MB host / ~3.4 GB VRAM (GPU
+    # mode), shared across every ingest and query in this process.
+    shared_graph_channel._ensure_spacy()
 
     # Build the RAG pipeline AFTER shared resources so it shares the
     # same GraphPPRChannel instance (the new ``graph_channel`` kwarg).
@@ -198,6 +215,10 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("RAG pipeline singleton constructed (shared graph channel)")
 
+    # graph_explore tool tunables (entity_lookup_min_sim / gradient)
+    # are baked at construction; admin changes require a backend restart.
+    # See ConfigStore.graph_explore_kwargs() and the entries' descriptions.
+    shared_graph_explore_kwargs = _app.state.config.graph_explore_kwargs()
     _app.state.base_agent = build_default_agent(
         llm_client=shared_llm,
         embedding_client=shared_embedding,
@@ -205,6 +226,7 @@ async def lifespan(_app: FastAPI):
         page_store=shared_page_store,
         inventory=shared_inventory,
         graph_channel=shared_graph_channel,
+        graph_explore_kwargs=shared_graph_explore_kwargs,
     )
     _app.state.proof_agent = build_proof_agent(
         llm_client=shared_llm,
@@ -213,6 +235,7 @@ async def lifespan(_app: FastAPI):
         page_store=shared_page_store,
         inventory=shared_inventory,
         graph_channel=shared_graph_channel,
+        graph_explore_kwargs=shared_graph_explore_kwargs,
     )
     _app.state.graph_agent = build_graph_agent(
         llm_client=shared_llm,
@@ -220,19 +243,20 @@ async def lifespan(_app: FastAPI):
         page_store=shared_page_store,
         inventory=shared_inventory,
         graph_channel=shared_graph_channel,
+        graph_explore_kwargs=shared_graph_explore_kwargs,
     )
 
     # Tavily client + web agent. The Tavily client is fail-soft when
     # TAVILY_API_KEY is missing — :meth:`available` lets routes / the
     # tool short-circuit, so the lifespan still boots cleanly without
-    # a key (the regulation / web-rag / web-agent surfaces will then
-    # respond 503 / "unavailable" envelopes until the key is set).
+    # a key (the web-rag / web-agent chat surfaces will then respond
+    # "unavailable" envelopes until the key is set).
     shared_tavily = TavilyClient()
     _app.state.tavily_client = shared_tavily
     if not shared_tavily.available():
         logger.warning(
-            "TAVILY_API_KEY missing — web search / regulation surfaces will return "
-            "503 until the key is provided in the env"
+            "TAVILY_API_KEY missing — chat web mode + web agent will surface "
+            "'tavily unavailable' until the key is provided in the env"
         )
 
     _app.state.web_agent = build_web_agent(
@@ -249,9 +273,100 @@ async def lifespan(_app: FastAPI):
     # are immutable post-ingest).
     _app.state.graph_service = GraphService(channel=shared_graph_channel)
     logger.info("graph service constructed")
+
+    # Long-lived singletons capture an empty-disk snapshot at boot
+    # (lifespan runs before any PDF is uploaded). After every successful
+    # ingest / reingest / delete the bg task calls this hook so the
+    # in-memory state matches the on-disk artifacts. Without it
+    # toc / graph_explore / read_page / GraphService all silently see
+    # the empty-boot state for any file uploaded after process start.
+    #
+    # The hook also doubles as the implementation of
+    # ``POST /admin/refresh-indexes`` — operator-initiated rescue when
+    # an out-of-band write to local_storage needs to be picked up.
+    def refresh_indexes() -> None:
+        """Reload all on-disk-backed singletons + invalidate the
+        per-instance derived caches that wrap them. Idempotent.
+
+        Order matters:
+
+        1. Reload the data sources (PageStore re-scans page_assets,
+           InventoryStore drops section / passage / table_row caches,
+           GraphPPRChannel re-mmaps faiss + re-reads GraphML).
+        2. Invalidate the wrappers that snapshot derived views from
+           those sources (GraphService passage-meta / cluster /
+           sample caches, and each agent's GraphExploreTool
+           passage-meta / cluster caches). Without step 2 the wrappers
+           keep handing out hashes / clusters that no longer exist
+           in the underlying stores.
+        """
+        shared_page_store.reload()
+        shared_inventory.reload()
+        shared_graph_channel.reload()
+        # Force every process-cached EmbeddingStore that wasn't already
+        # reloaded by a higher-level component to re-read from disk.
+        # ``GraphPPRChannel.reload()`` above already covered the three
+        # graph stores (passage / entity / sentence); skip them here
+        # to avoid a second 200 MB read each on big corpora. The
+        # remaining dense / visual stores have no per-channel reload
+        # hook so they need this helper.
+        try:
+            from config.settings import (
+                faiss_graph_entity_dir,
+                faiss_graph_passage_dir,
+                faiss_graph_sentence_dir,
+            )
+            from config.shared import (
+                canonical_store_key,
+                reload_embedding_stores_from_disk,
+            )
+
+            already_reloaded = {
+                canonical_store_key(faiss_graph_passage_dir(), "passage"),
+                canonical_store_key(faiss_graph_entity_dir(), "entity"),
+                canonical_store_key(faiss_graph_sentence_dir(), "sentence"),
+            }
+            reload_embedding_stores_from_disk(skip_keys=already_reloaded)
+        except Exception:
+            logger.exception(
+                "reload_embedding_stores_from_disk raised; "
+                "dense/visual stores may be stale until restart"
+            )
+        # Wrapper invalidations — must come AFTER channel.reload()
+        # because they pull fresh state from the channel on next access.
+        try:
+            _app.state.graph_service.invalidate_caches()
+        except Exception:
+            logger.exception("graph_service.invalidate_caches raised")
+        for agent_attr in ("base_agent", "proof_agent", "graph_agent"):
+            agent = getattr(_app.state, agent_attr, None)
+            if agent is None:
+                continue
+            tool = None
+            try:
+                tool = agent.tools.get("graph_explore")
+            except Exception:
+                tool = None
+            if tool is not None and hasattr(tool, "invalidate_caches"):
+                try:
+                    tool.invalidate_caches()
+                except Exception:
+                    logger.exception(
+                        "%s graph_explore.invalidate_caches raised", agent_attr
+                    )
+
+    _app.state.refresh_indexes = refresh_indexes
+    register_refresh_hook(refresh_indexes)
+    logger.info(
+        "refresh_indexes hook registered (PageStore + InventoryStore + "
+        "GraphPPRChannel + GraphService caches + per-agent graph_explore caches)"
+    )
     try:
         yield
     finally:
+        # Drop the hook before tearing down singletons so a late ingest
+        # task can't call into half-finalized state.
+        unregister_refresh_hook()
         # Best-effort close of the long-lived ``requests.Session``
         # objects held by the model clients + the web tool. They are
         # thread-safe but leaking connection pools on shutdown is
@@ -306,6 +421,7 @@ app.include_router(files_routes.router)
 app.include_router(audit_routes.router)
 app.include_router(chat_routes.router)
 app.include_router(admin_routes.router)
+app.include_router(admin_routes.admin_actions_router)
 app.include_router(admin_users_routes.router)
 app.include_router(graph_routes.router)
 app.include_router(insurance_routes.router)

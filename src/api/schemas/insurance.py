@@ -1,73 +1,31 @@
 """DTOs for the insurance workbenches.
 
-One file for all five workbenches because their request / response
-shapes are tiny and forking per-workbench would just multiply
-imports. The order below mirrors the runner files:
+One file for all SSE workbenches because their request shapes are
+tiny and forking per-workbench would just multiply imports. The
+order below mirrors the runner files:
 
-* :class:`RegulationSearchRequest` / :class:`RegulationSearchResponse`
-  — non-streaming Tavily + LLM summarize.
 * :class:`CompareRequest` — N×M product comparison (BaseAgent SSE).
 * :class:`ExclusionAuditRequest` — single-product underwriting audit
   (ProofAgent SSE).
 * :class:`RecommendRequest` — customer-profile product recommendation
-  (BaseAgent SSE).
+  with optional held-policy gap analysis (BaseAgent SSE).
 * :class:`ClaimCheckRequest` — multi-product claim-coverage analysis
   (BaseAgent SSE).
 * :class:`PolicyCalcRequest` — actuarial calculation workbench
   (BaseAgent + code_run SSE).
+* :class:`FraudPPRRequest` — single PPR + LLM call surfacing
+  semantically adjacent passages (no agent loop).
+* :class:`RiskPredictRequest` — proactive pre-issuance risk
+  prediction (GraphAgent driving graph_explore + read).
 
-All SSE-streaming endpoints use the same SSE protocol the chat surface
-uses; the request schemas only define the request body. Final-payload
-shapes are documented at the runner level — they ride the ``final``
-SSE event and the optional ``result_future`` rather than living here.
+All endpoints share the same SSE protocol the chat surface uses;
+request schemas only define the request body. Final-payload shapes
+are documented at the runner level — they ride the ``final`` SSE
+event and the optional ``result_future`` rather than living here.
 """
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
-
-
-# ---------------------------------------------------------------- regulation
-
-
-JurisdictionLiteral = Literal["hk", "cn", "both"]
-
-
-class RegulationSearchRequest(BaseModel):
-    """Non-streaming request body for ``POST /insurance/regulation-search``."""
-
-    query: str = Field(..., min_length=1, max_length=2000)
-    jurisdiction: JurisdictionLiteral = "both"
-    max_results: Optional[int] = Field(default=None, ge=3, le=20)
-    days: Optional[int] = Field(
-        default=None,
-        ge=1,
-        le=3650,
-        description=(
-            "Restrict results to the last N days. Tavily honors this only "
-            "when ``topic='news'``; for general regulation queries it is "
-            "advisory."
-        ),
-    )
-
-
-class RegulationSource(BaseModel):
-    sup: int
-    title: str
-    url: str
-    snippet: str
-    score: float
-    published_date: Optional[str] = None
-
-
-class RegulationSearchResponse(BaseModel):
-    answer: str
-    summary_chars: int
-    sources: List[RegulationSource]
-    n_results: int
-    n_cited: int
-    jurisdiction: JurisdictionLiteral
-    used_include_domains: Optional[List[str]] = None
-    search_query: str
 
 
 # ---------------------------------------------------------------- compare
@@ -129,9 +87,25 @@ class ExclusionAuditRequest(BaseModel):
 
 
 class RecommendRequest(BaseModel):
-    """``POST /insurance/recommend/stream`` body."""
+    """``POST /insurance/recommend/stream`` body.
+
+    ``held_policies_file_ids`` lets the analyst hand the runner the
+    customer's existing coverage so the model does gap-analysis
+    instead of recommending duplicates. Optional — empty / None
+    means "open corpus, recommend whatever fits".
+    """
 
     customer: CustomerProfile
+    held_policies_file_ids: Optional[List[str]] = Field(
+        default=None,
+        max_length=20,
+        description=(
+            "Optional file_ids of policies the customer already holds. "
+            "When supplied, the runner injects them into the prompt so "
+            "the agent reads each one, summarises covered risks, then "
+            "recommends complementary products only."
+        ),
+    )
 
 
 # ---------------------------------------------------------------- claim check
@@ -231,3 +205,23 @@ class FraudPPRRequest(BaseModel):
         max_length=50,
         description="Optional: prune passages to these file_ids only (max 50).",
     )
+
+
+# ---------------------------------------------------------------- risk predict
+
+
+class RiskPredictRequest(BaseModel):
+    """``POST /insurance/risk-predict/stream`` body.
+
+    Proactive (pre-issuance) risk prediction: given one candidate
+    policy and a customer profile, the GraphAgent drives a fixed
+    PPR → neighbors → read pipeline and emits a forward-looking risk
+    forecast. ``scenario`` is an optional free-text hint (e.g.
+    "客户考虑提前退保 / 计划三年内购房") that gets folded into the
+    PPR query so the agent can bias its exploration toward that
+    angle when supplied.
+    """
+
+    file_id: str = Field(..., min_length=1, max_length=128)
+    customer: CustomerProfile
+    scenario: Optional[str] = Field(default=None, max_length=500)

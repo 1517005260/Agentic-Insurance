@@ -92,14 +92,21 @@ async def sample_graph(
 
     Cached per-n for the process lifetime so mode switches in the
     GraphPage don't reshuffle the underlying canvas under the user.
+
+    **Empty data semantics**: when no PDFs are ingested yet (graph
+    service uninitialized OR the underlying graph is empty) we return
+    ``{nodes: [], edges: []}`` rather than 503. Frontends consume
+    /sample as the canvas first-paint and would otherwise need to
+    handle 503 in every viewer; an empty subgraph is the natural
+    "show 'upload a file first' placeholder" signal.
     """
-    svc = _service(request)
+    svc = getattr(request.app.state, "graph_service", None)
+    if svc is None:
+        return GraphSubgraphResponse(nodes=[], edges=[])
     try:
         payload = await run_in_threadpool(svc.sample, n)
-    except GraphServiceUnavailable as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
-        ) from exc
+    except GraphServiceUnavailable:
+        return GraphSubgraphResponse(nodes=[], edges=[])
     return GraphSubgraphResponse(**payload)
 
 

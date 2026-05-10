@@ -48,6 +48,56 @@ router = APIRouter(
 )
 
 
+# Sibling router for non-config admin actions. Kept in this module so
+# the file stays the single home for /admin surfaces that are not
+# user-management; the prefix differs ("/admin" vs "/admin/config") so
+# we cannot reuse the same APIRouter instance.
+admin_actions_router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
+)
+
+
+@admin_actions_router.post(
+    "/refresh-indexes",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def refresh_indexes(request: Request) -> Response:
+    """Force-reload PageStore / InventoryStore / GraphPPRChannel from disk.
+
+    Normally ingest tasks call the same hook themselves on every
+    successful parse / reingest / delete, so an admin will only reach
+    for this when something wrote to ``local_storage`` out of band
+    (manual scripts, restored backups). Returns 204 — caller may verify
+    via the next /graph/sample or /files request.
+
+    503 when the singletons aren't wired (lifespan didn't run; rare
+    outside test clients without lifespan).
+    """
+    refresh = getattr(request.app.state, "refresh_indexes", None)
+    if refresh is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="refresh_indexes hook not initialized",
+        )
+    # Hold the global ingest lock for the duration of the refresh —
+    # otherwise a concurrent ingest writing to the very stores we're
+    # reloading could leave the in-memory snapshot pointing at a
+    # mid-write parquet (faiss + parquet are written non-atomically
+    # within an ``add()`` block, see EmbeddingStore.save). With the
+    # lock, the operator's manual refresh waits for any in-flight
+    # ingest to finish, then re-reads a consistent on-disk state.
+    import asyncio
+
+    from api.services.files import INGEST_LOCK
+
+    async with INGEST_LOCK:
+        await asyncio.get_running_loop().run_in_executor(None, refresh)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 def _store(request: Request) -> ConfigStore:
     """Pull the lifespan-built ConfigStore off ``app.state``."""
     store = getattr(request.app.state, "config", None)

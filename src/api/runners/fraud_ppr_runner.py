@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 _FLAVOR = "fraud_ppr"
 _MAX_PASSAGES_IN_PROMPT = 30
 _MAX_ENTITIES_IN_PROMPT = 20
+# Each passage snippet capped so a 30-passage prompt stays well under
+# the LLM's working context. ~280 chars ≈ ~140 zh tokens; 30 × that
+# fits even for chain-of-thought-heavy prompt expansions.
+_MAX_PASSAGE_SNIPPET_CHARS = 280
 
 
 async def stream_fraud_ppr(
@@ -75,7 +79,20 @@ async def stream_fraud_ppr(
 
             passages = subgraph.get("passages") or []
             citations = _build_citations(passages)
-            user_prompt = _build_user_prompt(query, subgraph, citations)
+            # Pull a short passage snippet for each citation so the LLM
+            # can describe what the neighboring conditions actually say
+            # — file_id/page_id stubs alone forced the model to invent
+            # clause names. The store is in-memory, so this is a dict
+            # lookup per passage.
+            try:
+                passage_text_map = (
+                    graph_service._channel.passage_store.hash_id_to_text  # type: ignore[attr-defined]
+                )
+            except Exception:
+                passage_text_map = {}
+            user_prompt = _build_user_prompt(
+                query, subgraph, citations, passages, passage_text_map
+            )
 
             messages = [
                 {"role": "system", "content": system_prompt},
@@ -176,12 +193,17 @@ def _build_user_prompt(
     query: str,
     subgraph: Dict[str, Any],
     citations: List[CitationItem],
+    passages: List[Dict[str, Any]],
+    passage_text_map: Dict[str, str],
 ) -> str:
     """Render the subgraph as plain text so the LLM can quote it.
 
     Numbered passages line up with the ``CitationItem.sup`` so the model
-    can use ``[^k]`` directly. Entities are sorted by score so the model's
-    "concentration" rule has a stable ordering to walk.
+    can use ``[^k]`` directly. Each passage carries a truncated snippet
+    of its actual text (looked up from the in-memory passage store)
+    so the LLM can name specific clauses instead of inventing them.
+    Entities are sorted by score so the model's "concentration" rule
+    has a stable ordering to walk.
     """
     mode = subgraph.get("mode", "ppr")
     if mode != "ppr":
@@ -214,13 +236,27 @@ def _build_user_prompt(
         or "- (none)"
     )
 
-    passages_block = (
-        "\n".join(
-            f"[^{c.sup}] file_id={c.file_id} page={c.page_id}"
-            for c in citations
-        )
-        or "(none)"
-    )
+    # ``citations`` is built from ``passages`` by skipping malformed
+    # entries (no file_id / no page_id). To zip snippets back onto
+    # citations, pre-filter passages with the same predicate so
+    # ``citations[i]`` aligns with ``valid_passages[i]``.
+    valid_passages = [
+        p for p in passages[:_MAX_PASSAGES_IN_PROMPT]
+        if p.get("file_id") and p.get("page_id")
+    ]
+    passage_lines: List[str] = []
+    for i, c in enumerate(citations):
+        p = valid_passages[i] if i < len(valid_passages) else {}
+        hash_id = p.get("hash_id") if isinstance(p, dict) else None
+        score = float(p.get("score") or 0.0) if isinstance(p, dict) else 0.0
+        snippet_raw = passage_text_map.get(hash_id, "") if hash_id else ""
+        snippet = _shorten(snippet_raw, _MAX_PASSAGE_SNIPPET_CHARS)
+        head = f"[^{c.sup}] file_id={c.file_id} page={c.page_id} score={score:.3f}"
+        if snippet:
+            passage_lines.append(f"{head}\n  {snippet}")
+        else:
+            passage_lines.append(f"{head}  (无可用正文)")
+    passages_block = "\n".join(passage_lines) or "(none)"
 
     edge_type_counts: Dict[str, int] = {}
     for e in edges:
@@ -236,6 +272,22 @@ def _build_user_prompt(
         f"### Passages (按 PPR 得分排序，可引用)\n{passages_block}\n\n"
         f"### Edges\ntotal={len(edges)}, by_type: {edge_summary}\n"
     )
+
+
+def _shorten(text: str, n: int) -> str:
+    """Trim text to ≤ n chars on a sentence-ish boundary so the snippet
+    isn't sliced mid-clause. Falls back to a hard cut + ellipsis."""
+    text = (text or "").strip().replace("\n", " ")
+    if len(text) <= n:
+        return text
+    head = text[: n - 1]
+    # Prefer the last 。/. before the cap; tolerate up to half-window
+    # back-off so we don't return something far shorter than asked.
+    for sep in ("。", "；", ";", ".", " "):
+        idx = head.rfind(sep)
+        if idx >= n // 2:
+            return head[: idx + 1] + "…"
+    return head + "…"
 
 
 # --------------------------------------------------------------- bus helpers

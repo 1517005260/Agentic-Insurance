@@ -13,12 +13,12 @@ class ConfigEntrySchema(BaseModel):
     """One row in the admin UI's config table."""
 
     key: str
-    type: str                # "int" | "str"
+    type: str                # "int" | "str" | "float" | "bool"
     default: Any
     description: str = ""
     group: str = ""
-    min: Optional[int] = None
-    max: Optional[int] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
     min_length: Optional[int] = None
     max_length: Optional[int] = None
 
