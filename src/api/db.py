@@ -62,51 +62,85 @@ SessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
 
 
 async def init_db() -> None:
-    """Create all tables on first startup. Idempotent.
+    """Bring the DB schema up to head. Idempotent.
 
-    Bootstrap path only — uses ``Base.metadata.create_all`` which adds
-    missing tables but cannot evolve column / constraint changes. Once
-    the schema starts changing in production, switch to alembic
-    (``alembic init`` + autogenerate); the dependency is already in
-    ``pyproject.toml``.
+    Three cases:
 
-    A tiny ad-hoc dev-mode top-up runs after ``create_all`` to add the
-    ``chat_sessions.web`` column to dev DBs that don't have it yet, so
-    the operator doesn't have to wipe ``app.db`` by hand. The column
-    is ``NOT NULL DEFAULT 0`` so existing rows get a safe value;
-    SQLite ignores model-level CHECK constraints on a late-added
-    column, so the Pydantic layer rejects forbidden combos at request
-    time instead.
+    1. **Fresh DB** (no app tables) → ``alembic upgrade head`` builds
+       everything from migrations.
+    2. **Pre-Phase-6 DB** (app tables exist from a prior
+       ``Base.metadata.create_all`` run, no recorded version) → stamp
+       ``head`` so Alembic considers the schema current, skipping
+       the would-be table creation that would CREATE TABLE rows that
+       already exist.
+    3. **Already-managed DB** (alembic_version row at head) →
+       ``upgrade head`` is a no-op; no work, no errors.
+
+    The check is "does the canonical ``users`` table exist AND has no
+    alembic version been recorded yet" — this catches both the
+    pre-Phase-6 case AND the case where a previous boot's failed
+    upgrade left an empty ``alembic_version`` table behind.
+
+    Why we DON'T share the lifespan's AsyncConnection with Alembic:
+    SQLite migrations run with ``transactional_ddl=False`` (Alembic's
+    default for SQLite); wrapping CREATE TABLE inside an outer
+    ``engine.begin()`` BEGIN block deadlocks the env.py txn release
+    on the very first migration. Instead we read the DB state with
+    a non-transactional ``engine.connect()``, then close that handle
+    and let Alembic open its own sync engine via the URL override in
+    ``alembic/env.py`` (which resolves to the same ``app_db_path()``).
     """
-    from api.models import Base  # local import to break cyclic init
+    import asyncio
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await _ensure_chat_sessions_web_column(conn)
+    from sqlalchemy import inspect as sa_inspect, text
 
-
-async def _ensure_chat_sessions_web_column(conn) -> None:
-    """Add ``chat_sessions.web`` (default 0) if the table lacks it.
-
-    SQLite's ``ALTER TABLE ADD COLUMN`` is the cheap path; we don't
-    rebuild the table because re-creating CHECK constraints requires
-    a 12-step dance that's overkill for a single dev-machine concern.
-    Production migrations should use alembic.
-    """
-    from sqlalchemy import text
-
-    cols = (
-        await conn.execute(text("PRAGMA table_info(chat_sessions)"))
-    ).fetchall()
-    have_web = any(row[1] == "web" for row in cols)
-    if have_web:
-        return
-    await conn.execute(
-        text(
-            "ALTER TABLE chat_sessions "
-            "ADD COLUMN web INTEGER NOT NULL DEFAULT 0"
+    # Phase 1 — quick state probe (no transaction).
+    async with engine.connect() as conn:
+        existing_tables = await conn.run_sync(
+            lambda sync_conn: sa_inspect(sync_conn).get_table_names()
         )
-    )
+        users_present = "users" in existing_tables
+        has_version_row = False
+        if "alembic_version" in existing_tables:
+            row = (
+                await conn.execute(text("SELECT version_num FROM alembic_version"))
+            ).first()
+            has_version_row = row is not None
+
+    # Phase 2 — Alembic in its own thread + own sync engine. Don't
+    # share connections with the async lifespan engine.
+    loop = asyncio.get_running_loop()
+    if users_present and not has_version_row:
+        await loop.run_in_executor(None, _alembic_stamp_head)
+    else:
+        await loop.run_in_executor(None, _alembic_upgrade_head)
+
+
+def _alembic_upgrade_head() -> None:
+    """Run ``alembic upgrade head``. Sync — call via run_in_executor.
+
+    Alembic opens its own sync engine via ``sqlalchemy.url`` in
+    ``alembic.ini`` (overridden in ``alembic/env.py`` to
+    ``sqlite:///{app_db_path()}``).
+    """
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    cfg = Config(str(project_root / "alembic.ini"))
+    command.upgrade(cfg, "head")
+
+
+def _alembic_stamp_head() -> None:
+    """Mark the DB as already at head without running migrations."""
+    from alembic import command
+    from alembic.config import Config
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    cfg = Config(str(project_root / "alembic.ini"))
+    command.stamp(cfg, "head")
 
 
 @asynccontextmanager
