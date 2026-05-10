@@ -1,4 +1,9 @@
-# Python bytecode / build artifacts
+# =============================================================================
+# Single source of truth for ignored paths. No nested .gitignore files —
+# everything ignored or tracked is decided here.
+# =============================================================================
+
+# ---- Python ----------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,40 +13,73 @@ build/
 dist/
 *.egg-info/
 *.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# Virtual environments
+# ---- Virtual envs ----------------------------------------------------------
 .venv/
 venv/
 env/
+.python-version
 
-# Environment / secrets
+# ---- Environment / secrets -------------------------------------------------
 .env
 .env.*
 !.env.example
 
-# Editor / IDE
+# ---- Frontend (Node / Vite / pnpm) -----------------------------------------
+node_modules/
+frontend/dist/
+frontend/dist-ssr/
+*.local
+.pnpm-store/
+
+# Frontend logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Editor / IDE ----------------------------------------------------------
 .vscode/
+!.vscode/extensions.json
 .idea/
 *.swp
 *.swo
+*.suo
+*.sw?
 
-# OS
+# ---- OS --------------------------------------------------------------------
 .DS_Store
 Thumbs.db
 
-# Project runtime data — STORAGE_PATH lives outside the repo.
-# src/local_storage/ exists due to a stray write into the package tree
-# and contains BM25 / FAISS / OCR artifacts, not code.
+# ---- Project runtime data --------------------------------------------------
+# All app-generated artifacts live under STORAGE_PATH (default
+# ./local_storage/, anchored to the repo root). Never tracked. The
+# stray src/local_storage/ duplicate is the same intent — older test
+# runs accidentally wrote there.
 local_storage/
 src/local_storage/
 
-# Test / E2E artifacts
+# ---- Test / smoke artifacts ------------------------------------------------
 e2e_test_summary.json
+output/                     # playwright screenshots / debug traces
+.playwright-cli/            # playwright CLI per-cwd cache
+playwright-cli.json         # local playwright skill config (browserName: chromium)
 
-# PDFs at the project root (input documents, not source).
+# ---- Vendored / WIP --------------------------------------------------------
+# /projects holds upstream vendor code (LinearRAG paper, ARAG reference)
+# that we keep around for diffing but don't ship.
+/projects/
+
+# ---- Input documents at repo root ------------------------------------------
+# PDFs / Markdown that you drop in for ad-hoc testing — keep them out of
+# the tracked tree even when they happen to live next to README.md.
 /*.pdf
 
-# Ad-hoc dirs not yet part of the tracked tree
-/docs/
-/scripts/
-/projects/
+# ---- Repo housekeeping -----------------------------------------------------
+.codex/                     # local codex CLI scratch
+.claude/                    # local Claude Code scratch
+docs/
