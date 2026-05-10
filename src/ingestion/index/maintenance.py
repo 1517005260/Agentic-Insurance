@@ -31,6 +31,7 @@ from config.settings import (
 )
 from ingestion.index.linear_rag.maintenance import remove_file as _remove_file_impl
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 
 
 def purge_file_artifacts(
@@ -115,7 +116,9 @@ def indexed_file_ids() -> Set[str]:
         if not store_dir.exists():
             continue
         try:
-            store = EmbeddingStore(store_dir, namespace=ns)
+            # Audit walk also goes through the process cache so we
+            # don't load the same faiss index twice on the way in.
+            store = get_or_create_store(store_dir, namespace=ns)
         except Exception:
             # A partial-write corruption is loud (raises in EmbeddingStore.__init__);
             # callers handling the exception above us should report; here we

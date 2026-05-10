@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import (
     PADDLE_OCR_API_URL,
     PADDLE_OCR_FILE_TYPE_IMAGE,
@@ -63,7 +64,11 @@ class PaddleOCRClient:
         self.use_doc_orientation_classify = use_doc_orientation_classify
         self.use_doc_unwarping = use_doc_unwarping
         self.use_chart_recognition = use_chart_recognition
-        self._session = make_retry_session()
+        # Process-wide pool — paddle OCR's relay is the same host across
+        # ingest jobs, urllib3's connection reuse saves TLS handshake.
+        self._session = shared_session(
+            "paddle-ocr-default", lambda: make_retry_session()
+        )
 
     # ------------------------------------------------------------------ public
 

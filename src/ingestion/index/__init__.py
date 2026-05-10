@@ -8,22 +8,15 @@
 Every builder consumes a ``PageAsset`` list and a ``file_id``. Stores are
 **global**: each call appends, ``file_id`` is a meta column for filtering
 and per-file removal. Build-time the four builders are independent.
+
+This package intentionally re-exports nothing: each submodule pulls in
+heavyweight backends (spaCy + torch for ``graph_linearrag`` /
+``text_dense``, tantivy for ``bm25_tantivy``) and importing the
+package would chain-load all of them. Workers that need only one
+builder — most importantly the spawn-mode graph subprocess — would
+otherwise pay 600 MB+ of resident memory at child boot. Callers
+import the specific submodule they need
+(``from ingestion.index.maintenance import purge_file_artifacts``).
 """
 
-from ingestion.index.base import IndexBuilder, IndexBuildResult
-from ingestion.index.bm25_tantivy import BM25IndexBuilder
-from ingestion.index.graph_linearrag import GraphIndexBuilder
-from ingestion.index.maintenance import indexed_file_ids, purge_file_artifacts
-from ingestion.index.text_dense import TextDenseIndexBuilder
-from ingestion.index.vision_dense import VisionDenseIndexBuilder
-
-__all__ = [
-    "IndexBuilder",
-    "IndexBuildResult",
-    "BM25IndexBuilder",
-    "GraphIndexBuilder",
-    "TextDenseIndexBuilder",
-    "VisionDenseIndexBuilder",
-    "purge_file_artifacts",
-    "indexed_file_ids",
-]
+__all__: list[str] = []

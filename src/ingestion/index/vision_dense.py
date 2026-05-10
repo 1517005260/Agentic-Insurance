@@ -15,8 +15,9 @@ import numpy as np
 
 from config.settings import faiss_visual_dir, paddle_ocr_root
 from ingestion.index.base import IndexBuilder, IndexBuildResult
-from model_client import VisualEmbeddingClient
+from model_client import VisualEmbeddingClient, get_cached_visual_embedding_client
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 from storage.page_store import PageAsset
 
 
@@ -24,7 +25,7 @@ class VisionDenseIndexBuilder(IndexBuilder):
     name = "vision_dense"
 
     def __init__(self, visual_client: Optional[VisualEmbeddingClient] = None):
-        self.visual_client = visual_client or VisualEmbeddingClient()
+        self.visual_client = visual_client or get_cached_visual_embedding_client()
         self._store: Optional[EmbeddingStore] = None
 
     @property
@@ -33,7 +34,9 @@ class VisionDenseIndexBuilder(IndexBuilder):
 
     def _get_store(self) -> EmbeddingStore:
         if self._store is None:
-            self._store = EmbeddingStore(self.output_dir, namespace="visual")
+            # Process-cached store — see text_dense._get_store for
+            # rationale (avoid re-loading a large faiss index per ingest).
+            self._store = get_or_create_store(self.output_dir, namespace="visual")
         return self._store
 
     def _build(self, file_id: str, pages: List[PageAsset]) -> IndexBuildResult:

@@ -18,8 +18,8 @@ from typing import List, Optional
 from config import LinearRAGConfig
 from config.settings import faiss_graph_dir, models_root
 from ingestion.index.base import IndexBuilder, IndexBuildResult
-from ingestion.index.linear_rag import LinearRAG
-from model_client import EmbeddingClient
+from ingestion.index.linear_rag.linear_rag import LinearRAG
+from model_client import EmbeddingClient, get_cached_embedding_client
 from storage.page_store import PageAsset
 
 
@@ -32,17 +32,26 @@ class GraphIndexBuilder(IndexBuilder):
         spacy_model_name: str = "en_core_web_trf",
         zh_spacy_model_name: Optional[str] = "zh_core_web_trf",
         max_workers: int = 4,
+        linear_config: Optional[LinearRAGConfig] = None,
     ):
-        self.embedding_client = embedding_client or EmbeddingClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
         self.spacy_model_name = spacy_model_name
         self.zh_spacy_model_name = zh_spacy_model_name
         self.max_workers = max_workers
+        # Carries the admin-tuned literal-backfill flags. The
+        # embedding_client / spacy paths / max_workers fields here will
+        # be overwritten in _build() with the per-call values; only the
+        # backfill knobs survive. None preserves pre-Phase-6 behaviour
+        # for experiment scripts that construct the builder directly.
+        self.linear_config = linear_config
 
     @property
     def output_dir(self) -> Path:
         return faiss_graph_dir()
 
     def _build(self, file_id: str, pages: List[PageAsset]) -> IndexBuildResult:
+        from dataclasses import replace as _replace
+
         eligible = [p for p in pages if p.text_markdown.strip()]
         passages = [p.text_markdown for p in eligible]
         page_numbers = [
@@ -62,7 +71,14 @@ class GraphIndexBuilder(IndexBuilder):
             if (candidate / "config.cfg").is_file():
                 zh_path = str(candidate)
 
-        config = LinearRAGConfig(
+        # Compose: take the admin-provided literal-backfill knobs from
+        # self.linear_config when present, then override the
+        # plumbing-only fields (embedding_client, spaCy paths,
+        # max_workers) with the per-call values. ``replace`` keeps
+        # the dataclass immutable-by-construction.
+        base_lc = self.linear_config or LinearRAGConfig()
+        config = _replace(
+            base_lc,
             embedding_client=self.embedding_client,
             spacy_model=str(spacy_model_path),
             zh_spacy_model=zh_path,

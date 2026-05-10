@@ -61,6 +61,22 @@ _HAS_HAN_RE = regex.compile(r"\p{Han}")
 # Leading-article strip (English only).
 _LEADING_ARTICLE_RE = regex.compile(r"^(the|a|an)\s+", regex.IGNORECASE)
 
+# Trailing whitespace + sentence-ending punctuation that frequently
+# leaks into an entity surface when spaCy splits a Chinese sentence
+# mid-clause (`保单。` / `,并选择一` style fragments). Newlines and
+# full-width spaces are NOT listed here because ``_WS_RE`` (``\s+``)
+# already collapses them to a normal space earlier in ``cleanup``.
+# Half-width ``!?`` and full-width ``！？`` cover Chinese terminal
+# punctuation beyond the period.
+_TRAILING_PUNCT_RE = regex.compile(r"[。\.,，;；:：、!?！？ \t]+$")
+
+# A single dangling opening bracket at end of string — half-width `(`
+# or full-width `（`, with optional whitespace before it. spaCy
+# occasionally cuts a token like ``万通危疾加护保(优越版)`` exactly at
+# the opening bracket, leaving us ``万通危疾加护保(`` which never
+# canonicalises to the same entity as the well-bounded mention.
+_TRAILING_OPEN_BRACKET_RE = regex.compile(r"\s*[(（]\s*$")
+
 
 # --------------------------------------------------------------- functions
 
@@ -73,6 +89,11 @@ def cleanup(surface: str) -> str:
       superscript artifact), keeping anything outside the wrappers.
     * Strip HTML tag fragments leaked from OCR'd tables.
     * Collapse whitespace.
+    * Trim a sentence-ending punctuation cluster + dangling opening
+      bracket — both are common spaCy boundary artefacts on
+      bracket-heavy CJK product names (``"万通危疾加护保("`` →
+      ``"万通危疾加护保"``). Run after whitespace collapse so the
+      regexes can rely on a clean trailing edge.
     """
     if not surface:
         return ""
@@ -81,7 +102,15 @@ def cleanup(surface: str) -> str:
     s = _LATEX_WRAPPED_RE.sub(" ", s)
     s = _HTML_TAG_RE.sub(" ", s)
     s = _WS_RE.sub(" ", s).strip()
-    return s
+    # Bracket repair in three alternating passes, each idempotent:
+    #   1. trim trailing punct          (`保单。`        → `保单`)
+    #   2. trim a dangling open bracket (`万通危疾加护保(` → `万通危疾加护保`)
+    #   3. trim trailing punct again    (covers cases where step 2
+    #      uncovered punct underneath, e.g. `保单。(` → `保单。` → `保单`)
+    s = _TRAILING_PUNCT_RE.sub("", s)
+    s = _TRAILING_OPEN_BRACKET_RE.sub("", s)
+    s = _TRAILING_PUNCT_RE.sub("", s)
+    return s.strip()
 
 
 def is_junk(surface: str) -> bool:

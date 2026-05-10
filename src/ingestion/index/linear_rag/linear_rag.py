@@ -41,12 +41,14 @@ from config.settings import (
 from ingestion.index.linear_rag.disambig import (
     add_alias_edges,
     gradient_topk_candidates,
+    is_composite_surface,
     invalidate_clusters,
     mutual_topk_filter,
 )
 from ingestion.index.linear_rag.ner import SpacyNER
 from ingestion.index.linear_rag.normalize import canonical_form, normalize_for_hash
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 
 import numpy as np
 
@@ -58,13 +60,21 @@ class LinearRAG:
         self.config = global_config
         logger.info("Initializing LinearRAG with config: %s", self.config)
 
-        self.passage_embedding_store = EmbeddingStore(
+        # Three stores come from the process-wide cache so they're the
+        # **same Python objects** as the lifespan-built GraphPPRChannel
+        # holds. Without sharing, each ingest's LinearRAG used to load
+        # ~1.5 GB of duplicate faiss / parquet — the dominant 8 GB OOM
+        # contributor. Sharing is safe because: writes (add()) are
+        # serialised by INGEST_LOCK; reads (PPR queries) tolerate seeing
+        # the in-memory new vectors before save() flushes to disk —
+        # that's the existing refresh-hook contract.
+        self.passage_embedding_store = get_or_create_store(
             faiss_graph_passage_dir(), namespace="passage"
         )
-        self.entity_embedding_store = EmbeddingStore(
+        self.entity_embedding_store = get_or_create_store(
             faiss_graph_entity_dir(), namespace="entity"
         )
-        self.sentence_embedding_store = EmbeddingStore(
+        self.sentence_embedding_store = get_or_create_store(
             faiss_graph_sentence_dir(), namespace="sentence"
         )
 
@@ -88,17 +98,58 @@ class LinearRAG:
 
     # ---------------------------------------------------------- NER caching
 
+    # Schema version for ``ner_results.json``. Bump when the surface
+    # extraction / split / cleanup pipeline changes so older caches are
+    # invalidated and every passage re-runs through the new path.
+    #
+    # v1 (implicit / legacy): raw spaCy ``ent.text`` per passage.
+    # v2: post split_catalog_mentions (catalog list-span fan-out) +
+    #     post cleanup (bracket repair + sentence-fragment trim).
+    NER_CACHE_VERSION = 2
+
     def load_existing_data(self, passage_hash_ids: Iterable[str]):
         if self._ner_results_path.exists():
-            existing = json.loads(self._ner_results_path.read_text(encoding="utf-8"))
-            existing_passage_hash_id_to_entities = existing["passage_hash_id_to_entities"]
-            existing_sentence_to_entities = existing["sentence_to_entities"]
-            existing_passage_hash_ids = set(existing_passage_hash_id_to_entities.keys())
-            new_passage_hash_ids = set(passage_hash_ids) - existing_passage_hash_ids
-            return (
-                existing_passage_hash_id_to_entities,
-                existing_sentence_to_entities,
-                new_passage_hash_ids,
+            try:
+                existing = json.loads(
+                    self._ner_results_path.read_text(encoding="utf-8")
+                )
+            except Exception:
+                existing = None
+            cached_version = (
+                existing.get("version") if isinstance(existing, dict) else None
+            )
+            if (
+                isinstance(existing, dict)
+                and cached_version == self.NER_CACHE_VERSION
+                and "passage_hash_id_to_entities" in existing
+            ):
+                existing_passage_hash_id_to_entities = existing[
+                    "passage_hash_id_to_entities"
+                ]
+                existing_sentence_to_entities = existing.get(
+                    "sentence_to_entities", {}
+                )
+                existing_passage_hash_ids = set(
+                    existing_passage_hash_id_to_entities.keys()
+                )
+                new_passage_hash_ids = (
+                    set(passage_hash_ids) - existing_passage_hash_ids
+                )
+                return (
+                    existing_passage_hash_id_to_entities,
+                    existing_sentence_to_entities,
+                    new_passage_hash_ids,
+                )
+            # Legacy cache (no version, or version < current) — drop the
+            # cached entities so every passage re-runs through the
+            # current NER pipeline (this is the migration path for v2's
+            # split_catalog_mentions; without it the legacy composite
+            # spans would survive forever).
+            logger.info(
+                "ner_results.json schema mismatch (cached=%s, current=%s); "
+                "re-running NER on all passages",
+                cached_version,
+                self.NER_CACHE_VERSION,
             )
         return {}, {}, set(passage_hash_ids)
 
@@ -107,6 +158,7 @@ class LinearRAG:
         self._ner_results_path.write_text(
             json.dumps(
                 {
+                    "version": self.NER_CACHE_VERSION,
                     "passage_hash_id_to_entities": passage_to_entities,
                     "sentence_to_entities": sentence_to_entities,
                 },
@@ -317,6 +369,16 @@ class LinearRAG:
         total_added = 0
         for hash_id in new_entity_hashes:
             entity_text = self.entity_embedding_store.get_text(hash_id)
+            # Composite-surface admission gate — entity-side. Surfaces
+            # that look like multiple mentions glued together (chain
+            # of products, conjunction-joined SKU codes) have a
+            # mixture-centroid embedding and would pull in cleanly-
+            # named neighbours, polluting the alias subgraph by
+            # transitivity. Skip outbound alias generation for them
+            # entirely; they remain in the graph as standalone
+            # vertices and PPR can still hit them via passage edges.
+            if is_composite_surface(entity_text):
+                continue
             mention_sentences = entity_text_to_mentions.get(entity_text, [])
             query_emb, low_context = self._entity_query_embedding(
                 hash_id, mention_sentences
@@ -340,6 +402,17 @@ class LinearRAG:
                 k=cfg.alias_top_k,
                 min_sim=min_sim,
             )
+            # Composite-surface admission gate — candidate-side.
+            # Mirror the entity-side check: never add an alias edge
+            # whose **target** is composite either, otherwise a clean
+            # entity could still be transitively pulled into a
+            # garbage-bucket cluster through a single composite hop.
+            cands = [
+                c for c in cands
+                if not is_composite_surface(
+                    self.entity_embedding_store.get_text(c.hash_id)
+                )
+            ]
             total_added += add_alias_edges(self.graph, hash_id, cands)
         return total_added
 

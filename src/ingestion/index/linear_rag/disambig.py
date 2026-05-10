@@ -15,6 +15,7 @@ The new entity is always added as a separate physical node (no merging) so
 mistakes are reversible by deleting an alias edge.
 """
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -161,13 +162,143 @@ def add_alias_edges(
     return len(pairs)
 
 
+# Surface-quality scoring — used to pick a cluster's ``canonical``
+# representative. Lower (more negative) = noisier; we pick the
+# **highest** score in a cluster as the canonical.
+#
+# The previous "longest surface" rule was empirically wrong on OCR
+# noise: spaCy's longest spans are usually mis-bounded chains
+# (``A(c1)、B(c2)、C(c3)``) or sentence fragments (``…保单。``),
+# both of which beat the clean prefix on length but are the worst
+# possible canonical name. The scoring below penalises the structural
+# defects that those bad spans exhibit, then breaks ties by
+# preferring shorter (cleaner) surfaces.
+
+# Trailing punctuation / whitespace / dangling **opening** bracket that
+# strongly indicates a mid-sentence cut. Closing brackets ``)`` ``）``
+# are intentionally NOT in this set: a balanced SKU like
+# ``"万通危疾加护保(优越版)"`` legitimately ends with ``)`` and would
+# otherwise lose a -2 penalty to a cleanup-stripped sentence fragment
+# like ``"…保单"`` (whose trailing ``。`` ``cleanup`` already removed).
+# Bracket imbalance is handled separately by ``_bracket_imbalance``.
+_TRAILING_JUNK_RE = re.compile(r"[。\.,，;；:：、!?！？\s(（]+$")
+# A list separator inside the surface — the surface is a chain of
+# multiple mentions glued together by spaCy.
+_LIST_SEP_INTERIOR_RE = re.compile(r"[、；;•｜|，]")
+# Bracket counts (both half- and full-width) for balance check.
+_OPEN_BRACKETS = ("(", "（")
+_CLOSE_BRACKETS = (")", "）")
+
+
+def _bracket_imbalance(s: str) -> int:
+    """Absolute difference between # opens and # closes (any width)."""
+    opens = sum(s.count(c) for c in _OPEN_BRACKETS)
+    closes = sum(s.count(c) for c in _CLOSE_BRACKETS)
+    return abs(opens - closes)
+
+
+def _open_bracket_count(s: str) -> int:
+    return sum(s.count(c) for c in _OPEN_BRACKETS)
+
+
+# Conjunction words that can glue multiple mentions into one span but
+# also legitimately appear inside organisation names (e.g.
+# "保险及再保险公司"). The catalog splitter (``split_catalog_mentions``)
+# intentionally does not split on these. The composite gate uses them
+# only as a corroborating signal alongside multiple bracket pairs.
+_COMPOSITE_CONJUNCTION_RE = re.compile(r"或|及|与")
+# Half-width comma — left out of the catalog splitter because it can
+# appear inside English company names (``"Inc., Ltd."``). Used here
+# only when paired with multiple bracket pairs as a composite signal.
+_HALF_WIDTH_COMMA_RE = re.compile(r",")
+
+
+def is_composite_surface(text: Optional[str]) -> bool:
+    """Return True when the surface looks like multiple mentions glued
+    into one span and the safe split rules couldn't decompose it.
+
+    Used as an admission gate before alias-edge generation: composite
+    surfaces are a mixture centroid in embedding space and pull in
+    cleanly-named neighbours, producing the c_0000-style "garbage
+    bucket" clusters we observed empirically. Skipping them at the
+    alias-edge stage prevents pollution-via-transitivity (entity A
+    aliased to composite C aliased to entity B → A and B end up in
+    the same cluster despite never being aliased directly).
+
+    Signals (any one is enough):
+
+    1. Interior list separator (``、；;•｜|，``) — defensive: this
+       should already have been split by ``split_catalog_mentions``;
+       a surviving one means we missed it.
+    2. Conjunction (``或/及/与``) **and** ≥2 bracket pairs — likely
+       ``A(code1) 或 B(code2)``. Conjunctions alone are not enough
+       (e.g. ``"保险及再保险公司"`` is a real org).
+    3. Half-width comma **and** ≥2 bracket pairs — likely
+       ``A(code1),B(code2)``. Comma alone is not enough (English
+       company names).
+    4. ≥3 open brackets — a chain like ``A(c1)(c2) B(c3)`` even
+       without a separator we recognise.
+    """
+    if not text:
+        return False
+    if _LIST_SEP_INTERIOR_RE.search(text):
+        return True
+    open_count = _open_bracket_count(text)
+    if open_count >= 2 and _COMPOSITE_CONJUNCTION_RE.search(text):
+        return True
+    if open_count >= 2 and _HALF_WIDTH_COMMA_RE.search(text):
+        return True
+    if open_count >= 3:
+        return True
+    return False
+
+
+def surface_quality_score(surface: Optional[str]) -> float:
+    """Higher = cleaner. Used to pick a canonical from a cluster.
+
+    Components (penalties stack additively, lower is worse):
+
+    * ``-3`` per bracket imbalance — dangling ``"万通危疾加护保("``.
+    * ``-2`` per interior list separator — composite chain like
+      ``"A、B、C"`` which should never have been one entity.
+    * ``-2`` for trailing punctuation/whitespace/bracket — sentence
+      fragment leakage like ``"…保单。"`` or ``"vip 环球医疗保("``.
+    * ``-0.05 * len`` — mild length penalty so among equally-clean
+      surfaces we prefer the shorter one (the family-level canonical
+      ``"万通危疾加护保"`` over the SKU-tagged ``"…(优越版)(phps)"``).
+
+    The mild length penalty is the only "preference" component; the
+    other three penalise concrete structural defects that the
+    composite-surface gate (P2) and the cleanup pipeline (P0) would
+    have caught had spaCy bounded the span correctly.
+    """
+    if not surface:
+        return -1e6
+    score = 0.0
+    score -= 3.0 * _bracket_imbalance(surface)
+    if _LIST_SEP_INTERIOR_RE.search(surface):
+        score -= 2.0
+    if _TRAILING_JUNK_RE.search(surface):
+        score -= 2.0
+    score -= 0.05 * len(surface)
+    return score
+
+
 def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
     """Connected components on the alias subgraph → logical entities.
 
-    Returns a list of cluster dicts. ``canonical`` is the longest member
-    surface. Only clusters with ≥2 members are returned (singletons are
-    implicit — every physical entity not appearing in this list is its own
-    logical entity).
+    Returns a list of cluster dicts. ``canonical`` is the cluster
+    member with the highest :func:`surface_quality_score` — the
+    cleanest surface. Empirically this gives canonicals like
+    ``"万通危疾加护保"`` instead of the previous longest-surface rule
+    which would pick the noisiest member (chained product list,
+    sentence fragment, dangling-bracket token).
+
+    Ties (same score) are broken deterministically by the member's
+    insertion order so ``compute_clusters`` is reproducible across
+    runs. Only clusters with ≥2 members are returned (singletons are
+    implicit — every physical entity not appearing in this list is
+    its own logical entity).
     """
     if graph.ecount() == 0:
         return []
@@ -188,7 +319,12 @@ def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
             (sub.vs[members[j]].attributes().get("content") or names[j], names[j])
             for j in range(len(members))
         ]
-        canonical_text, _ = max(contents, key=lambda t: len(t[0]))
+        # Argmax over surface_quality_score; tuple-as-key ties break by
+        # insertion order (stable, reproducible).
+        canonical_text, _ = max(
+            ((text, name) for text, name in contents),
+            key=lambda t: surface_quality_score(t[0]),
+        )
         clusters.append(
             {
                 "id": f"c_{cid:04d}",
@@ -199,6 +335,17 @@ def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
     return clusters
 
 
+# Cluster-cache schema version. Bump when ``compute_clusters`` /
+# ``surface_quality_score`` change so older cache files (which encode
+# the *previous* canonical-picker output) are silently invalidated and
+# recomputed on next read.
+#
+# v1: longest-surface canonical (legacy)
+# v2: surface_quality_score canonical + composite-aware admission gate
+#     (this PR — P1, P2 from codex review of 2026-05)
+CLUSTERS_CACHE_VERSION = 2
+
+
 def write_clusters(
     path: Path,
     clusters: List[Dict[str, object]],
@@ -206,7 +353,7 @@ def write_clusters(
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": CLUSTERS_CACHE_VERSION,
         "alias_edge_count": int(alias_edge_count),
         "clusters": clusters,
     }
@@ -221,16 +368,21 @@ def invalidate_clusters(path: Path) -> None:
 def get_clusters(graph: ig.Graph, cache_path: Path) -> List[Dict[str, object]]:
     """Lazy-loaded clusters: return cached if fresh, else compute + persist.
 
-    "Fresh" = the cache file exists. Any structural change (alias edge
-    added or removed, file removed) calls :func:`invalidate_clusters` so
-    the next read recomputes.
+    "Fresh" = file exists AND ``version`` matches the current
+    ``CLUSTERS_CACHE_VERSION``. Older versions are silently dropped
+    and recomputed — this is the migration path for the canonical-
+    picker change in v2 (otherwise an upgraded binary would keep
+    serving stale longest-surface canonicals from a v1 cache).
     """
     if cache_path.exists():
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
-            return payload.get("clusters", [])
+            cached_version = payload.get("version")
+            if cached_version == CLUSTERS_CACHE_VERSION:
+                return payload.get("clusters", [])
+            # Version mismatch (or missing) — fall through to recompute.
         except Exception:
-            pass  # fall through to recompute on parse error
+            pass  # parse error — fall through to recompute
     clusters = compute_clusters(graph)
     alias_edge_count = (
         sum(1 for e in graph.es if e.attributes().get("edge_type") == ALIAS_EDGE_TYPE)

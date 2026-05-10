@@ -5,52 +5,13 @@ Wraps the LinearRAG algorithm onto local primitives: the faiss-backed
 SentenceTransformer-backed store, and configuration is centralised in
 ``config.LinearRAGConfig``. Retrieval / PPR live with the query path,
 not here.
+
+This package intentionally re-exports nothing: the submodules pull in
+spaCy + torch transitively, so importing the package would force the
+~600 MB native baseline even for callers that only want a small
+helper (e.g. ``normalize_for_hash``). Import the specific submodule
+you need (``from ingestion.index.linear_rag.linear_rag import
+LinearRAG``).
 """
 
-from ingestion.index.linear_rag.backfill import (
-    build_gazetteer_automaton,
-    find_literal_matches,
-    literal_backfill_graph,
-)
-from ingestion.index.linear_rag.disambig import (
-    add_alias_edges,
-    compute_clusters,
-    get_clusters,
-    gradient_topk_candidates,
-    invalidate_clusters,
-    mutual_topk_filter,
-    write_clusters,
-)
-from ingestion.index.linear_rag.linear_rag import LinearRAG
-from ingestion.index.linear_rag.maintenance import remove_file, split_cluster, unalias
-from ingestion.index.linear_rag.ner import SpacyNER
-from ingestion.index.linear_rag.normalize import (
-    canonical_form,
-    cleanup,
-    is_junk,
-    normalize_for_hash,
-)
-from ingestion.index.linear_rag.utils import compute_mdhash_id
-
-__all__ = [
-    "LinearRAG",
-    "SpacyNER",
-    "compute_mdhash_id",
-    "gradient_topk_candidates",
-    "mutual_topk_filter",
-    "add_alias_edges",
-    "compute_clusters",
-    "get_clusters",
-    "write_clusters",
-    "invalidate_clusters",
-    "unalias",
-    "split_cluster",
-    "remove_file",
-    "cleanup",
-    "is_junk",
-    "canonical_form",
-    "normalize_for_hash",
-    "literal_backfill_graph",
-    "build_gazetteer_automaton",
-    "find_literal_matches",
-]
+__all__: list[str] = []

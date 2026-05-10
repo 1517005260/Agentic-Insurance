@@ -18,7 +18,47 @@ structural ``normalize.is_junk`` check.
 from collections import defaultdict
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional
 
-import spacy
+import regex
+
+from config.shared import shared_spacy
+
+
+# Pure-punctuation list separators commonly used in Chinese product
+# catalog OCR output. Splitting an entity surface on these is safe:
+# Chinese registration rules (PRC 企业名称登记管理规定) disallow these
+# punctuation characters inside organisation names, so they are almost
+# always enumeration glyphs.
+#
+# Conjunction words (或 / 及 / 与) were intentionally REMOVED after a
+# review surfaced realistic counter-examples like "保险及再保险公司" /
+# "联通及电信合作社" — those would be incorrectly split. The catalog
+# OCR symptom we're targeting (`A(code)、B(code)、C(code)`) is fully
+# covered by the punctuation set; conjunction-glued chains are rare
+# enough to leave as composite surfaces (the ``is_composite_surface``
+# gate downstream prevents them from polluting alias clusters).
+_CATALOG_LIST_SEP_RE = regex.compile(r"[、；;•｜|，]+")
+
+
+def split_catalog_mentions(text: str) -> List[str]:
+    """Fan out a catalog/list span into one surface per mention.
+
+    spaCy occasionally captures a Chinese product list (``A、B、C`` or
+    ``A；B；C``) as a single entity span. Split on the safe set of
+    pure-punctuation list separators so each sub-mention enters the
+    canonicaliser independently. Surfaces with no separator come back
+    as a single-element list, so callers can iterate uniformly.
+
+    This function lives on the **NER side** of the pipeline (mention
+    boundary repair) — distinct from ``normalize.cleanup`` which only
+    handles surface hygiene (HTML, LaTeX, dangling brackets, trailing
+    punctuation).
+    """
+    stripped = text.strip() if text else ""
+    if not stripped:
+        return []
+    parts = _CATALOG_LIST_SEP_RE.split(text)
+    out = [p.strip() for p in parts if p and p.strip()]
+    return out or [stripped]
 
 
 # OntoNotes labels that almost always carry numeric / temporal /
@@ -69,9 +109,15 @@ class SpacyNER:
         zh_spacy_model: Optional[str] = None,
         drop_labels: Optional[Iterable[str]] = None,
     ):
-        self._pipelines: Dict[str, Any] = {"en": spacy.load(spacy_model)}
+        # Pipelines come from the process-wide cache (``config.shared``)
+        # so a parent that already pre-warmed an EN/ZH trf pipeline at
+        # lifespan and a per-ingest LinearRAG share the same Language
+        # object instead of paying ~1.5 GB per duplicate ``spacy.load``.
+        # Concurrent reads via ``nlp.pipe`` are documented thread-safe;
+        # mutation paths are serialised by ``INGEST_LOCK`` upstream.
+        self._pipelines: Dict[str, Any] = {"en": shared_spacy(spacy_model)}
         if zh_spacy_model:
-            self._pipelines["zh"] = spacy.load(zh_spacy_model)
+            self._pipelines["zh"] = shared_spacy(zh_spacy_model)
         self.drop_labels: FrozenSet[str] = (
             frozenset(drop_labels) if drop_labels is not None else DEFAULT_DROP_LABELS
         )
@@ -119,10 +165,14 @@ class SpacyNER:
             if ent.label_ in self.drop_labels:
                 continue
             sent_text = ent.sent.text
-            ent_text = ent.text
-            if ent_text not in sentence_to_entities[sent_text]:
-                sentence_to_entities[sent_text].append(ent_text)
-            unique_entities.add(ent_text)
+            # Fan out catalog/list spans into one surface per mention
+            # so each piece deduplicates through the canonicaliser.
+            # Surfaces with no separator come back as a single-element
+            # list, so the loop body stays uniform.
+            for piece in split_catalog_mentions(ent.text):
+                if piece not in sentence_to_entities[sent_text]:
+                    sentence_to_entities[sent_text].append(piece)
+                unique_entities.add(piece)
         passage_hash_id_to_entities[passage_hash_id] = list(unique_entities)
         return passage_hash_id_to_entities, sentence_to_entities
 

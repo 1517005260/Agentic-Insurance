@@ -38,6 +38,7 @@ from config.settings import (
 )
 from ingestion.index.linear_rag.disambig import ALIAS_EDGE_TYPE, invalidate_clusters
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 
 
 def _open_graph() -> tuple[ig.Graph, Path]:
@@ -220,13 +221,13 @@ def remove_file(
         counts["paddle_ocr_dir"] = 1
 
     # 5. Dense + visual stores: drop by file_id.
-    dense = EmbeddingStore(faiss_dense_dir(), namespace="dense")
+    dense = get_or_create_store(faiss_dense_dir(), namespace="dense")
     counts["dense_rows"] = _drop_store_rows(dense, file_id=file_id)
-    visual = EmbeddingStore(faiss_visual_dir(), namespace="visual")
+    visual = get_or_create_store(faiss_visual_dir(), namespace="visual")
     counts["visual_rows"] = _drop_store_rows(visual, file_id=file_id)
 
     # 6. Graph passage store: drop passages with this file_id, remember their hashes.
-    passage_store = EmbeddingStore(faiss_graph_passage_dir(), namespace="passage")
+    passage_store = get_or_create_store(faiss_graph_passage_dir(), namespace="passage")
     dropped_passage_hashes = _list_store_rows_by_file(passage_store, file_id)
     counts["graph_passage_rows"] = _drop_store_rows(passage_store, file_id=file_id)
 
@@ -277,7 +278,7 @@ def remove_file(
         for ents in passage_to_entities.values():
             all_surviving_entities.update(ents)
 
-        entity_store = EmbeddingStore(faiss_graph_entity_dir(), namespace="entity")
+        entity_store = get_or_create_store(faiss_graph_entity_dir(), namespace="entity")
         for h, surface in entity_store.hash_id_to_text.items():
             if surface not in all_surviving_entities:
                 dropped_entities.append(h)
@@ -287,7 +288,7 @@ def remove_file(
             )
 
         # Sentence store: drop rows whose text is in dropped_sentences.
-        sentence_store = EmbeddingStore(faiss_graph_sentence_dir(), namespace="sentence")
+        sentence_store = get_or_create_store(faiss_graph_sentence_dir(), namespace="sentence")
         dropped_sentence_set = set(dropped_sentences)
         sent_drop_hashes = [
             h for h, t in sentence_store.hash_id_to_text.items()
@@ -345,53 +346,71 @@ def remove_file(
 # ----------------------------------------------------------- internals
 
 def _list_store_rows_by_file(store: EmbeddingStore, file_id: str) -> List[str]:
-    if "file_id" not in store._meta.columns:
-        return []
-    mask = store._meta["file_id"] == file_id
-    return store._meta.loc[mask, "hash_id"].tolist()
+    # Snapshot meta under the per-store lock so a concurrent ``add()``
+    # can't change the column set or row count between the column
+    # check and the row select.
+    with store._lock:
+        if "file_id" not in store._meta.columns:
+            return []
+        mask = store._meta["file_id"] == file_id
+        return store._meta.loc[mask, "hash_id"].tolist()
 
 
 def _drop_store_rows(store: EmbeddingStore, file_id: str) -> int:
-    if "file_id" not in store._meta.columns or len(store) == 0:
-        return 0
-    keep_mask = store._meta["file_id"] != file_id
-    n_dropped = int((~keep_mask).sum())
-    if n_dropped == 0:
-        return 0
-    _rebuild_store(store, keep_mask)
-    return n_dropped
+    # Mask compute + rebuild must be one critical section; otherwise a
+    # concurrent ``add()`` between the two would lose the just-added
+    # rows when ``_rebuild_store`` overwrites ``_index`` / ``_meta``.
+    with store._lock:
+        if "file_id" not in store._meta.columns or len(store) == 0:
+            return 0
+        keep_mask = store._meta["file_id"] != file_id
+        n_dropped = int((~keep_mask).sum())
+        if n_dropped == 0:
+            return 0
+        _rebuild_store(store, keep_mask)
+        return n_dropped
 
 
 def _drop_store_rows_by_hash(store: EmbeddingStore, hash_ids: Sequence[str]) -> int:
     if not hash_ids or len(store) == 0:
         return 0
-    drop_set = set(hash_ids)
-    keep_mask = ~store._meta["hash_id"].isin(drop_set)
-    n_dropped = int((~keep_mask).sum())
-    if n_dropped == 0:
-        return 0
-    _rebuild_store(store, keep_mask)
-    return n_dropped
+    with store._lock:
+        if len(store) == 0:
+            return 0
+        drop_set = set(hash_ids)
+        keep_mask = ~store._meta["hash_id"].isin(drop_set)
+        n_dropped = int((~keep_mask).sum())
+        if n_dropped == 0:
+            return 0
+        _rebuild_store(store, keep_mask)
+        return n_dropped
 
 
 def _rebuild_store(store: EmbeddingStore, keep_mask) -> None:
-    """Rebuild faiss index + meta from ``keep_mask``."""
-    keep_idx = store._meta.index[keep_mask].tolist()
-    survivors_meta = store._meta.loc[keep_mask].reset_index(drop=True)
+    """Rebuild faiss index + meta from ``keep_mask``.
 
-    if store._index is not None and store._index.ntotal > 0:
-        all_emb = store._index.reconstruct_n(0, store._index.ntotal)
-        new_emb = all_emb[keep_idx]
-    else:
-        new_emb = np.zeros((0, store.dim or 0), dtype=np.float32)
+    Held under ``store._lock`` so the three-step mutation
+    (``_index`` / ``_meta`` / ``_hash_id_to_idx``) is atomic vs concurrent
+    readers. Re-entrant lock so the inner ``store.save()`` (which also
+    grabs the lock) doesn't deadlock.
+    """
+    with store._lock:
+        keep_idx = store._meta.index[keep_mask].tolist()
+        survivors_meta = store._meta.loc[keep_mask].reset_index(drop=True)
 
-    new_index = faiss.IndexFlatIP(store.dim or new_emb.shape[1])
-    if new_emb.size > 0:
-        new_index.add(new_emb)
-    store._index = new_index
-    store._meta = survivors_meta
-    store._hash_id_to_idx = {h: i for i, h in enumerate(survivors_meta["hash_id"].tolist())}
-    store.save()
+        if store._index is not None and store._index.ntotal > 0:
+            all_emb = store._index.reconstruct_n(0, store._index.ntotal)
+            new_emb = all_emb[keep_idx]
+        else:
+            new_emb = np.zeros((0, store.dim or 0), dtype=np.float32)
+
+        new_index = faiss.IndexFlatIP(store.dim or new_emb.shape[1])
+        if new_emb.size > 0:
+            new_index.add(new_emb)
+        store._index = new_index
+        store._meta = survivors_meta
+        store._hash_id_to_idx = {h: i for i, h in enumerate(survivors_meta["hash_id"].tolist())}
+        store.save()
 
 
 def _rebuild_bm25(skip_file_id: str) -> int:

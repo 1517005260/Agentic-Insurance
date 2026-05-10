@@ -14,8 +14,9 @@ import numpy as np
 from config.settings import faiss_dense_dir
 from ingestion.index._sentence import split_sentences
 from ingestion.index.base import IndexBuilder, IndexBuildResult
-from model_client import EmbeddingClient
+from model_client import EmbeddingClient, get_cached_embedding_client
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 from storage.page_store import PageAsset
 
 
@@ -23,7 +24,7 @@ class TextDenseIndexBuilder(IndexBuilder):
     name = "text_dense"
 
     def __init__(self, embedding_client: Optional[EmbeddingClient] = None):
-        self.embedding_client = embedding_client or EmbeddingClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
         self._store: Optional[EmbeddingStore] = None
 
     @property
@@ -32,7 +33,10 @@ class TextDenseIndexBuilder(IndexBuilder):
 
     def _get_store(self) -> EmbeddingStore:
         if self._store is None:
-            self._store = EmbeddingStore(self.output_dir, namespace="dense")
+            # Process-cached store — same instance as the dense
+            # ``SemanticChannel`` consumer at query time. Saves a
+            # second ``faiss.read_index`` per ingest.
+            self._store = get_or_create_store(self.output_dir, namespace="dense")
         return self._store
 
     def _build(self, file_id: str, pages: List[PageAsset]) -> IndexBuildResult:
