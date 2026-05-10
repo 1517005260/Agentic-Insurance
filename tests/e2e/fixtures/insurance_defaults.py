@@ -90,11 +90,12 @@ DEFAULT_CALC_TARGETS: List[str] = [
 ]
 
 
-# ---------------------------------------------------------- regulation
+# ---------------------------------------------------------- hidden risk (PPR)
 
 
-DEFAULT_REGULATION_QUERY: str = "香港强积金最新监管要求 2025"
-DEFAULT_REGULATION_JURISDICTION: str = "hk"
+DEFAULT_HIDDEN_RISK_QUERY: str = (
+    "客户在职业列表里登记为高空作业，想了解意外险有哪些与该职业相关的限制条款？"
+)
 
 
 # ---------------------------------------------------------- web RAG

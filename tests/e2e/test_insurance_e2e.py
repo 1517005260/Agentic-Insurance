@@ -34,10 +34,9 @@ from fixtures.insurance_defaults import (  # noqa: E402
     DEFAULT_COMPARE_PROPERTIES,
     DEFAULT_CUSTOMER,
     DEFAULT_FILE_IDS,
+    DEFAULT_HIDDEN_RISK_QUERY,
     DEFAULT_POLICY_PARAMS,
     DEFAULT_PRIMARY_FILE_ID,
-    DEFAULT_REGULATION_JURISDICTION,
-    DEFAULT_REGULATION_QUERY,
     DEFAULT_WEB_AGENT_QUERY,
     DEFAULT_WEB_RAG_QUERY,
 )
@@ -95,53 +94,7 @@ async def _drain_sse(client, path: str, body: dict, headers: dict, timeout: floa
 
 
 # ============================================================
-# 1. regulation-search (non-streaming)
-# ============================================================
-
-
-@_NEEDS_KEYS
-async def test_regulation_search_hk_jurisdiction(app_harness):
-    async with _client_for(app_harness) as (client, app, headers):
-        body = {
-            "query": DEFAULT_REGULATION_QUERY,
-            "jurisdiction": DEFAULT_REGULATION_JURISDICTION,
-            "max_results": 4,
-        }
-        r = await client.post(
-            "/insurance/regulation-search", json=body, headers=headers, timeout=120.0
-        )
-        assert r.status_code == 200, r.text
-        out = r.json()
-        assert out["jurisdiction"] == "hk"
-        assert out["search_query"] == DEFAULT_REGULATION_QUERY
-        assert out["used_include_domains"], "HK domain whitelist must be applied"
-        assert isinstance(out["sources"], list)
-        # If Tavily returned anything, the LLM should have produced text.
-        if out["n_results"] > 0:
-            assert out["summary_chars"] > 0, "non-empty summary expected when sources exist"
-
-
-@_NEEDS_KEYS
-async def test_regulation_search_503_when_no_tavily(app_harness, monkeypatch):
-    # Yank the key inside the running process so the lifespan-built
-    # client surfaces unavailable. We do this BEFORE _client_for boots
-    # so the lifespan sees the wiped key.
-    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-    async with _client_for(app_harness) as (client, app, headers):
-        # Replace the lifespan client too — defensively, the cached one
-        # still holds the old key value.
-        from model_client.web_search import TavilyClient
-        app.state.tavily_client = TavilyClient(api_key=None)
-        r = await client.post(
-            "/insurance/regulation-search",
-            json={"query": "anything", "jurisdiction": "both"},
-            headers=headers,
-        )
-        assert r.status_code == 503, r.text
-
-
-# ============================================================
-# 2. compare (BaseAgent SSE)
+# 1. compare (BaseAgent SSE)
 # ============================================================
 
 
@@ -165,7 +118,7 @@ async def test_compare_two_products_streams_final(app_harness):
 
 
 # ============================================================
-# 3. exclusion audit (ProofAgent SSE)
+# 2. exclusion audit (ProofAgent SSE)
 # ============================================================
 
 
@@ -187,7 +140,7 @@ async def test_exclusion_audit_with_default_customer(app_harness):
 
 
 # ============================================================
-# 4. recommend (BaseAgent SSE)
+# 3. recommend / needs-analysis (BaseAgent SSE)
 # ============================================================
 
 
@@ -202,16 +155,82 @@ async def test_recommend_with_default_customer(app_harness):
             timeout=600.0,
         )
         # The agent should have called list_files (it is the canonical
-        # discovery step the prompt requires).
+        # discovery step the prompt requires in open-corpus mode).
         list_files_calls = [
             e for e in events if e[0] == "tool_call" and e[1].get("name") == "list_files"
         ]
         assert list_files_calls, "recommend agent must call list_files"
         assert final is not None and final.get("flavor") == "recommend"
+        assert final.get("held_policies_count", 0) == 0
+
+
+@_NEEDS_KEYS
+async def test_recommend_gap_analysis_with_held_policies(app_harness):
+    """Held-policy mode: the runner should switch to gap-analysis prompt.
+
+    Beyond "some read happened" (which would also pass when the agent
+    reads candidate products), assert at least one ``read`` targets a
+    held file_id — that's what proves the gap-analysis branch ran the
+    "summarize existing coverage first" step the new prompt mandates.
+    """
+    held = DEFAULT_FILE_IDS[:1]
+    held_set = set(held)
+    async with _client_for(app_harness) as (client, app, headers):
+        events, final = await _drain_sse(
+            client,
+            "/insurance/recommend/stream",
+            {"customer": DEFAULT_CUSTOMER, "held_policies_file_ids": held},
+            headers,
+            timeout=600.0,
+        )
+        read_calls = [
+            e for e in events
+            if e[0] == "tool_call" and e[1].get("name") == "read"
+        ]
+        assert read_calls, "gap analysis must read at least one policy"
+        # ReadTool addresses a unit either via `unit_ids` (where each
+        # unit_id is `<file_id>/<page_id>`) or via `file_ids` (file
+        # allow-list). Check both shapes for any held file_id reference.
+        held_targeted = False
+        for _, payload in read_calls:
+            args = payload.get("args") or {}
+            for fid in args.get("file_ids") or []:
+                if isinstance(fid, str) and fid in held_set:
+                    held_targeted = True
+                    break
+            if held_targeted:
+                break
+            for uid in args.get("unit_ids") or []:
+                if not isinstance(uid, str):
+                    continue
+                if any(uid.startswith(f"{fid}/") for fid in held_set):
+                    held_targeted = True
+                    break
+            if held_targeted:
+                break
+        assert held_targeted, (
+            f"gap analysis must read at least one held file_id "
+            f"({held_set}), but read_calls targeted: "
+            f"{[c[1].get('args') for c in read_calls]}"
+        )
+        # Belt-and-braces: the citations event must list a passage
+        # whose file_id is in the held set — proves the read actually
+        # surfaced a real page rather than a not_found stub. The
+        # workbench scaffold always emits ``citations`` before
+        # ``final``, so absence here is itself a regression.
+        cite_evs = [e for e in events if e[0] == "citations"]
+        assert cite_evs, "stream_workbench_agent must emit a citations event"
+        items = (cite_evs[-1][1].get("items") or [])
+        assert any(
+            isinstance(it, dict) and it.get("file_id") in held_set
+            for it in items
+        ), "citations must include at least one held file_id"
+        assert final is not None and final.get("flavor") == "recommend"
+        assert final.get("held_policies_count") == len(held)
 
 
 # ============================================================
-# 5. claim check (BaseAgent SSE)
+# 4. claim check (BaseAgent SSE)
 # ============================================================
 
 
@@ -231,7 +250,7 @@ async def test_claim_check_with_default_event(app_harness):
 
 
 # ============================================================
-# 6. policy calc (BaseAgent + code_run)
+# 5. policy calc (BaseAgent + code_run)
 # ============================================================
 
 
@@ -257,6 +276,89 @@ async def test_policy_calc_invokes_code_run(app_harness):
         ]
         assert code_run_calls, "policy-calc agent must call code_run at least once"
         assert final is not None and final.get("flavor") == "policy_calc"
+
+
+# ============================================================
+# 6. hidden-risk (PPR + LLM, no agent loop)
+# ============================================================
+
+
+@_NEEDS_KEYS
+async def test_hidden_risk_with_query_streams_token_and_final(app_harness):
+    """``/insurance/fraud-ppr/stream`` is now powering the Policy-Review
+    hidden-risk tab (URL preserved for trace flavor / persisted history).
+
+    Smoke: SSE bus emits at least one token frame and a terminal final
+    that carries the documented schema (mode + subgraph_counts + flavor).
+    """
+    body = {
+        "query": DEFAULT_HIDDEN_RISK_QUERY,
+        "file_ids": [DEFAULT_PRIMARY_FILE_ID],
+    }
+    async with _client_for(app_harness) as (client, app, headers):
+        events, final = await _drain_sse(
+            client, "/insurance/fraud-ppr/stream", body, headers, timeout=240.0
+        )
+        # Allow no_seeds / no_graph paths to skip token frames (the prompt
+        # in those modes is a one-shot abstain). Otherwise we require the
+        # bus pumped at least one token before close.
+        if final and final.get("mode") == "ppr":
+            assert any(e[0] == "token" for e in events), "ppr mode must stream tokens"
+        assert final is not None
+        assert final.get("flavor") == "fraud_ppr"
+        assert "subgraph_counts" in final
+        assert {"seeds", "actived_entities", "passages", "edges"} <= set(
+            final["subgraph_counts"].keys()
+        )
+
+
+# ============================================================
+# 6b. risk predict (GraphAgent + Sankey side-channel)
+# ============================================================
+
+
+@_NEEDS_KEYS
+async def test_risk_predict_emits_risk_subgraph(app_harness):
+    """Pre-issuance risk prediction must:
+      - drive the GraphAgent through at least one graph_explore call
+        (visible as a ``graph_subgraph`` SSE frame), and
+      - augment the ``final`` event with a ``risk_subgraph`` payload
+        that carries the documented 4-key shape.
+    """
+    body = {
+        "file_id": DEFAULT_PRIMARY_FILE_ID,
+        "customer": DEFAULT_CUSTOMER,
+        "scenario": "客户考虑在投保 6 个月内出境长期旅游",
+    }
+    async with _client_for(app_harness) as (client, app, headers):
+        events, final = await _drain_sse(
+            client, "/insurance/risk-predict/stream", body, headers, timeout=600.0
+        )
+        # The wrapper relies on stream_agent's GRAPH_SUBGRAPH passthrough;
+        # at least one graph_explore call must have happened for the
+        # canvas to populate.
+        assert any(e[0] == "graph_subgraph" for e in events), (
+            "risk-predict must trigger at least one graph_explore call"
+        )
+        assert final is not None
+        assert final.get("flavor") == "risk_predict"
+        rs = final.get("risk_subgraph")
+        assert isinstance(rs, dict), "final must carry risk_subgraph dict"
+        assert {
+            "customer_fields", "risk_factors", "triggered_clauses", "edges",
+        } <= set(rs.keys())
+        # Customer profile contributes age + gender + occupation at minimum,
+        # so the column-1 strip must never be empty.
+        assert len(rs["customer_fields"]) >= 3
+        # triggered_clauses MUST NOT carry ``sup`` — agent's read order
+        # (citations[].sup) is a separate namespace from PPR rank, and
+        # cross-linking would resolve clicks to wrong passages. Frontend
+        # joins on (file_id, page_id) instead.
+        for clause in rs["triggered_clauses"]:
+            assert "sup" not in clause, (
+                f"risk_subgraph.triggered_clauses must not carry sup; got {clause}"
+            )
+            assert {"id", "file_id", "page_id"} <= set(clause.keys())
 
 
 # ============================================================

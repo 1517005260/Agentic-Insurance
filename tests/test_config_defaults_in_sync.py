@@ -19,12 +19,13 @@ from agentic.agent.prompts import (
     CLAIM_CHECK_SYSTEM_PROMPT,
     COMPARE_SYSTEM_PROMPT,
     EXCLUSION_AUDIT_SYSTEM_PROMPT,
+    FRAUD_PPR_SYSTEM_PROMPT,
     GRAPH_SYSTEM_PROMPT,
     POLICY_CALC_SYSTEM_PROMPT,
     PROOF_SYSTEM_PROMPT,
     RAG_BUSINESS_SYSTEM_PROMPT,
     RECOMMEND_SYSTEM_PROMPT,
-    REGULATION_SUMMARIZER_SYSTEM_PROMPT,
+    RISK_PREDICT_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     WEB_AGENT_SYSTEM_PROMPT,
     WEB_RAG_SYSTEM_PROMPT,
@@ -73,12 +74,16 @@ def test_prompt_defaults_match_module_constants():
     assert CONFIG_ENTRIES_BY_KEY["prompt.graph_agent"].default is GRAPH_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.web_rag"].default is WEB_RAG_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.web_agent"].default is WEB_AGENT_SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.regulation"].default is REGULATION_SUMMARIZER_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.compare"].default is COMPARE_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.exclusion_audit"].default is EXCLUSION_AUDIT_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.recommend"].default is RECOMMEND_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.claim_check"].default is CLAIM_CHECK_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.policy_calc"].default is POLICY_CALC_SYSTEM_PROMPT
+    # ``prompt.fraud_ppr`` key + default are pinned because the runner
+    # reads the key by name and the trace flavor lives on disk under
+    # the same string — both are critical-preservation contracts.
+    assert CONFIG_ENTRIES_BY_KEY["prompt.fraud_ppr"].default is FRAUD_PPR_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.risk_predict"].default is RISK_PREDICT_SYSTEM_PROMPT
 
 
 def test_citation_default_matches_module_constant():
@@ -88,10 +93,14 @@ def test_citation_default_matches_module_constant():
 def test_tavily_defaults():
     assert CONFIG_ENTRIES_BY_KEY["tavily.max_results"].default == 5
     assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
-    assert "ia.org.hk" in CONFIG_ENTRIES_BY_KEY["tavily.include_domains_hk"].default
-    assert "nfra.gov.cn" in CONFIG_ENTRIES_BY_KEY["tavily.include_domains_cn"].default
 
 
-def test_entry_count_is_29():
-    # rag/rerank/agent core (15) + agent.web (2) + tavily (4) + prompt (8) = 29.
-    assert len(CONFIG_ENTRIES_BY_KEY) == 29
+def test_entry_count_is_35():
+    # rag/rerank/agent core (15) + agent.web (2) + tavily (2) + prompt (9) +
+    # chat.history_turns (1) + linear_rag.literal_backfill_* (3) +
+    # graph_explore.entity_lookup_* (2) + ingest.parallel_workers (1) = 35.
+    # The 9th prompt key is ``prompt.risk_predict`` (proactive
+    # pre-issuance risk prediction workbench, GraphAgent-driven).
+    # ``ingest.parallel_workers`` (admin-tuned) caps the per-process
+    # parse-stage semaphore so multi-PDF uploads OCR in parallel.
+    assert len(CONFIG_ENTRIES_BY_KEY) == 35

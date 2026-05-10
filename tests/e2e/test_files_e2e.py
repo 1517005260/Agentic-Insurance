@@ -283,7 +283,7 @@ def _purge_e2e_artifacts(root: Path) -> None:
     if not candidate_ids:
         return
     try:
-        from ingestion.index import purge_file_artifacts
+        from ingestion.index.maintenance import purge_file_artifacts
     except Exception:
         return
     for file_id in sorted(candidate_ids):
@@ -814,7 +814,7 @@ async def _seed_disposable_delete_target(root: Path, source: CorpusPdf) -> Delet
         paddle_ocr_root,
         upload_path,
     )
-    from ingestion.index import BM25IndexBuilder
+    from ingestion.index.bm25_tantivy import BM25IndexBuilder
     from storage.page_store import PageAsset
 
     file_id = f"e2e_delete_{hashlib.sha256(source.file_id.encode('utf-8')).hexdigest()[:16]}"
@@ -1001,7 +1001,7 @@ async def _assert_strict_teardown_state(
     expected_ids: set[str],
     config: pytest.Config,
 ) -> None:
-    from ingestion.index import indexed_file_ids
+    from ingestion.index.maintenance import indexed_file_ids
 
     indexed_ids = indexed_file_ids()
     db_ids = await _file_ids_in_db()
@@ -1432,20 +1432,22 @@ async def test_builder_failure_marks_file_failed_and_purges_partial(
     """
     from api.services import files as files_service
     from config.settings import upload_path
-    from ingestion.index import bm25_tantivy as bm25_module
+    import ingestion.index.bm25_tantivy as bm25_module
 
     item = CORPUS[1]
     fake_file_id = "e2e_builder_fail_target"
 
-    real_pipeline = files_service.parse_and_index
+    real_index_parsed = files_service.index_parsed
 
-    def fake_parse_and_index(*args: Any, **kwargs: Any):
+    def fake_index_parsed(parse_result, *args: Any, **kwargs: Any):
         # Mirror the real call's return shape but force one builder to
         # fail. We don't actually run paddle / dense / graph — too slow
         # for a unit-style test. We synthesize a PipelineResult that
         # exercises the (failed=True → ok=False) wiring AND drops a
         # bm25 row tagged with file_id so the post-failure purge has
-        # something concrete to clean up.
+        # something concrete to clean up. ``parse_only`` has already
+        # run upstream by the time the route hands us ``parse_result``;
+        # we ignore its content here and return a synthetic failure.
         from ingestion.index.base import IndexBuildResult
         from ingestion.paddle_ocr.parser import ParseResult
         from pipeline.parse_and_index import PipelineResult
@@ -1472,17 +1474,18 @@ async def test_builder_failure_marks_file_failed_and_purges_partial(
             encoding="utf-8",
         )
 
+        synthetic_parse = parse_result if parse_result is not None else ParseResult(
+            file_id=fake_file_id,
+            source_path="",
+            file_type=0,
+            total_pages=0,
+            output_dir="",
+            combined_markdown_path="",
+            meta_path="",
+            batches=[],
+        )
         return PipelineResult(
-            parse=ParseResult(
-                file_id=fake_file_id,
-                source_path=str(args[0]) if args else "",
-                file_type=0,
-                total_pages=0,
-                output_dir="",
-                combined_markdown_path="",
-                meta_path="",
-                batches=[],
-            ),
+            parse=synthetic_parse,
             pages=[],
             indexes=[
                 IndexBuildResult(
@@ -1500,12 +1503,12 @@ async def test_builder_failure_marks_file_failed_and_purges_partial(
                 ),
             ],
             total_seconds=0.01,
-            source=str(args[0]) if args else "",
+            source=getattr(synthetic_parse, "source_path", ""),
             ok=False,
             error="builder(s) failed: text_dense (build raised: RuntimeError: simulated dense failure)",
         )
 
-    monkeypatch.setattr(files_service, "parse_and_index", fake_parse_and_index)
+    monkeypatch.setattr(files_service, "index_parsed", fake_index_parsed)
 
     # Use the API end-to-end so the route + bg task wiring is also tested.
     blob = _corpus_pdf_path(app_harness.root, item).read_bytes()
@@ -1586,7 +1589,7 @@ async def test_purge_uploads_does_not_cross_delete_prefix_sibling(
     of an unrelated file whose name begins with ``abc_hash.`` — that's
     the cross-deletion hazard the exact-suffix fix closed."""
     from config.settings import upload_path, uploads_root
-    from ingestion.index import purge_file_artifacts
+    from ingestion.index.maintenance import purge_file_artifacts
 
     uploads_root().mkdir(parents=True, exist_ok=True)
 
