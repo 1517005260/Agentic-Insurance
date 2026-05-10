@@ -27,9 +27,11 @@ The response is uniform: ``output.results`` is a list of
 comparable WITHIN a single request — never across calls.
 """
 
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence
 
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import RERANKER_API_BASE_URL, RERANKER_API_KEY, RERANKER_MODEL
 
 
@@ -52,7 +54,9 @@ class RerankClient:
         self.api_key = api_key or RERANKER_API_KEY
         self.base_url = (base_url or RERANKER_API_BASE_URL).rstrip("/")
         self.timeout = timeout
-        self._session = make_retry_session()
+        self._session = shared_session(
+            "rerank-default", lambda: make_retry_session()
+        )
 
     def available(self) -> bool:
         return bool(self.model and self.api_key)
@@ -127,3 +131,9 @@ class RerankClient:
             "input": {"query": query, "documents": documents},
             "parameters": {"top_n": top_n, "return_documents": False},
         }
+
+
+@lru_cache(maxsize=1)
+def get_cached_rerank_client() -> "RerankClient":
+    """Process-wide singleton for the no-arg :class:`RerankClient`."""
+    return RerankClient()

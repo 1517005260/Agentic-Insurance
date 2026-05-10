@@ -9,7 +9,7 @@ import logging
 import threading
 from typing import Any, Dict, Iterator, List, Optional
 
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class StreamProtocolError(RuntimeError):
     """
 
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import CHAT_API_BASE_URL, CHAT_API_KEY, CHAT_MODEL
 
 
@@ -94,12 +95,23 @@ class LLMClient:
                 "Chat API key required. Set CHAT_API_KEY in .env or pass api_key."
             )
 
-        self._session = make_retry_session()
+        # ``read=0`` disables retries on read timeout — combined with
+        # the per-call ``timeout=(10, 120)`` it caps the wall-clock
+        # any chat() / chat_stream() call can stall at ≤ 120 s + a
+        # bit of connect/backoff. Without this override, the default
+        # ``read=total`` (=5) would let a hung relay block for
+        # 5 × 120 s before the caller sees a TimeoutError, and the
+        # preprocess wall-clock fallback (130 s) would never trigger.
+        # status / connect retries are still useful for transient
+        # 5xx and DNS hiccups, so we keep those.
+        # Process-wide pool — distinct profile so this tight retry
+        # policy doesn't bleed into other clients.
+        self._session = shared_session(
+            "chat-no-read-retry", lambda: make_retry_session(read_retries=0)
+        )
 
-        try:
-            self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        # Process-cached encoder shared with all agent / tool callsites.
+        self.tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     def count_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text))
@@ -169,7 +181,17 @@ class LLMClient:
         if self.disable_thinking:
             _apply_thinking_off(payload)
 
-        response = self._session.post(url, headers=headers, json=payload, timeout=300)
+        # ``(connect, read)`` instead of a single 300s wall: with one
+        # number, a hung relay (TCP open, no body bytes) blocks for the
+        # full 5 min and the runner can only emit a giant silent gap.
+        # 10s connect catches dead endpoints quickly; 120s read covers
+        # slow but live generations without rewarding indefinite stalls.
+        # See preprocess() for the per-call timeout fallback that turns
+        # a ReadTimeout into a usable {rewrite=query} so the pipeline
+        # still produces an answer instead of dying on the first hang.
+        response = self._session.post(
+            url, headers=headers, json=payload, timeout=(10, 120),
+        )
         response.raise_for_status()
         result = response.json()
         usage = result.get("usage", {})
@@ -253,8 +275,13 @@ class LLMClient:
         saw_done = False
         saw_finish_reason = False
         saw_malformed_data = False
+        # ``(connect, read)`` tuple: see chat() for the rationale.
+        # ``read=120`` doubles as a between-byte watchdog — if the
+        # provider stalls between SSE chunks, ``iter_lines`` raises
+        # rather than appearing to hang for the full 5-min wall the
+        # old single-int timeout used to allow.
         with self._session.post(
-            url, headers=headers, json=payload, timeout=300, stream=True
+            url, headers=headers, json=payload, timeout=(10, 120), stream=True
         ) as response:
             response.raise_for_status()
             # Some relays send ``Content-Type: text/event-stream`` without an
@@ -341,13 +368,33 @@ class LLMClient:
 
 
 def _apply_thinking_off(payload: Dict[str, Any]) -> None:
-    """Mute chain-of-thought across the relays we hit.
+    """Mute chain-of-thought on relays that route to thinking-prone models.
 
-    DeepSeek / Qwen / vLLM use different field names; sending all three
-    is the cheapest way to be portable. OpenAI strict APIs ignore
-    unknown ``extra_body`` keys, and a strict relay that rejects extras
-    would have already failed every other workbench.
+    DeepSeek / Qwen / vLLM use ``enable_thinking`` / ``chat_template_kwargs``
+    / ``extra_body``; sending all three is the cheapest way to cover them.
+
+    BUT: some OpenAI-compatible relays (e.g. yunwu.ai's gpt-4o-mini route)
+    strict-validate the request body and reject unknown root fields with
+    ``new_api_error: shell_api_error``. We therefore gate the override on
+    the model name — only send the flags for models that need them.
+    GPT / Claude / Gemini routes don't ship reasoning_content on every
+    turn (their reasoning APIs are explicit, like ``reasoning_effort``),
+    so skipping is safe.
     """
+    model = (payload.get("model") or "").lower()
+    # Models that historically emit ``reasoning_content`` even when the
+    # caller doesn't ask for thinking — needs the explicit kill switch.
+    thinking_prone = (
+        "deepseek" in model
+        or "qwen" in model
+        or "yi-" in model
+        or model.startswith("yi")
+        or "glm" in model
+        or "thinking" in model
+        or "reason" in model
+    )
+    if not thinking_prone:
+        return
     payload["enable_thinking"] = False
     payload.setdefault("chat_template_kwargs", {})["enable_thinking"] = False
     payload.setdefault("extra_body", {})["enable_thinking"] = False

@@ -1,8 +1,8 @@
 """Tavily Search client.
 
-Powers the regulation-lookup workbench. The client is intentionally tiny
-— Tavily's REST endpoint is one POST that accepts a JSON body and returns
-ranked results plus an optional LLM-style ``answer`` field.
+Powers the chat web mode + the web agent. The client is intentionally
+tiny — Tavily's REST endpoint is one POST that accepts a JSON body and
+returns ranked results plus an optional LLM-style ``answer`` field.
 
 Two methods:
 
@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import TAVILY_API_BASE_URL, TAVILY_API_KEY
 
 
@@ -48,7 +49,18 @@ class TavilyClient:
         self.api_key = api_key or TAVILY_API_KEY
         self.base_url = (base_url or TAVILY_API_BASE_URL).rstrip("/")
         self.timeout = timeout
-        self._session = make_retry_session()
+        # Default ``make_retry_session()`` uses total=5/read=5 — fine for
+        # cheap embedding/rerank calls but catastrophic for Tavily: each
+        # 30 s read timeout gets retried 5×, turning a slow first call
+        # into a ~150 s wall-clock stall (we measured 113 s for a single
+        # cold-start chat web turn). Tavily's own SLA is "1-3 s typical,
+        # 30 s outlier"; one retry is plenty. Connection retries stay at
+        # 2 in case a TLS handshake races a transient DNS hiccup.
+        # Process-wide shared session — distinct profile from the other
+        # clients because the retry policy is tighter.
+        self._session = shared_session(
+            "tavily-tight", lambda: make_retry_session(total=2, read_retries=1)
+        )
 
     def available(self) -> bool:
         return bool(self.api_key)

@@ -4,11 +4,13 @@ Returns L2-normalized float32 vectors so dot product equals cosine similarity
 downstream. Batches requests to avoid hitting per-request size limits.
 """
 
+from functools import lru_cache
 from typing import List, Optional, Sequence, Union
 
 import numpy as np
 
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import (
     EMBEDDING_API_BASE_URL,
     EMBEDDING_API_KEY,
@@ -36,7 +38,13 @@ class EmbeddingClient:
                 "Embedding API key required. Set EMBEDDING_API_KEY in .env or pass api_key."
             )
 
-        self._session = make_retry_session()
+        # Shared urllib3 connection pool keyed by retry profile so this
+        # client doesn't get its own ~30 MB session on top of the LLM /
+        # rerank / visual / Tavily clients. ``shared_session`` is
+        # documented thread-safe.
+        self._session = shared_session(
+            "embedding-default", lambda: make_retry_session()
+        )
 
     def encode(self, texts: Union[str, Sequence[str]]) -> np.ndarray:
         """Embed a string (1-D) or list of strings (2-D). L2-normalized."""
@@ -68,3 +76,15 @@ class EmbeddingClient:
         if single:
             return arr[0]
         return arr
+
+
+@lru_cache(maxsize=1)
+def get_cached_embedding_client() -> "EmbeddingClient":
+    """Process-wide singleton for the no-arg :class:`EmbeddingClient`.
+
+    Most callsites construct ``EmbeddingClient()`` with default args
+    (lifespan, ingest builders, RAG pipeline, agent factory). Each
+    instance is ~30 MB once warmed; sharing avoids the ~6× duplication.
+    Callers needing a custom model / api_key still build directly.
+    """
+    return EmbeddingClient()

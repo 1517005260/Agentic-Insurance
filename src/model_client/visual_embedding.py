@@ -27,7 +27,10 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
+from functools import lru_cache
+
 from config.http import make_retry_session
+from config.shared import shared_session
 from config.settings import (
     VISUAL_EMBEDDING_API_BASE_URL,
     VISUAL_EMBEDDING_API_KEY,
@@ -53,7 +56,9 @@ class VisualEmbeddingClient:
         self.base_url = (base_url or VISUAL_EMBEDDING_API_BASE_URL).rstrip("/")
         self.batch_size = max(1, batch_size)
         self.timeout = timeout
-        self._session = make_retry_session()
+        self._session = shared_session(
+            "visual-embedding-default", lambda: make_retry_session()
+        )
 
     def available(self) -> bool:
         return bool(self.model and self.api_key)
@@ -154,3 +159,9 @@ class VisualEmbeddingClient:
             )
         items = sorted(items, key=lambda d: d.get("index", 0))
         return [item["embedding"] for item in items]
+
+
+@lru_cache(maxsize=1)
+def get_cached_visual_embedding_client() -> "VisualEmbeddingClient":
+    """Process-wide singleton for the no-arg :class:`VisualEmbeddingClient`."""
+    return VisualEmbeddingClient()
