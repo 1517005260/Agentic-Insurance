@@ -49,10 +49,11 @@ from ingestion.index.linear_rag.backfill import (
 )
 from ingestion.index.linear_rag.ner import SpacyNER
 from ingestion.index.linear_rag.normalize import normalize_for_hash
-from model_client import EmbeddingClient
+from model_client import EmbeddingClient, get_cached_embedding_client
 from rag.channels.base import BaseChannel, ChannelHit
 from rag.preprocess import QueryContext
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 
 
 logger = logging.getLogger(__name__)
@@ -70,14 +71,18 @@ class GraphPPRChannel(BaseChannel):
         zh_spacy_model_name: Optional[str] = "zh_core_web_trf",
     ):
         self.config = config or RAGConfig()
-        self.embedding_client = embedding_client or EmbeddingClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
         self.linear_config = linear_config or LinearRAGConfig(
             embedding_client=self.embedding_client
         )
 
-        self.passage_store = EmbeddingStore(faiss_graph_passage_dir(), namespace="passage")
-        self.entity_store = EmbeddingStore(faiss_graph_entity_dir(), namespace="entity")
-        self.sentence_store = EmbeddingStore(faiss_graph_sentence_dir(), namespace="sentence")
+        # Stores are pulled from the process-wide cache (storage.embedding_store
+        # ::get_or_create_store) so the lifespan-built channel and any
+        # per-ingest LinearRAG share the same in-memory faiss / parquet
+        # handle. Avoids ~1.5 GB duplicate RSS on 8 GB hosts.
+        self.passage_store = get_or_create_store(faiss_graph_passage_dir(), namespace="passage")
+        self.entity_store = get_or_create_store(faiss_graph_entity_dir(), namespace="entity")
+        self.sentence_store = get_or_create_store(faiss_graph_sentence_dir(), namespace="sentence")
 
         self._graphml_path = faiss_graph_dir() / "LinearRAG.graphml"
         self._ner_path = faiss_graph_dir() / "ner_results.json"
@@ -130,6 +135,77 @@ class GraphPPRChannel(BaseChannel):
         self._call_lock = threading.RLock()
 
     # ----------------------------------------------------------- public API
+
+    def reload(self) -> None:
+        """Re-mmap faiss + re-read the GraphML so a fresh ingest is visible.
+
+        The whole steady-state ``__init__`` is rebuilt:
+
+        * three :class:`EmbeddingStore` handles are reconstructed —
+          faiss / parquet are not auto-reloading caches, so without this
+          a channel built before any ingest stays at ``len() == 0``
+          forever;
+        * the igraph ``Graph`` is re-read from disk if the GraphML now
+          exists (the original ``__init__`` left ``self.graph = None``
+          on first boot when the file did not yet exist);
+        * vertex-name / passage-vertex indexes are recomputed against
+          the new graph;
+        * lazy NER / mention-map / gazetteer caches are dropped so the
+          next query rebuilds from the current entity surfaces.
+
+        The spaCy model reference is preserved — it is heavy to load
+        (~8s, ~1.6 GB heap) and unaffected by ingest data.
+
+        Held under ``_call_lock`` for the swap so a concurrent retrieve
+        cannot read a half-rebuilt state.
+        """
+        with self._call_lock:
+            # Same shared-cache lookup as ``__init__``. The cache
+            # returns the *same* object as before, so reassignment is
+            # idempotent. To force the cached store to pick up
+            # out-of-band on-disk changes (admin restored a backup,
+            # operator hand-edited faiss/), explicitly call
+            # ``reload_from_disk()`` on each store — that drops the
+            # in-memory state under the per-store lock and re-runs
+            # ``_load`` against the current artifacts. This restores
+            # the original ``/admin/refresh-indexes`` contract that was
+            # silently broken when the cache started returning the same
+            # object on every ``reload()`` call.
+            self.passage_store = get_or_create_store(
+                faiss_graph_passage_dir(), namespace="passage"
+            )
+            self.passage_store.reload_from_disk()
+            self.entity_store = get_or_create_store(
+                faiss_graph_entity_dir(), namespace="entity"
+            )
+            self.entity_store.reload_from_disk()
+            self.sentence_store = get_or_create_store(
+                faiss_graph_sentence_dir(), namespace="sentence"
+            )
+            self.sentence_store.reload_from_disk()
+
+            if self._graphml_path.is_file():
+                self.graph = ig.Graph.Read_GraphML(str(self._graphml_path))
+            else:
+                self.graph = None
+
+            self._name_to_vidx = {}
+            self._passage_vidx = []
+            if self.graph is not None:
+                self._name_to_vidx = {v["name"]: v.index for v in self.graph.vs}
+                if "vertex_type" in self.graph.vs.attributes():
+                    self._passage_vidx = [
+                        v.index for v in self.graph.vs if v["vertex_type"] == "passage"
+                    ]
+                else:
+                    passage_hashes = set(self.passage_store.hash_ids)
+                    self._passage_vidx = [
+                        v.index for v in self.graph.vs if v["name"] in passage_hashes
+                    ]
+
+            self._entity_to_sents = None
+            self._sent_to_entities = None
+            self._gazetteer_automaton = None
 
     def retrieve(self, ctx: QueryContext) -> List[ChannelHit]:
         # Hold ``_call_lock`` for the whole body so a downstream caller
@@ -318,11 +394,16 @@ class GraphPPRChannel(BaseChannel):
         if len(self.entity_store) == 0:
             return None
         surfaces = self.entity_store.hash_id_to_text
-        # Mirror the ingest-time backfill defaults: short / single-word
-        # surfaces get filtered to avoid spurious "us" / "irs" hits.
-        # TODO(config-center): expose these to admin tunables.
+        # Mirror the ingest-time backfill defaults — same admin knob
+        # tunes both ingest backfill and query-time PPR gazetteer:
+        # short / single-word surfaces get filtered to avoid spurious
+        # "us" / "irs" hits. Sourced from ``self.linear_config`` which
+        # ConfigStore.materialize_linear_rag_config() injects per
+        # request from admin overrides.
         automaton, n_kept = build_gazetteer_automaton(
-            surfaces, min_surface_chars=4, multi_word_only=True
+            surfaces,
+            min_surface_chars=self.linear_config.literal_backfill_min_chars,
+            multi_word_only=self.linear_config.literal_backfill_multi_word_only,
         )
         if n_kept == 0:
             return None
@@ -541,7 +622,13 @@ class GraphPPRChannel(BaseChannel):
         """
         # Same lock as :meth:`retrieve` — prevents the gazetteer /
         # spaCy state from interleaving with a concurrent agent call
-        # on the shared channel singleton.
+        # on the shared channel singleton AND keeps a concurrent
+        # ``reload()`` from swapping the entity_store / graph out
+        # mid-payload-assembly. Earlier versions released the lock
+        # after ``_materialize_hits`` and then read
+        # ``self.entity_store.hash_id_to_text`` outside; under refresh
+        # that yielded vertex indices from the old graph paired with
+        # surface text from the new entity store.
         with self._call_lock:
             if self.graph is None or len(self.passage_store) == 0:
                 return {"mode": "no_graph", "seeds": [], "actived_entities": {}, "passages": []}
@@ -559,30 +646,31 @@ class GraphPPRChannel(BaseChannel):
             ranked = self._run_ppr(node_weights)
             passages = self._materialize_hits(ranked, file_ids)
 
-        # Surface form is in entity_store keyed by hash_id.
-        ent_text = self.entity_store.hash_id_to_text
-        return {
-            "mode": "ppr",
-            "seeds": [
-                {
-                    "hash_id": hid,
-                    "vertex_idx": vidx,
-                    "surface": ent_text.get(hid, ""),
-                    "sim": float(sim),
-                }
-                for hid, vidx, sim in seeds
-            ],
-            "actived_entities": {
-                hid: {
-                    "vertex_idx": vidx,
-                    "surface": ent_text.get(hid, ""),
-                    "score": float(score),
-                    "iteration_tier": int(tier),
-                }
-                for hid, (vidx, score, tier) in actived.items()
-            },
-            "passages": passages,  # List[ChannelHit] — has file_id / page_id / score
-        }
+            # Final payload assembly stays inside the lock for the
+            # consistency reason above.
+            ent_text = self.entity_store.hash_id_to_text
+            return {
+                "mode": "ppr",
+                "seeds": [
+                    {
+                        "hash_id": hid,
+                        "vertex_idx": vidx,
+                        "surface": ent_text.get(hid, ""),
+                        "sim": float(sim),
+                    }
+                    for hid, vidx, sim in seeds
+                ],
+                "actived_entities": {
+                    hid: {
+                        "vertex_idx": vidx,
+                        "surface": ent_text.get(hid, ""),
+                        "score": float(score),
+                        "iteration_tier": int(tier),
+                    }
+                    for hid, (vidx, score, tier) in actived.items()
+                },
+                "passages": passages,  # List[ChannelHit] — has file_id / page_id / score
+            }
 
     # ----------------------------------------------------------- materialize
 

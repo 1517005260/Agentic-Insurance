@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 from config import RAGConfig
-from model_client import RerankClient
+from model_client import RerankClient, get_cached_rerank_client
 from storage.page_store import PageAsset
 
 
@@ -28,7 +28,7 @@ def rerank_pages(
     ``relevance_score`` is comparable only within this request.
     """
     cfg = config or RAGConfig()
-    rc = client or RerankClient()
+    rc = client or get_cached_rerank_client()
     if not pages or not rc.available():
         return [RerankedPage(page=p, score=0.0) for p in pages[: cfg.rerank_top_n]]
 

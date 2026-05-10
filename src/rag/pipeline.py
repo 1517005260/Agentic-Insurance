@@ -4,11 +4,19 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import RAGConfig
 from config.settings import page_assets_root
-from model_client import EmbeddingClient, LLMClient, RerankClient, VisualEmbeddingClient
+from model_client import (
+    EmbeddingClient,
+    LLMClient,
+    RerankClient,
+    VisualEmbeddingClient,
+    get_cached_embedding_client,
+    get_cached_rerank_client,
+    get_cached_visual_embedding_client,
+)
 from rag.aggregate import FusedHit, rrf
 from rag.answer import answer as answer_call
 from rag.channels import (
@@ -64,9 +72,9 @@ class RAGPipeline:
     ):
         self.config = config or RAGConfig()
         self.llm = llm or LLMClient()
-        self.embedding_client = embedding_client or EmbeddingClient()
-        self.visual_client = visual_client or VisualEmbeddingClient()
-        self.rerank_client = rerank_client or RerankClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
+        self.visual_client = visual_client or get_cached_visual_embedding_client()
+        self.rerank_client = rerank_client or get_cached_rerank_client()
         self.page_store = page_store or self._default_page_store()
 
         if channels is None:
@@ -141,6 +149,7 @@ class RAGPipeline:
         pages_block_provider: Optional[Callable[[Sequence], str]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
         config_override: Optional[RAGConfig] = None,
+        history: Optional[List[Tuple[str, str]]] = None,
     ) -> AnswerResult:
         """Run the full RAG pipeline.
 
@@ -195,12 +204,40 @@ class RAGPipeline:
 
         emit("status", {"phase": "preprocess"})
         t0 = time.perf_counter()
+        # Multi-turn: rewrite stage gets prior user queries (for
+        # coreference resolution); answer stage gets full (q, a) pairs
+        # below. HyDE is intentionally history-free (anchor-embedding
+        # for the *current* topic, not a coreference-resolution task).
+        history_user_only = (
+            [q for q, _a in history] if history else None
+        )
         # Pass the raw on_event (not wrapped emit) so preprocess can
         # short-circuit when no consumer is listening — same pattern
         # used by _retrieve_all below.
         ctx = preprocess(
-            query, llm=self.llm, file_ids=file_ids, on_event=on_event,
+            query,
+            llm=self.llm,
+            file_ids=file_ids,
+            on_event=on_event,
+            history_user_only=history_user_only,
         )
+        # Multi-turn: when history is present, swap the standalone
+        # rewrite into ctx.query so retrieval channels (semantic
+        # text/vision, BM25, regex, graph_ppr) and rerank operate on
+        # the coreference-resolved form. Without this, only BM25 +
+        # regex (which use ctx.regexes / ctx.rewrite explicitly)
+        # benefit from the rewrite — semantic text uses ctx.hyde or
+        # ctx.query, semantic vision uses ctx.query, rerank uses raw
+        # ``query`` — all of which would still be the ambiguous
+        # "它的免赔额" form. Rerank-side query (``query`` local) is
+        # likewise swapped below. Single-turn (history is None) keeps
+        # the original ctx so byte-level identical with experiment
+        # scripts.
+        retrieval_query = query
+        if history and ctx.rewrite and ctx.rewrite.strip() and ctx.rewrite.strip() != query.strip():
+            from dataclasses import replace as _replace
+            ctx = _replace(ctx, query=ctx.rewrite)
+            retrieval_query = ctx.rewrite
         timings["preprocess"] = time.perf_counter() - t0
         if session is not None:
             session.snapshot(
@@ -299,7 +336,7 @@ class RAGPipeline:
 
         emit("status", {"phase": "rerank", "candidates": len(candidate_pages)})
         reranked = rerank_pages(
-            query=query,
+            query=retrieval_query,  # standalone form when history is present
             pages=candidate_pages,
             config=effective_config,
             client=self.rerank_client,
@@ -370,6 +407,7 @@ class RAGPipeline:
             stream=stream,
             on_event=on_event,
             cancel_check=cancel_check,
+            history=history,
         )
         timings["answer"] = time.perf_counter() - t0
 

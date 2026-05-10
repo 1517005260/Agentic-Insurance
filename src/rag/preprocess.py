@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
@@ -148,16 +148,55 @@ def hyde_call(query: str, llm: LLMClient) -> str:
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.DOTALL)
 
 
-def rewrite_regex_call(query: str, llm: LLMClient) -> Dict[str, Any]:
+def _format_history_block(history_user_only: List[str]) -> str:
+    """Format prior user queries as a coreference-resolution prefix.
+
+    Only the user side: rewrite is about resolving "它 / that one /
+    上一个" references in the *current* question, not reasoning about
+    the assistant's prior answers. Including the assistant text would
+    bloat the cheap rewrite call without changing the rewrite output
+    on questions that aren't ambiguous in the first place.
+    """
+    if not history_user_only:
+        return ""
+    lines = [f"  T{i+1}: {q}" for i, q in enumerate(history_user_only)]
+    return (
+        "Conversation history (user questions only, oldest → newest):\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
+def rewrite_regex_call(
+    query: str,
+    llm: LLMClient,
+    *,
+    history_user_only: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Return ``{"rewrite": str, "lang": str, "regexes": [...]}``.
 
     LLMs occasionally wrap JSON in code fences despite instructions; we
     strip a single fence non-destructively and then parse. On parse
     failure we degrade to a safe empty result rather than crashing the
     pipeline — the BM25/semantic/PPR channels still work.
+
+    ``history_user_only`` (optional) prepends prior user questions so
+    the rewrite can resolve references ("它的免赔额" → "AXA 盛利II
+    的免赔额"). Default ``None`` keeps single-turn behaviour.
     """
+    history_block = _format_history_block(history_user_only or [])
+    prompt = (
+        history_block
+        + (
+            "Resolve any references in the *current* question to entities mentioned above, "
+            "writing the rewrite as a self-contained, standalone question.\n\n"
+            if history_block
+            else ""
+        )
+        + _REWRITE_PROMPT.format(query=query)
+    )
     raw = llm.chat(
-        messages=[{"role": "user", "content": _REWRITE_PROMPT.format(query=query)}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
     )["message"].get("content", "").strip()
 
@@ -206,6 +245,18 @@ def rewrite_regex_call(query: str, llm: LLMClient) -> Dict[str, Any]:
 # to show "what query rewrite the system is using" — a preview.
 _PREPROCESS_PREVIEW_CHARS = 240
 
+# Wall-clock budget for the *parallel* HyDE + rewrite phase. The
+# upstream LLM client now uses a (10s, 120s) connect/read timeout,
+# but a stalled relay that ships a single keep-alive byte every 119s
+# would still drag this stage out indefinitely. When the wall fires
+# we cancel any in-flight future, emit synthetic ``done`` events with
+# safe fallbacks (rewrite = original query, empty regex list), and
+# let the rest of the pipeline run instead of hanging the whole
+# request. The user-visible failure mode flips from "RAG silently
+# never produces tokens" to "answer is computed against the un-rewritten
+# query" — degraded but responsive.
+_PREPROCESS_TIMEOUT_S: float = 130.0
+
 
 def preprocess(
     query: str,
@@ -213,6 +264,7 @@ def preprocess(
     file_ids: List[str] | None = None,
     *,
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    history_user_only: Optional[List[str]] = None,
 ) -> QueryContext:
     """Run HyDE + rewrite/regex calls in parallel, then synthesize QueryContext.
 
@@ -239,7 +291,14 @@ def preprocess(
         except Exception:
             logger.exception("preprocess on_event failed")
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Manual lifecycle (no ``with`` block): the context-manager exit
+    # calls ``shutdown(wait=True)``, which would block on hung LLM
+    # futures and defeat the wall-clock fallback below. We instead
+    # call ``shutdown(wait=False)`` from the ``finally`` so the pool
+    # background-cleans the cancelled futures while the caller
+    # proceeds with the safe-fallback ``meta`` dict.
+    pool = ThreadPoolExecutor(max_workers=2)
+    try:
         # We push start events BEFORE submitting so the frontend can
         # show "HyDE 启动 / rewrite 启动" right away — submit() is
         # near-instant but the LLM round-trip is 1-3s, so seeing the
@@ -249,51 +308,148 @@ def preprocess(
         t0_hyde = time.perf_counter()
         t0_rewrite = time.perf_counter()
         fut_hyde = pool.submit(hyde_call, query, llm)
-        fut_rewrite = pool.submit(rewrite_regex_call, query, llm)
+        # Only the rewrite path consumes history (coreference resolution);
+        # HyDE is a hypothetical answer for embedding anchoring and would
+        # see no benefit, only added prompt cost.
+        fut_rewrite = pool.submit(
+            rewrite_regex_call,
+            query,
+            llm,
+            history_user_only=history_user_only,
+        )
 
         # as_completed lets the faster path's "done" event fire as
         # soon as it finishes, even if the slower one hasn't returned
         # yet — that's the whole point of running them in parallel.
+        # The ``timeout`` argument is a wall-clock fence on the *whole*
+        # iteration: when it fires (e.g. one of the LLM calls has hung
+        # past the upstream read timeout's keep-alive window) we
+        # convert any unfinished futures into safe-fallback events so
+        # the rest of the pipeline sees usable data.
         fut_to_step = {fut_hyde: "hyde", fut_rewrite: "rewrite"}
+        fut_t0 = {fut_hyde: t0_hyde, fut_rewrite: t0_rewrite}
+        remaining = {fut_hyde, fut_rewrite}
         hyde: str = ""
-        meta: Dict[str, Any] = {}
-        for fut in as_completed([fut_hyde, fut_rewrite]):
-            step = fut_to_step[fut]
-            if step == "hyde":
-                elapsed_ms = int((time.perf_counter() - t0_hyde) * 1000)
-                hyde = fut.result()
-                _emit(
-                    "preprocess",
-                    {
-                        "step": "hyde",
-                        "phase": "done",
-                        "elapsed_ms": elapsed_ms,
-                        "hyde_preview": (hyde or "")[:_PREPROCESS_PREVIEW_CHARS],
-                        "hyde_chars": len(hyde or ""),
-                    },
-                )
-            else:
-                elapsed_ms = int((time.perf_counter() - t0_rewrite) * 1000)
-                meta = fut.result()
-                _emit(
-                    "preprocess",
-                    {
-                        "step": "rewrite",
-                        "phase": "done",
-                        "elapsed_ms": elapsed_ms,
-                        "lang": meta.get("lang"),
-                        "rewrite": meta.get("rewrite", ""),
-                        "regexes": [
-                            {
-                                "pattern": r.pattern,
-                                "weight": r.weight,
-                                "rationale": r.rationale,
-                            }
-                            for r in meta.get("regexes", [])
-                        ],
-                    },
-                )
+        meta: Optional[Dict[str, Any]] = None
+        try:
+            for fut in as_completed([fut_hyde, fut_rewrite], timeout=_PREPROCESS_TIMEOUT_S):
+                remaining.discard(fut)
+                step = fut_to_step[fut]
+                elapsed_ms = int((time.perf_counter() - fut_t0[fut]) * 1000)
+                if step == "hyde":
+                    try:
+                        hyde = fut.result()
+                    except Exception as exc:
+                        # A blow-up inside the LLM call (HTTP 500,
+                        # parse error, …) shouldn't kill RAG — log
+                        # and proceed with empty HyDE so the dense
+                        # channel still queries against the bare
+                        # question.
+                        logger.warning("preprocess hyde call raised: %s", exc)
+                        hyde = ""
+                    _emit(
+                        "preprocess",
+                        {
+                            "step": "hyde",
+                            "phase": "done",
+                            "elapsed_ms": elapsed_ms,
+                            "hyde_preview": (hyde or "")[:_PREPROCESS_PREVIEW_CHARS],
+                            "hyde_chars": len(hyde or ""),
+                        },
+                    )
+                else:
+                    try:
+                        meta = fut.result()
+                    except Exception as exc:
+                        logger.warning("preprocess rewrite call raised: %s", exc)
+                        meta = {
+                            "rewrite": query,
+                            "lang": detect_lang_local(query),
+                            "regexes": [],
+                        }
+                    _emit(
+                        "preprocess",
+                        {
+                            "step": "rewrite",
+                            "phase": "done",
+                            "elapsed_ms": elapsed_ms,
+                            "lang": meta.get("lang"),
+                            "rewrite": meta.get("rewrite", ""),
+                            "regexes": [
+                                {
+                                    "pattern": r.pattern,
+                                    "weight": r.weight,
+                                    "rationale": r.rationale,
+                                }
+                                for r in meta.get("regexes", [])
+                            ],
+                        },
+                    )
+        except FutTimeout:
+            # Wall-clock fired with one or both futures still running.
+            # Emit synthetic done events so the SSE consumer sees
+            # closure on every step it saw a "start" for, then
+            # continue with safe fallbacks. ``cancel()`` is best-effort
+            # — a future already executing the LLM HTTP call can't
+            # actually stop the call, but it does prevent the result
+            # from being silently consumed later.
+            for fut in remaining:
+                step = fut_to_step[fut]
+                fut.cancel()
+                elapsed_ms = int((time.perf_counter() - fut_t0[fut]) * 1000)
+                if step == "hyde":
+                    hyde = ""
+                    _emit(
+                        "preprocess",
+                        {
+                            "step": "hyde",
+                            "phase": "done",
+                            "elapsed_ms": elapsed_ms,
+                            "hyde_preview": "",
+                            "hyde_chars": 0,
+                            "error": "timeout",
+                        },
+                    )
+                else:
+                    meta = {
+                        "rewrite": query,
+                        "lang": detect_lang_local(query),
+                        "regexes": [],
+                    }
+                    _emit(
+                        "preprocess",
+                        {
+                            "step": "rewrite",
+                            "phase": "done",
+                            "elapsed_ms": elapsed_ms,
+                            "lang": meta["lang"],
+                            "rewrite": meta["rewrite"],
+                            "regexes": [],
+                            "error": "timeout",
+                        },
+                    )
+            logger.warning(
+                "preprocess hit %.1fs wall: %d future(s) cancelled with fallbacks",
+                _PREPROCESS_TIMEOUT_S, len(remaining),
+            )
+    finally:
+        # ``wait=False`` is the whole point: a hung LLM future would
+        # block ``shutdown(wait=True)`` (the implicit ``with`` exit)
+        # and re-stretch the wall-clock fence we just enforced. The
+        # background thread leaks until the LLM call eventually times
+        # out at the chat-client layer (timeout=(10, 120) + read=0
+        # retries → ≤ ~130 s), then the pool is GC'd cleanly.
+        pool.shutdown(wait=False)
 
+    if meta is None:
+        # Both futures hit the wall (or the rewrite future raised before
+        # ever returning a dict). Make sure downstream code never reads
+        # ``meta["lang"]`` against a None.
+        meta = {
+            "rewrite": query,
+            "lang": detect_lang_local(query),
+            "regexes": [],
+        }
     lang = sanity_check_lang(query, meta["lang"])
     return QueryContext(
         query=query,

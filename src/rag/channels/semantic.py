@@ -20,10 +20,16 @@ from typing import List, Optional
 
 from config import RAGConfig
 from config.settings import faiss_dense_dir, faiss_visual_dir
-from model_client import EmbeddingClient, VisualEmbeddingClient
+from model_client import (
+    EmbeddingClient,
+    VisualEmbeddingClient,
+    get_cached_embedding_client,
+    get_cached_visual_embedding_client,
+)
 from rag.channels.base import BaseChannel, ChannelHit, RawHit, aggregate_per_page
 from rag.preprocess import QueryContext
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 
 
 class SemanticChannel(BaseChannel):
@@ -38,21 +44,23 @@ class SemanticChannel(BaseChannel):
         visual_store: Optional[EmbeddingStore] = None,
     ):
         self.config = config or RAGConfig()
-        self.embedding_client = embedding_client or EmbeddingClient()
-        self.visual_client = visual_client or VisualEmbeddingClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
+        self.visual_client = visual_client or get_cached_visual_embedding_client()
         self._text_store = text_store
         self._visual_store = visual_store
 
     @property
     def text_store(self) -> EmbeddingStore:
         if self._text_store is None:
-            self._text_store = EmbeddingStore(faiss_dense_dir(), namespace="dense")
+            # Pull from process cache so the dense store is the same
+            # in-memory faiss as the ingest builder writes into.
+            self._text_store = get_or_create_store(faiss_dense_dir(), namespace="dense")
         return self._text_store
 
     @property
     def visual_store(self) -> EmbeddingStore:
         if self._visual_store is None:
-            self._visual_store = EmbeddingStore(faiss_visual_dir(), namespace="visual")
+            self._visual_store = get_or_create_store(faiss_visual_dir(), namespace="visual")
         return self._visual_store
 
     # ---------------------------------------------------------- retrieve ----

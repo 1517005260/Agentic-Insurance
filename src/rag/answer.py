@@ -16,7 +16,7 @@ the ``[^k]`` legend after the question. Algorithm callers pass neither.
 """
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from config import RAGConfig
 from model_client import LLMClient
@@ -84,6 +84,7 @@ def answer(
     stream: bool = False,
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    history: Optional[List[Tuple[str, str]]] = None,
 ) -> str:
     """Run the answer LLM and return its plain-text response.
 
@@ -100,6 +101,14 @@ def answer(
     ``citation_legend`` (already-rendered text from
     ``CitationBuilder``) is appended to the user message between the
     pages block and the "Answer:" cue.
+
+    ``history`` (optional) is a chronological list of
+    ``(prior_user_query, prior_assistant_answer)`` pairs that gets
+    spliced between the system prompt and the current user message.
+    The current turn's pages-block + legend stays anchored to the
+    *current* query — prior turns' citations don't carry over because
+    sup numbering is per-turn (Phase 2-Δ contract). Default ``None``
+    keeps the single-turn behaviour for experiment scripts.
     """
     cfg = config or RAGConfig()
     client = llm or LLMClient()
@@ -115,10 +124,12 @@ def answer(
     else:
         user_msg = _USER_TEMPLATE.format(query=query, pages_block=pages_block)
 
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_msg},
-    ]
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": sys_prompt}]
+    if history:
+        for prev_q, prev_a in history:
+            messages.append({"role": "user", "content": prev_q})
+            messages.append({"role": "assistant", "content": prev_a})
+    messages.append({"role": "user", "content": user_msg})
 
     if stream:
         return _answer_stream(client, messages, cfg, on_event, query, cancel_check)
