@@ -1,7 +1,7 @@
 """Prompts for the web-only routes.
 
 * :data:`WEB_RAG_SYSTEM_PROMPT` — single-call summarizer used by the
-  ``web`` chat mode and the regulation-search workbench.
+  ``web`` chat mode.
 * :data:`WEB_AGENT_SYSTEM_PROMPT` — multi-step web agent that owns
   ``web_search`` + ``web_fetch`` and nothing else.
 

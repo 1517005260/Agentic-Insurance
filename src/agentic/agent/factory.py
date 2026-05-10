@@ -16,7 +16,7 @@ Centralizing construction here keeps three properties straight:
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Any, Dict, TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from config.config_store import ConfigStore
@@ -45,7 +45,13 @@ from agentic.tools.acquisition import (
 from agentic.closure.inventory import InventoryAdapter
 from agentic.tools.registry import ToolRegistry
 from config.settings import page_assets_root
-from model_client import EmbeddingClient, LLMClient, VisualEmbeddingClient
+from model_client import (
+    EmbeddingClient,
+    LLMClient,
+    VisualEmbeddingClient,
+    get_cached_embedding_client,
+    get_cached_visual_embedding_client,
+)
 from rag.channels.graph_ppr import GraphPPRChannel
 from storage.inventory_store import InventoryStore
 from storage.page_store import PageStore
@@ -67,6 +73,7 @@ def build_default_agent(
     max_loops: int = 12,
     max_token_budget: int = 128_000,
     verbose: bool = False,
+    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> BaseAgent:
     """Build a BaseAgent with the eight acquisition tools pre-registered.
 
@@ -77,8 +84,8 @@ def build_default_agent(
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)
 
-    embedding_client = embedding_client or EmbeddingClient()
-    visual_client = visual_client or VisualEmbeddingClient()
+    embedding_client = embedding_client or get_cached_embedding_client()
+    visual_client = visual_client or get_cached_visual_embedding_client()
     llm_client = llm_client or LLMClient()
 
     graph_channel = graph_channel or GraphPPRChannel(
@@ -100,7 +107,13 @@ def build_default_agent(
     )
     registry.register(Bm25SearchTool(page_store=page_store, inventory=inventory))
     registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
-    registry.register(GraphExploreTool(channel=graph_channel, inventory=inventory))
+    registry.register(
+        GraphExploreTool(
+            channel=graph_channel,
+            inventory=inventory,
+            **(graph_explore_kwargs or {}),
+        )
+    )
     registry.register(ReadTool(page_store=page_store, inventory=inventory))
     registry.register(CodeRunTool())
 
@@ -128,6 +141,7 @@ def build_proof_agent(
     max_loops: int = 16,
     max_token_budget: int = 128_000,
     verbose: bool = False,
+    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ProofAgent:
     """Build a ProofAgent with the eight acquisition tools wired in.
 
@@ -139,8 +153,8 @@ def build_proof_agent(
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory_store = inventory or InventoryStore(page_store=page_store)
 
-    embedding_client = embedding_client or EmbeddingClient()
-    visual_client = visual_client or VisualEmbeddingClient()
+    embedding_client = embedding_client or get_cached_embedding_client()
+    visual_client = visual_client or get_cached_visual_embedding_client()
     llm_client = llm_client or LLMClient()
 
     graph_channel = graph_channel or GraphPPRChannel(
@@ -160,7 +174,13 @@ def build_proof_agent(
     )
     acquisition.register(Bm25SearchTool(page_store=page_store, inventory=inventory_store))
     acquisition.register(PatternSearchTool(page_store=page_store, inventory=inventory_store))
-    acquisition.register(GraphExploreTool(channel=graph_channel, inventory=inventory_store))
+    acquisition.register(
+        GraphExploreTool(
+            channel=graph_channel,
+            inventory=inventory_store,
+            **(graph_explore_kwargs or {}),
+        )
+    )
     acquisition.register(ReadTool(page_store=page_store, inventory=inventory_store))
     acquisition.register(CodeRunTool())
 
@@ -189,6 +209,7 @@ def build_graph_agent(
     max_loops: int = 8,
     max_token_budget: int = 64_000,
     verbose: bool = False,
+    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> BaseAgent:
     """Build a BaseAgent specialised for knowledge-graph navigation.
 
@@ -210,7 +231,7 @@ def build_graph_agent(
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)
 
-    embedding_client = embedding_client or EmbeddingClient()
+    embedding_client = embedding_client or get_cached_embedding_client()
     llm_client = llm_client or LLMClient()
 
     graph_channel = graph_channel or GraphPPRChannel(
@@ -218,7 +239,13 @@ def build_graph_agent(
     )
 
     registry = ToolRegistry()
-    registry.register(GraphExploreTool(channel=graph_channel, inventory=inventory))
+    registry.register(
+        GraphExploreTool(
+            channel=graph_channel,
+            inventory=inventory,
+            **(graph_explore_kwargs or {}),
+        )
+    )
     registry.register(ReadTool(page_store=page_store, inventory=inventory))
 
     return BaseAgent(

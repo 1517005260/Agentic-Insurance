@@ -25,7 +25,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 from agentic.agent.prompts import SYSTEM_PROMPT
 from agentic.core.context import AgentContext
@@ -54,10 +54,8 @@ class BaseAgent:
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
         self.verbose = verbose
-        try:
-            self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        # Process-cached encoder — six callsites used to each hold ~50 MB.
+        self.tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     def warm_up(self) -> Dict[str, float]:
         """Invoke each tool's optional ``warm_up()`` hook.
@@ -147,6 +145,7 @@ class BaseAgent:
         max_loops: Optional[int] = None,
         max_token_budget: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         """Run the tool-calling loop.
 
@@ -161,6 +160,13 @@ class BaseAgent:
         ``None`` falls back to the per-instance defaults so existing
         call sites — every experiment script — keep their byte-identical
         behavior.
+
+        ``cancel_check`` (optional) is a no-arg predicate polled at
+        each loop boundary; when it returns True the loop exits with
+        ``exit_reason='client_disconnect'``. The runner side wires it
+        to ``EventBus.is_closed`` so a TCP disconnect stops the agent
+        from spending more LLM tokens. Default ``None`` is the legacy
+        always-False behavior.
 
         Emitted events:
         * ``status`` — phase transitions (``thinking`` per loop,
@@ -220,6 +226,18 @@ class BaseAgent:
 
         for loop_idx in range(effective_max_loops):
             loop_count = loop_idx + 1
+
+            # Cancellation gate. Polled at the loop boundary so the
+            # in-flight tool-call / LLM round-trip is allowed to finish
+            # — interrupting a tool mid-execute would leave the agent's
+            # message history desynced from any side effects. The
+            # runner side wires this to ``EventBus.is_closed`` so a
+            # client disconnect stops the agent from spinning more
+            # loops.
+            if cancel_check is not None and cancel_check():
+                emit("status", {"phase": "client_disconnect"})
+                early_exit_reason = "client_disconnect"
+                break
 
             current_tokens = self._calculate_message_tokens(
                 messages, system_prompt=effective_system_prompt

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 import tantivy
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 from agentic.tools.acquisition._common import (
     err,
@@ -59,10 +59,7 @@ class Bm25SearchTool(BaseTool):
         self.inventory = inventory
         self.index_path = Path(index_path) if index_path else (bm25_root() / "index")
         self._index: Optional[tantivy.Index] = None
-        try:
-            self._tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self._tokenizer = tiktoken.get_encoding("cl100k_base")
+        self._tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     @property
     def name(self) -> str:

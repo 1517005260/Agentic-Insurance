@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 from agentic.tools.acquisition._common import (
     err,
@@ -43,8 +43,14 @@ from agentic.tools.acquisition._common import (
 )
 from agentic.tools.base import BaseTool
 from config.settings import faiss_dense_dir, faiss_visual_dir
-from model_client import EmbeddingClient, VisualEmbeddingClient
+from model_client import (
+    EmbeddingClient,
+    VisualEmbeddingClient,
+    get_cached_embedding_client,
+    get_cached_visual_embedding_client,
+)
 from storage import EmbeddingStore
+from storage.embedding_store import get_or_create_store
 from storage.inventory_store import InventoryStore
 from storage.page_store import PageStore
 
@@ -75,28 +81,30 @@ class SemanticSearchTool(BaseTool):
         self.inventory = inventory
         self._text_store_dir = Path(text_store_dir) if text_store_dir else faiss_dense_dir()
         self._vision_store_dir = Path(vision_store_dir) if vision_store_dir else faiss_visual_dir()
-        self.embedding_client = embedding_client or EmbeddingClient()
-        self.visual_client = visual_client or VisualEmbeddingClient()
+        self.embedding_client = embedding_client or get_cached_embedding_client()
+        self.visual_client = visual_client or get_cached_visual_embedding_client()
 
         self._text_store: Optional[EmbeddingStore] = None
         self._vision_store: Optional[EmbeddingStore] = None
-        try:
-            self._tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self._tokenizer = tiktoken.get_encoding("cl100k_base")
+        self._tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     # ------------------------------------------------------------- stores
 
     @property
     def text_store(self) -> EmbeddingStore:
         if self._text_store is None:
-            self._text_store = EmbeddingStore(self._text_store_dir, namespace="dense")
+            # Process-cached — same handle as the ingest builder writes to.
+            self._text_store = get_or_create_store(
+                self._text_store_dir, namespace="dense"
+            )
         return self._text_store
 
     @property
     def vision_store(self) -> EmbeddingStore:
         if self._vision_store is None:
-            self._vision_store = EmbeddingStore(self._vision_store_dir, namespace="visual")
+            self._vision_store = get_or_create_store(
+                self._vision_store_dir, namespace="visual"
+            )
         return self._vision_store
 
     # ------------------------------------------------------------- schema

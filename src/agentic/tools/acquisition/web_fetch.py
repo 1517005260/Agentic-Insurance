@@ -25,6 +25,7 @@ import requests
 from agentic.tools.acquisition._common import err, ok
 from agentic.tools.base import BaseTool
 from config.http import make_retry_session
+from config.shared import shared_session
 
 
 # Hard escape hatch for environments where DNS is intercepted by a
@@ -257,7 +258,12 @@ class WebFetchTool(BaseTool):
         # Lower retries than the LLM/embedding session — unreachable
         # external sites are noise; we shouldn't burn 5 retries on
         # every 404. 2 attempts cover transient DNS / TCP blips.
-        self._session = make_retry_session(total=2, backoff_factor=0.5)
+        # Process-wide pool by retry profile; many WebFetchTool instances
+        # (one per agent) share the same urllib3 connection pool.
+        self._session = shared_session(
+            "web-fetch-tight",
+            lambda: make_retry_session(total=2, backoff_factor=0.5),
+        )
 
     @property
     def name(self) -> str:

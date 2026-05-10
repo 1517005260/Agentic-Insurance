@@ -26,7 +26,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 from agentic.tools.acquisition._common import Scope, err, ok, parse_scope
 from agentic.tools.acquisition._vlm import VlmReader, default_vlm_reader
@@ -58,10 +58,7 @@ class ReadTool(BaseTool):
         self.inventory = inventory
         self.vlm_reader = vlm_reader if vlm_reader is not None else default_vlm_reader()
         self.vlm_parallelism = max(1, int(vlm_parallelism))
-        try:
-            self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     @property
     def name(self) -> str:

@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-import tiktoken
+from config.shared import shared_tiktoken_encoder
 
 from agentic.agent.base import _make_emitter
 from agentic.agent.prompts.proof_system import PROOF_SYSTEM_PROMPT
@@ -80,10 +80,7 @@ class ProofAgent:
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
         self.verbose = verbose
-        try:
-            self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
-        except Exception:
-            self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        self.tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     def warm_up(self) -> Dict[str, float]:
         timings: Dict[str, float] = {}
@@ -112,6 +109,7 @@ class ProofAgent:
         max_loops: Optional[int] = None,
         max_token_budget: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> ProofRunResult:
         """Run the proof loop.
 
@@ -125,6 +123,11 @@ class ProofAgent:
         optional, ``None`` → constructor value) let the web layer push
         the admin-config overrides per request without rebuilding the
         agent singleton.
+
+        ``cancel_check`` (optional) is a no-arg predicate polled at
+        each loop boundary; True exits with ``exit_reason='client_disconnect'``.
+        Same contract as :meth:`BaseAgent.run` so the runner side can
+        wire ``EventBus.is_closed`` uniformly.
         """
         effective_max_loops = max_loops if max_loops is not None else self.max_loops
         effective_max_tokens = (
@@ -185,6 +188,16 @@ class ProofAgent:
                 remaining_steps=effective_max_loops - loop_idx,
                 max_loops=effective_max_loops,
             )
+
+            # Cancellation gate (mirrors BaseAgent.run). At the loop
+            # boundary, before any LLM / tool work; in-flight tool
+            # results from the previous iteration are already in
+            # ``messages`` so the agent state is consistent if a
+            # later resume happens.
+            if cancel_check is not None and cancel_check():
+                emit("status", {"phase": "client_disconnect"})
+                exit_reason = "client_disconnect"
+                break
 
             if self._token_count(messages, system_prompt=effective_system_prompt) > effective_max_tokens:
                 exit_reason = "token_budget_exceeded"

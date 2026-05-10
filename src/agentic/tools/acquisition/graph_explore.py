@@ -74,6 +74,9 @@ class GraphExploreTool(BaseTool):
         self,
         channel: Optional[GraphPPRChannel] = None,
         inventory: Optional[InventoryStore] = None,
+        *,
+        entity_lookup_min_sim: float = 0.6,
+        entity_lookup_gradient: float = 0.5,
     ):
         # The channel owns graph + entity/passage/sentence stores + NER
         # state. We hold a reference instead of re-loading everything,
@@ -81,6 +84,14 @@ class GraphExploreTool(BaseTool):
         # operate on the same data.
         self._channel = channel or GraphPPRChannel()
         self.inventory = inventory
+        # Entity lookup tunables — admin config injects these via the
+        # factory (build_graph_agent → ConfigStore). The defaults here
+        # reproduce the pre-Phase-6 hardcoded constants
+        # (_ENTITY_LOOKUP_MIN_SIM=0.6, gradient g=0.5) so call sites
+        # that construct the tool directly (experiment scripts) keep
+        # bytewise behaviour.
+        self._entity_lookup_min_sim = float(entity_lookup_min_sim)
+        self._entity_lookup_gradient = float(entity_lookup_gradient)
         self._clusters_cache_path: Path = faiss_graph_dir() / "clusters.json"
         self._cluster_index: Optional[Dict[str, Dict[str, Any]]] = None
         # Passage meta is stable for the life of the agent (graph is
@@ -92,6 +103,27 @@ class GraphExploreTool(BaseTool):
     @property
     def name(self) -> str:
         return "graph_explore"
+
+    # ---------------------------------------------------------- invalidate
+
+    def invalidate_caches(self) -> None:
+        """Drop the per-instance derived caches.
+
+        ``_passage_meta_by_hash`` / ``_passage_hash_by_meta`` reflect a
+        snapshot of the channel's passage_store at first use; after a
+        reingest or delete the store has different rows and the cached
+        maps return stale (file_id, page_number) pairs. Same story for
+        ``_cluster_index`` — it's loaded from
+        ``faiss/graph/clusters.json`` which is rewritten on ingest.
+
+        The wrapping ``GraphPPRChannel.reload()`` rebuilds the underlying
+        stores; this method is the second half of "make a stale tool
+        instance look fresh again" and should be called from the
+        lifespan refresh hook.
+        """
+        self._passage_meta_by_hash = None
+        self._passage_hash_by_meta = None
+        self._cluster_index = None
 
     # ----------------------------------------------------------- warm-up
 
@@ -802,16 +834,15 @@ class GraphExploreTool(BaseTool):
         # edges (high precision, low recall); query-time lookup wants
         # something looser, but 0.4 surfaces too much noise (e.g. a
         # surface like "Premium Refund" matched a sim=0.4 product name).
-        # 0.6 is the empirical sweet spot on this corpus.
-        # TODO(config-center): expose `min_sim` and gradient `g` to the
-        # admin tunables panel — different corpora prefer different cutoffs.
-        _ENTITY_LOOKUP_MIN_SIM = 0.6
+        # 0.6 is the empirical sweet spot on this corpus; admin config
+        # `graph_explore.entity_lookup_min_sim` overrides it per
+        # corpus (see schema.py).
         cands = gradient_topk_candidates(
             emb_arr,
             store,
             k=limit,
-            g=0.5,
-            min_sim=_ENTITY_LOOKUP_MIN_SIM,
+            g=self._entity_lookup_gradient,
+            min_sim=self._entity_lookup_min_sim,
         )
         if not cands:
             return (
@@ -821,7 +852,7 @@ class GraphExploreTool(BaseTool):
                     surface=surface,
                     physical=[],
                     note=(
-                        f"No entity above min similarity {_ENTITY_LOOKUP_MIN_SIM} "
+                        f"No entity above min similarity {self._entity_lookup_min_sim} "
                         f"— try a different surface form."
                     ),
                 ),
