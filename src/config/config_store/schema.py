@@ -24,14 +24,18 @@ from agentic.agent.prompts import (
     PROOF_SYSTEM_PROMPT,
     RAG_BUSINESS_SYSTEM_PROMPT,
     RECOMMEND_SYSTEM_PROMPT,
-    REGULATION_SUMMARIZER_SYSTEM_PROMPT,
+    RISK_PREDICT_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     WEB_AGENT_SYSTEM_PROMPT,
     WEB_RAG_SYSTEM_PROMPT,
 )
+from config.linear_rag import LinearRAGConfig
 from config.rag import RAGConfig
 
 from config.config_store.entry import ConfigEntry
+
+
+_LINEAR_RAG_DEFAULTS = LinearRAGConfig()
 
 
 # Pull RAG defaults from a live RAGConfig instance — RAGConfig is the
@@ -214,6 +218,116 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         group="citation",
         description="Max characters of page text shown inline with each citation.",
     ),
+    # ---------- ingest.* ----------
+    ConfigEntry(
+        key="ingest.parallel_workers",
+        type="int",
+        default=1,
+        min=1,
+        max=4,
+        group="ingest",
+        description=(
+            "Number of files whose parse stage may run concurrently. "
+            "Index-write stage is always serial (faiss / graph stores "
+            "are not safe under concurrent writes). **Default 1** for "
+            "memory safety: paddle response cache (~50 MB/file) + spaCy "
+            "zh-trf NER (~2 GB resident) + LinearRAG igraph snapshots "
+            "push an 8 GB host past OOM at parallel_workers=2 on real "
+            "60-page PDFs (verified: backend SIGKILL at swap exhaustion). "
+            "Bump to 2 only on hosts with ≥12 GB RAM, 4 only on ≥24 GB. "
+            "Process restart required after change (semaphore caps at "
+            "boot — see _get_parse_sem)."
+        ),
+    ),
+    # ---------- chat.* ----------
+    ConfigEntry(
+        key="chat.history_turns",
+        type="int",
+        default=6,
+        min=0,
+        max=20,
+        group="chat",
+        description=(
+            "Number of prior (user, assistant) turns fed back into the next "
+            "request when a chat session is active. 0 disables multi-turn "
+            "(every request acts stateless). RAG path uses this to seed "
+            "rewrite + answer; agent path stitches prior final answers in "
+            "front of the new query."
+        ),
+    ),
+    # ---------- linear_rag.* (LinearRAG literal-substring backfill) ----------
+    # Mirror constants in src/config/linear_rag.py +
+    # src/rag/channels/graph_ppr.py:_build_gazetteer (the same defaults
+    # are used both at ingest-time backfill AND at query-time PPR
+    # gazetteer construction; admins tune one knob, both honour it via
+    # GraphPPRChannel constructor and ingest pipeline reading from
+    # config store).
+    ConfigEntry(
+        key="linear_rag.literal_backfill_enabled",
+        type="bool",
+        default=_LINEAR_RAG_DEFAULTS.literal_backfill_enabled,
+        group="linear_rag",
+        description=(
+            "Enable literal-substring backfill at ingest time. When True, "
+            "after spaCy NER, sweep every passage against the union of "
+            "discovered entity surfaces and add missing entity↔passage "
+            "edges (KAG-style 'domain mount'; covers the contextual-NER "
+            "miss rate, ~48% on insurance corpus)."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.literal_backfill_min_chars",
+        type="int",
+        default=_LINEAR_RAG_DEFAULTS.literal_backfill_min_chars,
+        min=1,
+        max=16,
+        group="linear_rag",
+        description=(
+            "Minimum surface character length for literal backfill. "
+            "Drops noise like 'us' / 'irs'. Same default applies to the "
+            "query-time PPR gazetteer (graph_ppr channel)."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.literal_backfill_multi_word_only",
+        type="bool",
+        default=_LINEAR_RAG_DEFAULTS.literal_backfill_multi_word_only,
+        group="linear_rag",
+        description=(
+            "Require multi-word surfaces only for literal backfill. "
+            "Drops single-word ambiguities like 'axa' / 'company'. "
+            "Same default applies to the query-time PPR gazetteer."
+        ),
+    ),
+    # ---------- graph_explore.* (entity_lookup tool runtime) ----------
+    ConfigEntry(
+        key="graph_explore.entity_lookup_min_sim",
+        type="float",
+        default=0.6,
+        min=0.3,
+        max=0.95,
+        group="graph_explore",
+        description=(
+            "Cosine similarity floor for the graph_explore entity_lookup "
+            "tool. The disambiguator's 0.85 (precision-tuned for adding "
+            "alias edges) is too strict at query time; 0.4 surfaces too "
+            "much noise; 0.6 is the empirical sweet spot."
+        ),
+    ),
+    ConfigEntry(
+        key="graph_explore.entity_lookup_gradient",
+        type="float",
+        default=0.5,
+        min=0.1,
+        max=1.0,
+        group="graph_explore",
+        description=(
+            "Gradient g for gradient_topk_candidates() — controls how "
+            "fast similarity scores below the top hit are penalised. "
+            "Larger g → flatter top-k (more candidates pass); smaller "
+            "g → sharper cutoff (only the top match passes)."
+        ),
+    ),
     # ---------- agent.web.* ----------
     ConfigEntry(
         key="agent.web.max_loops",
@@ -241,7 +355,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         min=3,
         max=20,
         group="tavily",
-        description="Default number of Tavily search results returned to the agent / regulation runner.",
+        description="Default number of Tavily search results returned to the chat web mode + web agent.",
     ),
     ConfigEntry(
         key="tavily.search_depth",
@@ -251,24 +365,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         min_length=1,
         group="tavily",
         description='Tavily depth: "basic" (fast) or "advanced" (thorough crawl, more credits).',
-    ),
-    ConfigEntry(
-        key="tavily.include_domains_hk",
-        type="str",
-        default="ia.org.hk,hkma.gov.hk,sfc.hk,gld.gov.hk",
-        max_length=2000,
-        min_length=0,
-        group="tavily",
-        description="Comma-separated HK regulatory domains injected when jurisdiction=hk.",
-    ),
-    ConfigEntry(
-        key="tavily.include_domains_cn",
-        type="str",
-        default="nfra.gov.cn,csrc.gov.cn,gov.cn,pbc.gov.cn",
-        max_length=2000,
-        min_length=0,
-        group="tavily",
-        description="Comma-separated mainland-China regulatory domains injected when jurisdiction=cn.",
     ),
     # ---------- prompt.* (web + workbench prompts) ----------
     ConfigEntry(
@@ -288,15 +384,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         min_length=1,
         group="prompt",
         description="System prompt for the web agent (chat web+agent mode).",
-    ),
-    ConfigEntry(
-        key="prompt.regulation",
-        type="str",
-        default=REGULATION_SUMMARIZER_SYSTEM_PROMPT,
-        max_length=8000,
-        min_length=1,
-        group="prompt",
-        description="System prompt for the regulation-search workbench (compliance-strict).",
     ),
     ConfigEntry(
         key="prompt.compare",
@@ -323,7 +410,12 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max_length=8000,
         min_length=1,
         group="prompt",
-        description="System prompt for the product-recommendation workbench (BaseAgent over open corpus).",
+        description=(
+            "System prompt for the needs-analysis workbench (BaseAgent). "
+            "Two modes: open-corpus top-3 when no held policies are "
+            "supplied; gap analysis + complementary picks when "
+            "held_policies_file_ids are provided in the request."
+        ),
     ),
     ConfigEntry(
         key="prompt.claim_check",
@@ -350,7 +442,27 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max_length=8000,
         min_length=1,
         group="prompt",
-        description="System prompt for the fraud-PPR analysis (single LLM call over a precomputed PPR subgraph).",
+        description=(
+            "System prompt for the Policy-Review hidden-risk tab "
+            "(single LLM call over a precomputed PPR subgraph). Key "
+            "name retained for backward compat with persisted overrides; "
+            "current default surfaces semantically adjacent clauses, "
+            "not fraud judgments."
+        ),
+    ),
+    ConfigEntry(
+        key="prompt.risk_predict",
+        type="str",
+        default=RISK_PREDICT_SYSTEM_PROMPT,
+        max_length=8000,
+        min_length=1,
+        group="prompt",
+        description=(
+            "System prompt for the proactive pre-issuance risk-prediction "
+            "workbench (GraphAgent driving graph_explore PPR → neighbors → "
+            "read flow). Output is a forward-looking risk forecast tied to "
+            "the customer profile, not a reactive claim/exclusion judgment."
+        ),
     ),
 ]
 

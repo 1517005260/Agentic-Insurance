@@ -22,7 +22,26 @@ def _get(key: str, default: str | None = None) -> str | None:
 
 # ---------------------------------------------------------------- storage ----
 
-STORAGE_PATH: Path = Path(_get("STORAGE_PATH", "./local_storage") or "./local_storage")
+# Project root: ``src/config/settings.py`` → ``../../../`` = repo root.
+# Used to anchor a *relative* ``STORAGE_PATH`` so it resolves to the
+# same directory regardless of the process CWD. Past bug: starting
+# uvicorn from inside ``frontend/`` made ``./local_storage`` resolve to
+# ``frontend/local_storage/``, silently creating a parallel storage
+# tree (empty DB, no faiss / graph), with the original tree under
+# ``agentic/local_storage/`` left behind. Anchoring relative paths to
+# the repo root makes the storage location process-CWD-independent.
+_PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_storage(raw: str) -> Path:
+    """Anchor relative STORAGE_PATH at the repo root, not the CWD."""
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return (_PROJECT_ROOT / p).resolve()
+
+
+STORAGE_PATH: Path = _resolve_storage(_get("STORAGE_PATH", "./local_storage") or "./local_storage")
 
 # Subdirectory under STORAGE_PATH that holds raw PaddleOCR outputs.
 PADDLE_OCR_SUBDIR: str = "paddle_ocr"
@@ -54,6 +73,22 @@ def page_assets_root() -> Path:
 
 def page_assets_path(file_id: str) -> Path:
     return page_assets_root() / f"{file_id}.json"
+
+
+# Per-file rendered PDF page images served by /files/{id}/preview.
+# Lazily produced via pypdfium2 on first access (one JPG per requested
+# page) so the file-card thumbnail and the full-file preview drawer
+# don't trigger a re-render on every request. Layout is
+# ``<STORAGE_PATH>/preview/<file_id>/p_NNNN.jpg``.
+PREVIEW_SUBDIR: str = "preview"
+
+
+def preview_root() -> Path:
+    return STORAGE_PATH / PREVIEW_SUBDIR
+
+
+def preview_page_path(file_id: str, page_number: int) -> Path:
+    return preview_root() / file_id / f"p_{int(page_number):04d}.jpg"
 
 
 # Per-file structural inventory (sections derived from Markdown headings).
@@ -296,10 +331,9 @@ CORS_ORIGINS: list[str] = [
 
 # -------------------------------------------------------------- tavily ----
 
-# Tavily Search powers the regulation-lookup workbench in the web app. The
-# free tier is sufficient for the demo. Unset key => /insurance/regulation-
-# search returns 503 and the UI shows a disabled state; nothing else
-# depends on it.
+# Tavily Search powers the chat web mode + the web agent. The free
+# tier is sufficient for the demo. Unset key => those surfaces emit
+# "tavily unavailable" envelopes; nothing else depends on it.
 TAVILY_API_KEY: str | None = _get("TAVILY_API_KEY")
 TAVILY_API_BASE_URL: str = _get("TAVILY_API_BASE_URL") or "https://api.tavily.com"
 

@@ -65,17 +65,25 @@ def make_retry_session(
     allowed_methods: Optional[Iterable[str]] = None,
     pool_connections: int = 16,
     pool_maxsize: int = 16,
+    read_retries: Optional[int] = None,
 ) -> requests.Session:
     """Build a :class:`requests.Session` with transport-level retries.
 
     Parameters mirror :class:`urllib3.util.retry.Retry` directly so the
     caller can override per-client (e.g. embedding endpoints often want
     a higher ``total`` because batches are expensive to redo).
+
+    ``read_retries`` (None → use ``total``, 0 → disable) is broken out
+    so callers that already enforce a per-call ``timeout=(connect, read)``
+    can opt out of the additional 5×backoff that ``Retry(read=total)``
+    introduces. The chat client uses 0 — without it a hung LLM relay
+    blocks for ``5 × read_timeout`` instead of the documented one-shot,
+    and any wall-clock fallback above the chat client never fires.
     """
     retry = Retry(
         total=total,
         connect=total,
-        read=total,
+        read=total if read_retries is None else read_retries,
         status=total,
         status_forcelist=tuple(status_forcelist),
         allowed_methods=frozenset(allowed_methods) if allowed_methods else _DEFAULT_ALLOWED_METHODS,

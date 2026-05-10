@@ -223,6 +223,59 @@ class ConfigStore:
     def citation_preview_chars(self) -> int:
         return int(self._values["citation.preview_chars"])
 
+    def chat_history_turns(self) -> int:
+        """Recent (user, assistant) pairs replayed into the next request.
+
+        0 keeps every request stateless (the existing behaviour pre-
+        Phase 6); the chat route then skips the trace lookup entirely.
+        """
+        return int(self._values["chat.history_turns"])
+
+    def ingest_parallel_workers(self) -> int:
+        """Cap on concurrent parse stages (faiss/graph index write stays serial).
+
+        Powers the ``INGEST_PARSE_SEM`` semaphore in
+        :mod:`api.services.files`. 1 = original fully-serial behaviour.
+        """
+        return int(self._values["ingest.parallel_workers"])
+
+    def materialize_linear_rag_config(
+        self, base: Optional["LinearRAGConfig"] = None
+    ) -> "LinearRAGConfig":
+        """``LinearRAGConfig`` with admin-managed knobs swapped in.
+
+        Same pattern as :meth:`materialize_rag_config` — preserve any
+        constructor-time tuning of non-admin fields (embedding client,
+        spaCy model paths, alias thresholds) and only overwrite the
+        three literal-backfill knobs that the admin UI exposes. The
+        backfill defaults double as the query-time PPR gazetteer
+        defaults inside :class:`GraphPPRChannel`, so flipping them
+        here propagates to both ingest and retrieval.
+        """
+        from config.linear_rag import LinearRAGConfig
+        starting = base if base is not None else LinearRAGConfig()
+        return replace(
+            starting,
+            literal_backfill_enabled=bool(self._values["linear_rag.literal_backfill_enabled"]),
+            literal_backfill_min_chars=int(self._values["linear_rag.literal_backfill_min_chars"]),
+            literal_backfill_multi_word_only=bool(
+                self._values["linear_rag.literal_backfill_multi_word_only"]
+            ),
+        )
+
+    def graph_explore_kwargs(self) -> Dict[str, Any]:
+        """``{entity_lookup_min_sim, entity_lookup_gradient}`` for GraphExploreTool.
+
+        Pass straight as ``**kwargs`` to ``GraphExploreTool(...)`` from
+        the agent factory; the tool's constructor accepts these as
+        kw-only with the pre-Phase-6 hardcoded defaults so direct
+        instantiations (experiment scripts) keep bytewise behaviour.
+        """
+        return {
+            "entity_lookup_min_sim": float(self._values["graph_explore.entity_lookup_min_sim"]),
+            "entity_lookup_gradient": float(self._values["graph_explore.entity_lookup_gradient"]),
+        }
+
     # ---------------------------------------------------------- mutations ----
 
     async def patch(
