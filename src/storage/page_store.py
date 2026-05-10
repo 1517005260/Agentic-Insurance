@@ -83,6 +83,34 @@ class PageStore:
                 if page.page_id:
                     self._by_global_id[page.global_id] = page
 
+    def reload(self) -> None:
+        """Re-read every JSON file under ``source`` into a fresh map.
+
+        Call after ingest writes new ``page_assets/<file_id>.json`` files
+        — the PageStore is a long-lived singleton in the API process and
+        won't notice on-disk changes otherwise (``__init__`` runs once at
+        lifespan boot, before any upload).
+
+        Builds the new map first and atomically swaps so a concurrent
+        reader iterating ``ids()`` never observes a half-built state.
+        """
+        new_map: Dict[str, PageAsset] = {}
+        files: Iterable[Path]
+        if self.source.is_dir():
+            files = sorted(self.source.glob("*.json"))
+        else:
+            files = [self.source] if self.source.is_file() else []
+        for fp in files:
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for item in data:
+                page = PageAsset.from_dict(item)
+                if page.page_id:
+                    new_map[page.global_id] = page
+        self._by_global_id = new_map
+
     def get(self, key: str) -> Optional[PageAsset]:
         """Look up by ``"file_id/page_id"`` (global) or by bare ``page_id``.
 

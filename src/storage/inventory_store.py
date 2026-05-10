@@ -164,6 +164,34 @@ class InventoryStore:
 
     # ------------------------------------------------------------- public API
 
+    def reload(self) -> None:
+        """Drop the in-memory section caches so the next access re-derives
+        from the (now-updated) ``PageStore`` plus the on-disk inventory
+        JSON cache.
+
+        Call after a PageStore reload: per-file section spans are derived
+        from page text, so a stale section map for a freshly-ingested
+        file would still report ``[]``. The disk cache files are
+        respected (rebuilt only on page-count mismatch — see
+        ``_load_cache``); reload just forces re-reading them.
+
+        Also resets the sibling :class:`PassageStore` /
+        :class:`TableRowStore` per-file caches — those each maintain
+        their own ``_by_file`` / ``_by_id`` dicts that, like the
+        section cache, never re-stat the underlying JSON. Without this
+        a reingested file would surface old passage / table_row content
+        to ``inventory.units("passage" / "table_row", ...)`` queries.
+        """
+        with self._lock:
+            self._sections_by_file.clear()
+            self._section_by_id.clear()
+        # PassageStore / TableRowStore use their own internal locks;
+        # do not nest under self._lock to avoid lock-order surprises.
+        for sibling in (self.passage_store, self.table_row_store):
+            with sibling._lock:
+                sibling._by_file.clear()
+                sibling._by_id.clear()
+
     def sections_for_file(self, file_id: str) -> List[Section]:
         """Return all sections for ``file_id`` (empty list if no headings).
 
