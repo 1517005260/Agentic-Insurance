@@ -188,21 +188,17 @@ async def lifespan(_app: FastAPI):
         linear_config=shared_linear_config,
     )
 
-    # Pre-warm spaCy at lifespan so EN+ZH ``_trf`` pipelines land in
+    # Pre-warm GLiNER at lifespan so the open-set NER weights land in
     # the GPU once and every subsequent ingest / PPR query reuses the
-    # same ``Language`` object via ``shared_spacy``. Without prewarm
-    # the first PPR query (or the first ingest) pays ~10 s of model
-    # load on top of its own latency, and on small hosts the
-    # transient peak during load can race the rest of the process for
-    # memory.
+    # same model via ``shared_gliner``. Without prewarm the first PPR
+    # query (or the first ingest) pays the HF download + ``from_pretrained``
+    # cost (~5-10 s cold cache, ~3 s warm) on top of its own latency.
     #
-    # GPU activation is handled inside ``_spacy_cached``
-    # (``spacy.prefer_gpu()`` after preloading torch's libcudart);
-    # falling back to CPU is automatic when no usable GPU is
-    # available. A single resident copy of EN+ZH trf is ~2.9 GB host
-    # / ~3.4 GB VRAM (CPU mode) or ~600 MB host / ~3.4 GB VRAM (GPU
-    # mode), shared across every ingest and query in this process.
-    shared_graph_channel._ensure_spacy()
+    # GPU is mandatory by project policy (CPU inference unsupported); the
+    # cached factory raises if CUDA is unavailable. FP16 footprint on a
+    # 6 GB RTX 3060 Laptop is ~0.6 GB resident / ~0.7 GB peak during
+    # inference, shared across every ingest and query in this process.
+    shared_graph_channel._ensure_ner()
 
     # Build the RAG pipeline AFTER shared resources so it shares the
     # same GraphPPRChannel instance (the new ``graph_channel`` kwarg).
@@ -302,7 +298,11 @@ async def lifespan(_app: FastAPI):
         """
         shared_page_store.reload()
         shared_inventory.reload()
-        shared_graph_channel.reload()
+        # Re-materialise the LinearRAGConfig from the (just-reloaded)
+        # config-store snapshot so admin-rotated GLiNER knobs reach
+        # the query-side NER on the next request.
+        fresh_linear_config = _app.state.config.materialize_linear_rag_config()
+        shared_graph_channel.reload(linear_config=fresh_linear_config)
         # Force every process-cached EmbeddingStore that wasn't already
         # reloaded by a higher-level component to re-read from disk.
         # ``GraphPPRChannel.reload()`` above already covered the three

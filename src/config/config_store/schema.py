@@ -299,6 +299,64 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Same default applies to the query-time PPR gazetteer."
         ),
     ),
+    # ---------- linear_rag.gliner_* (open-set NER) ----------
+    # Mirror constants in src/config/linear_rag.py. Changing the label
+    # list at runtime swaps the NER prompt — the right knob to turn
+    # when adapting to a new domain (medical / legal / patent / …)
+    # without writing a domain dictionary.
+    ConfigEntry(
+        key="linear_rag.gliner_model_id",
+        type="str",
+        default=_LINEAR_RAG_DEFAULTS.gliner_model_id,
+        group="linear_rag",
+        description=(
+            "HuggingFace repo id for the GLiNER NER model. Weights live "
+            "in the standard HF cache (~/.cache/huggingface/hub/). "
+            "Default 'urchade/gliner_multiv2.1' is the multilingual "
+            "checkpoint validated on insurance corpus."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.gliner_labels",
+        type="list_str",
+        default=list(_LINEAR_RAG_DEFAULTS.gliner_labels),
+        min_length=1,
+        max_length=32,
+        group="linear_rag",
+        description=(
+            "Open-set NER label prompt. Use English label tokens — the "
+            "mT5 backbone tokenises them more stably than Chinese. "
+            "Domain swap = label swap (e.g. ['disease','drug','procedure'] "
+            "for medical)."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.gliner_threshold",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.gliner_threshold,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description=(
+            "Score floor for emitted GLiNER spans. 0.3 was empirically "
+            "the best recall/noise trade-off on the 4-document insurance "
+            "benchmark; lower values surface long sentence-fragment spans."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.junk_max_han_chars",
+        type="int",
+        default=_LINEAR_RAG_DEFAULTS.junk_max_han_chars,
+        min=6,
+        max=40,
+        group="linear_rag",
+        description=(
+            "Max Han-character length for an unbraced entity surface. "
+            "Surfaces above this are rejected as sentence-fragment leakage. "
+            "Insurance product names top out at ~10 (default 15 safe); "
+            "legal / patent corpora typically need 20-25."
+        ),
+    ),
     # ---------- graph_explore.* (entity_lookup tool runtime) ----------
     ConfigEntry(
         key="graph_explore.entity_lookup_min_sim",

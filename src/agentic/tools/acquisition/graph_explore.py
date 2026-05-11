@@ -86,10 +86,9 @@ class GraphExploreTool(BaseTool):
         self.inventory = inventory
         # Entity lookup tunables — admin config injects these via the
         # factory (build_graph_agent → ConfigStore). The defaults here
-        # reproduce the pre-Phase-6 hardcoded constants
-        # (_ENTITY_LOOKUP_MIN_SIM=0.6, gradient g=0.5) so call sites
-        # that construct the tool directly (experiment scripts) keep
-        # bytewise behaviour.
+        # (_ENTITY_LOOKUP_MIN_SIM=0.6, gradient g=0.5) keep call sites
+        # that construct the tool directly (experiment scripts) working
+        # without any config plumbing.
         self._entity_lookup_min_sim = float(entity_lookup_min_sim)
         self._entity_lookup_gradient = float(entity_lookup_gradient)
         self._clusters_cache_path: Path = faiss_graph_dir() / "clusters.json"
@@ -128,17 +127,17 @@ class GraphExploreTool(BaseTool):
     # ----------------------------------------------------------- warm-up
 
     def warm_up(self) -> None:
-        """Pre-load spaCy NER and force igraph to be in memory.
+        """Pre-load GLiNER NER and force igraph to be in memory.
 
-        The PPR mode needs spaCy on the first call, which is the
-        single biggest source of cold-start latency in the agent loop
-        (~10–15 s for transformer-based en + zh models). Run this
-        before the agent's first user turn.
+        The PPR mode needs the NER model on the first call, which is
+        the single biggest source of cold-start latency in the agent
+        loop (~3-10 s for GLiNER multi-v2.1 depending on HF cache
+        warmth). Run this before the agent's first user turn.
         """
         if self._channel.graph is None:
             return  # nothing to warm — graph not built
         try:
-            self._channel._ensure_spacy()
+            self._channel._ensure_ner()
         except Exception as exc:
             logger.warning("graph_explore: NER warm-up failed: %s", exc)
 
@@ -611,8 +610,17 @@ class GraphExploreTool(BaseTool):
                 hit = passage_lookup.get((file_id, page_n))
                 if hit:
                     return hit
-        # Entity surface — normalize to canonical hash key.
-        canon = normalize_for_hash(s, fold_traditional=True)
+        # Entity surface — normalize to canonical hash key. Pull the
+        # active per-domain cutoff from the channel's linear_config so a
+        # resolver running after the admin raised
+        # ``junk_max_han_chars`` to e.g. 25 doesn't keep dropping 18-25
+        # char clauses the ingest layer just accepted.
+        cfg = self._channel.linear_config
+        canon = normalize_for_hash(
+            s,
+            fold_traditional=cfg.fold_traditional,
+            han_fragment_max_chars=cfg.junk_max_han_chars,
+        )
         if canon and canon in entity_text_to_hash:
             return entity_text_to_hash[canon]
         # Last resort: raw text match (already-canonical input).

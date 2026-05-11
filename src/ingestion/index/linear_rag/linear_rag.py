@@ -45,7 +45,7 @@ from ingestion.index.linear_rag.disambig import (
     invalidate_clusters,
     mutual_topk_filter,
 )
-from ingestion.index.linear_rag.ner import SpacyNER
+from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import canonical_form, normalize_for_hash
 from storage import EmbeddingStore
 from storage.embedding_store import get_or_create_store
@@ -62,12 +62,12 @@ class LinearRAG:
 
         # Three stores come from the process-wide cache so they're the
         # **same Python objects** as the lifespan-built GraphPPRChannel
-        # holds. Without sharing, each ingest's LinearRAG used to load
-        # ~1.5 GB of duplicate faiss / parquet — the dominant 8 GB OOM
-        # contributor. Sharing is safe because: writes (add()) are
-        # serialised by INGEST_LOCK; reads (PPR queries) tolerate seeing
-        # the in-memory new vectors before save() flushes to disk —
-        # that's the existing refresh-hook contract.
+        # holds. Without sharing, each ingest would load ~1.5 GB of
+        # duplicate faiss / parquet — a major OOM source on 8 GB hosts.
+        # Sharing is safe because: writes (add()) are serialised by
+        # INGEST_LOCK; reads (PPR queries) tolerate seeing the in-memory
+        # new vectors before save() flushes to disk — that matches the
+        # refresh-hook contract.
         self.passage_embedding_store = get_or_create_store(
             faiss_graph_passage_dir(), namespace="passage"
         )
@@ -78,9 +78,11 @@ class LinearRAG:
             faiss_graph_sentence_dir(), namespace="sentence"
         )
 
-        self.spacy_ner = SpacyNER(
-            self.config.spacy_model,
-            zh_spacy_model=self.config.zh_spacy_model,
+        self.ner = GLiNERAdapter(
+            model_id=self.config.gliner_model_id,
+            labels=self.config.gliner_labels,
+            threshold=self.config.gliner_threshold,
+            batch_size=self.config.gliner_batch_size,
         )
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"
@@ -102,10 +104,12 @@ class LinearRAG:
     # extraction / split / cleanup pipeline changes so older caches are
     # invalidated and every passage re-runs through the new path.
     #
-    # v1 (implicit / legacy): raw spaCy ``ent.text`` per passage.
-    # v2: post split_catalog_mentions (catalog list-span fan-out) +
-    #     post cleanup (bracket repair + sentence-fragment trim).
-    NER_CACHE_VERSION = 2
+    # v3: switched from spaCy en/zh _trf + HanLP MTL to GLiNER multi-v2.1
+    #     open-set NER + pysbd sentence segmentation + HTML/table/LaTeX
+    #     pre-clean + 4 new structural ``is_junk`` rules. The label set,
+    #     span boundaries, and noise floor are all different from v2 so
+    #     v2 caches are not safely reusable.
+    NER_CACHE_VERSION = 3
 
     def load_existing_data(self, passage_hash_ids: Iterable[str]):
         if self._ner_results_path.exists():
@@ -140,11 +144,10 @@ class LinearRAG:
                     existing_sentence_to_entities,
                     new_passage_hash_ids,
                 )
-            # Legacy cache (no version, or version < current) — drop the
-            # cached entities so every passage re-runs through the
-            # current NER pipeline (this is the migration path for v2's
-            # split_catalog_mentions; without it the legacy composite
-            # spans would survive forever).
+            # Cache version mismatch (missing or older) — drop the
+            # cached entities and re-run every passage through the
+            # current NER pipeline. Otherwise stale composite spans
+            # would survive forever.
             logger.info(
                 "ner_results.json schema mismatch (cached=%s, current=%s); "
                 "re-running NER on all passages",
@@ -232,7 +235,7 @@ class LinearRAG:
 
         if new_passage_hash_ids:
             new_hash_id_to_passage = {h: hash_id_to_passage[h] for h in new_passage_hash_ids}
-            new_passage_to_entities, new_sentence_to_entities = self.spacy_ner.batch_ner(
+            new_passage_to_entities, new_sentence_to_entities = self.ner.batch_ner(
                 new_hash_id_to_passage, self.config.max_workers
             )
             self.merge_ner_results(
@@ -249,10 +252,14 @@ class LinearRAG:
         #     language-aware canonical key so case / article / 繁体 / NFKC
         #     variants collapse to one entity.
         existing_passage_to_entities = self._normalize_entity_surfaces(
-            existing_passage_to_entities
+            existing_passage_to_entities,
+            fold_traditional=self.config.fold_traditional,
+            han_fragment_max_chars=self.config.junk_max_han_chars,
         )
         existing_sentence_to_entities = self._normalize_entity_surfaces(
-            existing_sentence_to_entities
+            existing_sentence_to_entities,
+            fold_traditional=self.config.fold_traditional,
+            han_fragment_max_chars=self.config.junk_max_han_chars,
         )
 
         self.save_ner_results(existing_passage_to_entities, existing_sentence_to_entities)
@@ -309,6 +316,7 @@ class LinearRAG:
                 passage_text,
                 min_surface_chars=self.config.literal_backfill_min_chars,
                 multi_word_only=self.config.literal_backfill_multi_word_only,
+                fold_traditional=self.config.fold_traditional,
             )
 
         # Cluster cache is now stale — invalidate so it recomputes lazily.
@@ -468,20 +476,34 @@ class LinearRAG:
         return self.entity_embedding_store.get_embedding(hash_id), True
 
     @staticmethod
-    def _normalize_entity_surfaces(mapping):
+    def _normalize_entity_surfaces(
+        mapping,
+        *,
+        fold_traditional: bool = True,
+        han_fragment_max_chars: int = 15,
+    ):
         """Apply ``normalize_for_hash`` to every entity surface in place.
 
         ``mapping`` maps either passage_hash_id or sentence_text → list of
         raw entity surfaces. Junk surfaces are dropped; survivors are
         replaced with their canonical key. Duplicate canonicals after
         normalization are collapsed.
+
+        ``han_fragment_max_chars`` controls the Chinese sentence-fragment
+        cutoff used by ``is_junk``; pass the value from
+        ``LinearRAGConfig.junk_max_han_chars`` so the per-domain admin
+        tuning takes effect.
         """
         out = {}
         for key, ents in mapping.items():
             seen: list[str] = []
             seen_set: set[str] = set()
             for raw in ents:
-                canonical = normalize_for_hash(raw)
+                canonical = normalize_for_hash(
+                    raw,
+                    fold_traditional=fold_traditional,
+                    han_fragment_max_chars=han_fragment_max_chars,
+                )
                 if canonical is None:
                     continue
                 if canonical in seen_set:

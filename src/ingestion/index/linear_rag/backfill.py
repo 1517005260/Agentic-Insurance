@@ -42,8 +42,14 @@ from typing import Dict, List, Mapping, Tuple
 
 import ahocorasick
 import igraph as ig
+import regex
+
+from ingestion.index.linear_rag.normalize import canonical_form
 
 logger = logging.getLogger(__name__)
+
+
+_HAS_HAN_RE = regex.compile(r"\p{Han}")
 
 
 def build_gazetteer_automaton(
@@ -58,6 +64,14 @@ def build_gazetteer_automaton(
     payload is ``(entity_hash_id, lowercased_surface)``; surfaces are
     stored lowercased so callers must lowercase the target text before
     iterating with :func:`find_literal_matches`.
+
+    ``multi_word_only`` is interpreted **per script**: it requires an
+    ASCII space for surfaces that look Latin-script (e.g. "axa" /
+    "company" — drop, "Heritage Protector Option" — keep), but is
+    waived for CJK surfaces ("萬通保險" — keep) since Chinese has no
+    word boundary character. Without this carve-out the gazetteer
+    came out empty on Chinese-heavy corpora and silently produced
+    zero backfill edges (the symptom that led to this fix).
     """
     A = ahocorasick.Automaton()
     n_kept = 0
@@ -65,7 +79,7 @@ def build_gazetteer_automaton(
         s = (surface or "").strip().lower()
         if not s or len(s) < min_surface_chars:
             continue
-        if multi_word_only and " " not in s:
+        if multi_word_only and " " not in s and not _HAS_HAN_RE.search(s):
             continue
         # Two distinct hash_ids could collapse to the same lowercased
         # surface; first wins (the existing graph already merges them
@@ -81,23 +95,40 @@ def build_gazetteer_automaton(
 def find_literal_matches(
     text: str,
     automaton: ahocorasick.Automaton,
+    *,
+    fold_traditional: bool = True,
 ) -> Dict[str, int]:
     """Word-boundary substring matches → ``{entity_hash: mention_count}``.
 
     Word boundary = the character just outside each end is not in
     ``[a-z0-9_]``. This catches "AXA's" → "axa" while rejecting
-    "user" → "us". Empty when no hits.
+    "user" → "us". For CJK we deliberately do NOT require a boundary —
+    Chinese tokens are already character-level dense, and a "boundary"
+    requirement would make every entity inside a longer noun phrase
+    miss (e.g. "復歸紅利" inside "非保證復歸紅利"). Empty when no hits.
+
+    ``fold_traditional=True`` runs the target text through the same
+    ``canonical_form`` (lowercase + NFKC + OpenCC t2s) the entity
+    surfaces went through at ingest, so a Traditional-Chinese passage
+    looks the same to the automaton as the Simplified entity surface
+    it should match.
     """
-    text_l = text.lower()
+    text_l = canonical_form(text, fold_traditional=fold_traditional) if fold_traditional else text.lower()
     counts: Dict[str, int] = defaultdict(int)
     for end_idx, (hash_id, surf) in automaton.iter(text_l):
         start = end_idx - len(surf) + 1
+        # Latin / digit boundary check applies only when both edges of
+        # the matched span are in the ASCII alnum class — the case the
+        # original "us"/"user" carve-out targeted. CJK matches skip the
+        # check (no script-level boundary character exists).
         left = text_l[start - 1] if start > 0 else " "
         right = text_l[end_idx + 1] if end_idx + 1 < len(text_l) else " "
-        if left.isalnum() or left == "_":
-            continue
-        if right.isalnum() or right == "_":
-            continue
+        surf_is_cjk = bool(_HAS_HAN_RE.search(surf))
+        if not surf_is_cjk:
+            if left.isalnum() or left == "_":
+                continue
+            if right.isalnum() or right == "_":
+                continue
         counts[hash_id] += 1
     return counts
 
@@ -109,6 +140,7 @@ def literal_backfill_graph(
     *,
     min_surface_chars: int = 4,
     multi_word_only: bool = True,
+    fold_traditional: bool = True,
 ) -> int:
     """In-place backfill: add missing entity↔passage edges from literal hits.
 
@@ -146,7 +178,9 @@ def literal_backfill_graph(
         if phash not in name_to_vidx:
             continue
         pvidx = name_to_vidx[phash]
-        counts = find_literal_matches(ptext or "", automaton)
+        counts = find_literal_matches(
+            ptext or "", automaton, fold_traditional=fold_traditional
+        )
         for ehash, count in counts.items():
             if ehash not in name_to_vidx:
                 continue

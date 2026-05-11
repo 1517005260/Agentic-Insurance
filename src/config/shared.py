@@ -1,7 +1,7 @@
 """Process-level singleton cache for heavy resources.
 
 The web layer kept hitting OOM on 8 GB hosts because the same heavy
-resource (spaCy zh transformer ~2 GB, faiss EmbeddingStore ~500 MB,
+resource (GLiNER multi-v2.1 ~1 GB, faiss EmbeddingStore ~500 MB,
 tiktoken encoder ~50 MB × 6 callsites) was instantiated independently
 by lifespan, ingest, RAG channels and agent tools. This module gives
 those resources one process-level cache that every callsite can share.
@@ -66,8 +66,8 @@ _VALID_SESSION_PROFILES: frozenset[str] = frozenset(get_args(SessionProfile))
 
 if TYPE_CHECKING:  # pragma: no cover — types only
     import requests
-    import spacy.language
     import tiktoken
+    from gliner import GLiNER
 
     from storage.embedding_store import EmbeddingStore
 
@@ -97,120 +97,132 @@ def _key_lock(key: str) -> threading.Lock:
         return lock
 
 
-# ----------------------------------------------------------- spaCy ----
+# ----------------------------------------------------------- GLiNER ----
 
 
-# Tri-state: None = not probed yet; True/False = result of the first
-# successful ``spacy.prefer_gpu()`` (process-wide invariant — once a
-# pipeline is loaded on GPU, every later call must keep using GPU ops
-# or the loaded model parameters end up on a different device than the
-# tensors thinc materialises).
-_SPACY_GPU_AVAILABLE: bool | None = None
-
-
-def _activate_spacy_gpu_for_current_thread() -> None:
-    """Make sure thinc's GPU ops are the active backend in *this* thread.
-
-    Why this exists: ``thinc.backends.context_ops`` is a ``ContextVar``.
-    ``ThreadPoolExecutor.submit`` (and therefore ``loop.run_in_executor``)
-    does **not** propagate the parent thread's contextvar values into
-    the worker thread — the worker starts with ``context_ops.get()``
-    returning the module default ``None``, which makes
-    ``get_current_ops()`` silently fall back to ``NumpyOps`` via
-    ``require_cpu()``. From that point on, every input tensor thinc
-    materialises (e.g. ``input_ids`` inside ``spacy_curated_transformers``)
-    lands on CPU, but the transformer's ``nn.Embedding`` weight is still
-    on ``cuda:0`` from the main-thread load — yielding the
-    ``Expected all tensors to be on the same device`` ``RuntimeError``
-    we hit during concurrent reingest.
-
-    The fix is to re-assert the GPU ops on the calling thread every time
-    a cached pipeline is handed out. ``spacy.prefer_gpu()`` is idempotent
-    and cheap on the hot path (it short-circuits when the requested ops
-    type is already current), and crucially it's the same call the cold
-    load uses — so the main thread and any worker thread end up with
-    the exact same backend selection.
-
-    No-ops once ``_SPACY_GPU_AVAILABLE`` was probed and came back False
-    (e.g. CPU-only host); we don't want to retry GPU activation per call
-    and pay the cupy-import cost on every hand-out.
-    """
-    if _SPACY_GPU_AVAILABLE is not True:
-        return
-    import spacy
-
-    spacy.prefer_gpu()
-
-
-@lru_cache(maxsize=8)
-def _spacy_cached(model_path: str) -> "spacy.language.Language":
+@lru_cache(maxsize=4)
+def _gliner_cached(model_id: str) -> "GLiNER":
     """Inner cached loader; the public wrapper adds a per-key lock.
 
-    GPU activation is self-contained: ``torch`` is imported first so its
-    bundled ``libcudart.so.12`` is dlopen'd into the process — without
-    this preload, ``cupy`` cannot find the runtime even when installed,
-    and ``thinc.has_cupy`` silently returns False (we lose the GPU path
-    without any error). After torch is in, ``spacy.prefer_gpu()`` flips
-    thinc's backend to cupy if a usable GPU exists, transparently
-    falling back to CPU otherwise (idempotent across calls).
+    GPU is mandatory by project policy. We import ``torch`` first to
+    surface a clear ``RuntimeError`` on CPU-only hosts before paying the
+    HuggingFace download cost. Then we:
 
-    On a 6 GB RTX 3060 with EN+ZH ``_trf`` resident, GPU mode trims
-    Python RSS by ~800 MB (transformer weights + activations live in
-    VRAM instead of host) and speeds NER 3-4×. Entity output is
-    bit-identical to CPU mode, so the algorithm contract is unchanged.
+    1. Resolve the GLiNER snapshot via
+       ``snapshot_download(model_id, local_files_only=True)``. Cache
+       miss → one-shot online download for first-time deploys (the
+       only network call this function makes; subsequent process
+       starts never touch the wire). Operators should pre-warm via
+       ``python download_models.py``.
+    2. **Force ``HF_HUB_OFFLINE`` / ``TRANSFORMERS_OFFLINE`` before
+       importing ``gliner``**. GLiNER's ``_load_tokenizer`` calls
+       ``AutoTokenizer.from_pretrained(config.model_name, …)`` with
+       the base-model repo id (``microsoft/mdeberta-v3-base`` for
+       gliner_multiv2.1) — *not* the local snapshot path — so even
+       a local-path-only load triggers a HuggingFace Hub metadata
+       probe (``…/tree/main/additional_chat_templates``). On
+       mainland-China deployments that probe times out at 60 s,
+       which we measured as a 5× ingest slowdown before this fix.
+       The env vars must be set *before* transformers is imported the
+       first time, because transformers caches the offline flag at
+       module import. Our project never imports transformers
+       directly, so the ``from gliner import GLiNER`` below is the
+       first chance — fine as long as we set the env vars first.
+    3. Load the weights from the resolved local path and move to
+       cuda fp16 (~0.6 GB VRAM resident, no measurable accuracy
+       loss vs fp32).
 
-    The boolean returned by ``prefer_gpu`` is captured into the module
-    flag ``_SPACY_GPU_AVAILABLE`` so :func:`shared_spacy` can re-assert
-    GPU ops in worker threads without re-probing cupy on every call
-    (see :func:`_activate_spacy_gpu_for_current_thread`).
+    GLiNER runs on native PyTorch, so the per-thread backend
+    re-activation dance the prior spaCy pipeline needed (thinc
+    ContextVar trick for ``run_in_executor`` worker threads) is
+    obsolete. PyTorch tensors carry their device with them; any
+    thread's forward pass on a cuda-resident model stays on GPU
+    without extra bookkeeping.
     """
-    import torch  # noqa: F401  — preload libcudart for cupy
-    import spacy
+    import os
 
-    global _SPACY_GPU_AVAILABLE
-    _SPACY_GPU_AVAILABLE = bool(spacy.prefer_gpu())
-    logger.debug(
-        "_spacy_cached: loading %s (gpu=%s)", model_path, _SPACY_GPU_AVAILABLE
-    )
-    return spacy.load(model_path)
+    # CRITICAL: set offline mode BEFORE importing huggingface_hub /
+    # transformers / gliner. Both libs read this env var ONCE at
+    # module-import time and cache it into a module-level constant
+    # (``huggingface_hub.constants.HF_HUB_OFFLINE``,
+    # ``transformers.utils.hub._is_offline_mode``); a later
+    # ``os.environ.setdefault`` is silently ignored. If we set env
+    # after ``from huggingface_hub import snapshot_download`` the
+    # constants are already False and the GLiNER tokenizer load
+    # below will hit api/models/microsoft/mdeberta-v3-base on every
+    # call — measured as the 60 s timeout per cold start on
+    # mainland-China deployments before this fix.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    import torch
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "GLiNER requires CUDA; CPU inference is unsupported by project "
+            "policy. Set up a CUDA-enabled torch build or run on a GPU host."
+        )
+
+    try:
+        local_dir = snapshot_download(model_id, local_files_only=True)
+        logger.debug(
+            "_gliner_cached: resolved %s to local snapshot %s", model_id, local_dir
+        )
+    except LocalEntryNotFoundError:
+        # First-time bootstrap: cache miss in offline mode → temporarily
+        # flip online for a one-shot download, then restore offline so
+        # the subsequent ``from gliner import GLiNER`` and the GLiNER
+        # tokenizer load below stay offline. ``importlib.reload`` of
+        # the ``huggingface_hub.constants`` module is the documented
+        # way to refresh the cached flag after toggling the env var
+        # at runtime; there is no public API for this.
+        import importlib
+        import huggingface_hub.constants as _hf_const
+
+        logger.warning(
+            "_gliner_cached: %s not in HF cache; downloading once. "
+            "Run `python download_models.py` at deploy time to skip this.",
+            model_id,
+        )
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        importlib.reload(_hf_const)
+        try:
+            local_dir = snapshot_download(model_id)
+        finally:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
+            importlib.reload(_hf_const)
+
+    from gliner import GLiNER
+
+    logger.debug("_gliner_cached: loading %s from %s on cuda fp16", model_id, local_dir)
+    model = GLiNER.from_pretrained(local_dir).to("cuda").half()
+    model.eval()
+    return model
 
 
-def shared_spacy(model_path: str) -> "spacy.language.Language":
-    """Return the cached spaCy ``Language`` for ``model_path``.
+def shared_gliner(model_id: str) -> "GLiNER":
+    """Return the cached GLiNER model for ``model_id`` (HF repo id).
 
-    First call loads from disk (~2-5 s for ``zh_core_web_trf``, ~1-2 GB
-    resident); subsequent calls are O(1). The pipeline is shared across
-    threads — spaCy ``nlp.pipe`` / ``nlp(...)`` is documented thread-safe
-    for read-only inference (the underlying transformer's forward pass
-    is read-only).
+    First call downloads weights into the standard HF cache and loads
+    onto GPU in FP16 (~0.6 GB resident, ~0.7 GB peak during inference);
+    subsequent calls are O(1). The model is shared across threads —
+    PyTorch ``forward`` is read-only and the model is in ``eval()``
+    mode, so concurrent batch inference is safe.
 
-    The cache is keyed by the **string** path so callers that pass
-    ``Path`` objects must call ``str(path)`` first; we don't accept
-    ``Path`` because ``lru_cache`` would treat ``Path("a")`` and
-    ``Path("./a")`` as different keys even though they load the same
-    model. Force the caller to canonicalise.
-
-    Concurrency: the per-key lock guarantees the inner factory body
-    (``spacy.load``) is called at most once per ``model_path``. Plain
-    ``functools.lru_cache`` would let two concurrent miss callers
-    each run ``spacy.load`` and then race for the cache slot, doubling
-    GPU/CPU memory peaks during cold-start.
-
-    Per-thread GPU ops re-activation: when the model was loaded on GPU
-    in the main thread, every subsequent caller — including worker
-    threads spawned by ``loop.run_in_executor`` — must observe ``CupyOps``
-    as the current thinc backend, otherwise input tensors get
-    materialised on CPU while the model parameters live on cuda:0 (see
-    :func:`_activate_spacy_gpu_for_current_thread` for the full
-    diagnosis). We therefore re-assert GPU ops on each hand-out; the
-    call is cheap on the hot path and the only correct place to do it
-    (any caller-side opt-in would be silently forgotten next time we
-    add a new ingest entry point).
+    The cache is keyed by the HF ``repo_id`` string, so two callers
+    using the same model id share a single resident copy. Per-key lock
+    guarantees the underlying ``from_pretrained`` (~5-10 s on first
+    cold-start, even longer on a fresh HF cache) runs exactly once;
+    plain ``lru_cache`` would let concurrent miss callers each pull the
+    weights, doubling RSS during cold-start which is exactly what the
+    OOM-prone 8 GB host scenario fails on.
     """
-    with _key_lock(f"spacy:{model_path}"):
-        nlp = _spacy_cached(model_path)
-    _activate_spacy_gpu_for_current_thread()
-    return nlp
+    with _key_lock(f"gliner:{model_id}"):
+        return _gliner_cached(model_id)
 
 
 # ----------------------------------------------------------- tiktoken ----
@@ -229,11 +241,10 @@ def _tiktoken_cached(model_or_encoding: str) -> "tiktoken.Encoding":
 def shared_tiktoken_encoder(model_or_encoding: str) -> "tiktoken.Encoding":
     """Return the cached tiktoken ``Encoding`` for a model or encoding name.
 
-    Six callsites in the codebase (``LLMClient``, ``BaseAgent``,
-    ``ProofAgent``, ``SemanticSearchTool``, ``ReadTool``, ``BM25SearchTool``)
-    each used to hold their own encoder, costing ~50-150 MB resident
-    memory per instance. Sharing is safe because ``tiktoken.Encoding``
-    is read-only at use time.
+    Many callsites (``LLMClient``, ``BaseAgent``, ``ProofAgent``,
+    ``SemanticSearchTool``, ``ReadTool``, ``BM25SearchTool``) need an
+    encoder; one instance is ~50-150 MB resident, so we share. Safe
+    because ``tiktoken.Encoding`` is read-only at use time.
 
     We try ``encoding_for_model`` first (so callers can pass either
     ``"gpt-4o"`` or ``"cl100k_base"``); on failure we fall back to
@@ -300,10 +311,10 @@ def shared_embedding_store_for(store_dir: Path, namespace: str) -> "EmbeddingSto
     Most call sites already hold a ``Path`` from ``config.settings``;
     this helper canonicalises with ``resolve(strict=False)`` so even
     paths that don't exist yet (cold start before any ingest) get a
-    stable key — the file-existence check we used to do had a TOCTOU
-    race where the first caller might see "not exists" and store by
-    relative path while a second caller (after ingest created the dir)
-    saw "exists" and stored by absolute path, splitting the cache.
+    stable key. A dir-existence check would TOCTOU-race here: one
+    caller might see "not exists" and key by relative path while a
+    later caller (after ingest creates the dir) keys by absolute path,
+    splitting the cache.
     """
     canonical = str(store_dir.expanduser().resolve(strict=False))
     return shared_embedding_store(canonical, namespace)
@@ -311,10 +322,10 @@ def shared_embedding_store_for(store_dir: Path, namespace: str) -> "EmbeddingSto
 
 # ----------------------------------------------------- requests.Session ----
 
-# Session 池——按 ``profile`` 字符串 key 共享。``profile`` 是 caller
-# 自己定的标识符（"chat-stream-no-read-retry" / "tavily-tight" 等），
-# 同 profile 复用 session（urllib3 连接池 + retry 配置），不同 profile
-# 各自一份。
+# Session pool — shared by ``profile`` string key. ``profile`` is a
+# caller-chosen identifier ("chat-stream-no-read-retry", "tavily-tight",
+# ...); same profile reuses the session (urllib3 connection pool + retry
+# config), distinct profiles get distinct sessions.
 _SESSION_LOCK = threading.Lock()
 _SESSION_POOL: dict[str, "requests.Session"] = {}
 
@@ -372,10 +383,18 @@ def clear_caches() -> None:
     * Test teardown that needs a fresh load (rare; almost all tests
       can share the cached instances safely).
     * Hot-reload on admin config changes that genuinely require new
-      heavy resources (e.g. swapping the spaCy model path); the route
+      heavy resources (e.g. swapping the GLiNER model id); the route
       should call this and restart any in-flight subscribers.
+
+    GPU memory reclamation: ``_gliner_cached.cache_clear()`` only
+    releases the Python references; the PyTorch caching allocator
+    keeps the freed CUDA blocks in its pool until ``empty_cache()`` is
+    called, and Python's reference graph may still pin tensors through
+    a transient frame or weakref unless ``gc.collect()`` walks the
+    full cycle. We do both here so that swapping a GLiNER model id
+    via the admin route actually returns VRAM to the system.
     """
-    _spacy_cached.cache_clear()
+    _gliner_cached.cache_clear()
     _tiktoken_cached.cache_clear()
     _embedding_store_cached.cache_clear()
     with _SESSION_LOCK:
@@ -385,6 +404,24 @@ def clear_caches() -> None:
             except Exception:  # noqa: BLE001
                 pass
         _SESSION_POOL.clear()
+    # GPU reclamation: walk cycles first so any tensor held by a
+    # weakref / finalizer gets dropped, then ask the PyTorch caching
+    # allocator to release the freed blocks back to the driver.
+    # Guarded so a CPU-only host (e.g. CI) doesn't blow up on the
+    # ``torch.cuda.*`` calls.
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:  # noqa: BLE001
+        # Torch absent or CUDA in an odd state — best-effort cleanup
+        # shouldn't crash the caller (often a test teardown).
+        logger.debug("clear_caches: torch.cuda cleanup skipped", exc_info=True)
 
 
 def reload_embedding_stores_from_disk(
@@ -438,7 +475,7 @@ def canonical_store_key(store_dir: Path, namespace: str) -> "tuple[str, str]":
 
 
 __all__ = [
-    "shared_spacy",
+    "shared_gliner",
     "shared_tiktoken_encoder",
     "shared_embedding_store",
     "shared_embedding_store_for",

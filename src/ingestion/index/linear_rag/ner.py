@@ -1,26 +1,139 @@
-"""spaCy-backed NER with per-passage language routing.
+"""GLiNER-backed NER with open-set labels.
 
-Two responsibilities:
+Replaces the prior spaCy en/zh ``_trf`` + HanLP MTL stack. GLiNER multi-v2.1
+takes a runtime list of natural-language label descriptions
+(``["product", "term", "law", ...]``) and returns spans in one model
+forward, so changing domains is a prompt-list change — never a domain
+dictionary. The closed OntoNotes / MSRA tagsets the previous models used
+have no PRODUCT / TERM / CONCEPT classes, which on insurance / legal /
+medical text caused the ~50% recall floor we measured pre-change.
 
-1. **Semantic-type filter** — drop OntoNotes labels that almost always
-   carry numeric / temporal / measurement content (CARDINAL / ORDINAL /
-   PERCENT / MONEY / QUANTITY / DATE / TIME).
-2. **Language routing** — each passage is auto-detected as Chinese vs
-   non-Chinese (via langdetect). Chinese passages go through
-   ``zh_core_web_trf``, everything else through ``en_core_web_trf``. So
-   a corpus of mixed EN / Simplified / Traditional zh gets per-passage
-   pipeline selection without the caller setting anything.
+Two structural responsibilities preserved from the old SpacyNER:
 
-Anything that slips through the label filter is caught downstream by the
-structural ``normalize.is_junk`` check.
+1. **Catalog mention split** — spaCy occasionally captured a Chinese
+   product list (``A、B、C``) as a single span. The same can happen with
+   GLiNER on the same input shape, so :func:`split_catalog_mentions`
+   stays as a NER-side post-processor (mention boundary repair, not
+   domain knowledge).
+2. **Sentence-level NER** — the algorithm needs both
+   ``passage → entities`` and ``sentence → entities`` maps. We drive
+   sentence segmentation through pysbd (see ``_sentence.py``) so that
+   stays correct under arbitrary mixed zh/en input.
 """
 
 from collections import defaultdict
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 import regex
 
-from config.shared import shared_spacy
+from config.shared import shared_gliner
+from ingestion.index._sentence import split_sentences
+
+
+# ---------------------------------------------------------- input scrub
+
+# Drop ``<img ...>`` / ``<img />`` outright (no inner text to recover).
+_IMG_RE = regex.compile(r"<img\b[^>]*?/?>", regex.IGNORECASE)
+# Drop opening / closing ``<script>`` ``<style>`` tags AND their bodies.
+# We never want the inner text of a stylesheet entering the entity
+# universe (``word-wrap`` / ``break-word`` etc surfaced as entities in
+# the previous run).
+_SCRIPT_STYLE_RE = regex.compile(
+    r"<(script|style)\b[^>]*?>.*?</\1>",
+    regex.IGNORECASE | regex.DOTALL,
+)
+# LaTeX-superscript pattern PaddleOCR spits out for footnote markers,
+# e.g. ``$ ^{1} $``. Strip wholesale before NER so they don't bleed
+# into surrounding spans.
+_LATEX_SUP_RE = regex.compile(r"\$\s*\^\{[^}]*\}\s*\$")
+# Markdown table row marker ``|---|---|`` and trailing pipe sequences;
+# turning them into spaces lets the per-row content read as one line.
+_MD_TABLE_RULE_RE = regex.compile(r"^\s*\|?\s*[:\- ]+\|[:\-| ]+\s*$", regex.MULTILINE)
+# Generic ``<tag ...>`` open tag that is NOT a ``<table>``/``<tr>``/``<td>``
+# — those have row-level structural meaning we want to preserve as
+# newlines (handled separately below). Closing tags ``</...>`` are also
+# stripped here.
+_HTML_OPEN_TAG_RE = regex.compile(
+    r"</?(?!(?:table|thead|tbody|tr|td|th)\b)[A-Za-z][A-Za-z0-9-]*\b[^>]*?>"
+)
+# Row separators inside an HTML table — ``<tr>`` opens a new line,
+# ``</tr>`` closes the line, ``<td>`` / ``<th>`` cell boundaries become
+# spaces. We do this BEFORE the generic-tag scrub so the table
+# structure survives.
+_HTML_TR_OPEN_RE = regex.compile(r"<tr\b[^>]*?>", regex.IGNORECASE)
+_HTML_TR_CLOSE_RE = regex.compile(r"</tr\s*>", regex.IGNORECASE)
+_HTML_CELL_RE = regex.compile(r"</?(?:td|th)\b[^>]*?>", regex.IGNORECASE)
+_HTML_TABLE_BOUNDARY_RE = regex.compile(
+    r"</?(?:table|thead|tbody)\b[^>]*?>", regex.IGNORECASE
+)
+# Markdown table cell separator: a ``|`` is treated as a separator
+# only when the line containing it has at least 2 pipes AND starts /
+# ends with a pipe (modulo whitespace) — the canonical markdown table
+# row shape. A standalone ``|`` in body prose / regex literals /
+# pseudocode is left intact. Lines that look like table rows have
+# their pipes flattened to spaces; everything else passes through.
+_MD_TABLE_ROW_RE = regex.compile(
+    r"^\s*\|.*\|.*$",
+    regex.MULTILINE,
+)
+
+
+def _flatten_md_table_pipes(text: str) -> str:
+    """Replace ``|`` with space only on lines that look like markdown table rows."""
+    def _row_repl(m: "regex.Match[str]") -> str:
+        return m.group(0).replace("|", " ")
+    return _MD_TABLE_ROW_RE.sub(_row_repl, text)
+# Final whitespace collapse (multiple spaces / blank lines → one space
+# / one newline). Keep newlines so pysbd treats each table row as its
+# own line; pysbd happens to split on punctuation, not newlines, but
+# downstream ``split_catalog_mentions`` benefits from the line break.
+_MULTI_BLANK_RE = regex.compile(r"\n{2,}")
+_MULTI_SPACE_RE = regex.compile(r"[ \t]+")
+
+
+def preclean_for_ner(text: str) -> str:
+    """Strip OCR markup so each table row reads as one sentence.
+
+    Applied to passage text on the way into the NER model — not to the
+    ``passage_store`` which keeps the original markdown so evidence-side
+    rendering stays faithful. Targeting four structural OCR shapes the
+    benchmark surfaced as noise sources:
+
+    1. ``<img />`` and ``<script>`` / ``<style>`` blocks (drop entirely).
+    2. ``<table>``: ``<tr>`` becomes a newline, ``<td>``/``<th>`` becomes
+       a space, so each row reads as one sentence — exactly the shape
+       NER models handle well.
+    3. Markdown tables (``|---|---|`` rule rows + ``|`` cell separators):
+       the rule line is dropped, the pipes become spaces.
+    4. LaTeX superscript footnote markers (``$ ^{1} $``).
+
+    All other HTML tags are stripped but their inner text is preserved.
+    """
+    if not text:
+        return text
+    s = text
+    s = _SCRIPT_STYLE_RE.sub(" ", s)
+    s = _IMG_RE.sub(" ", s)
+    # HTML table → row-per-line plain text. Order matters: insert row
+    # newlines, then cell-boundary spaces, then drop table-level
+    # boundaries.
+    s = _HTML_TR_OPEN_RE.sub("\n", s)
+    s = _HTML_TR_CLOSE_RE.sub("\n", s)
+    s = _HTML_CELL_RE.sub(" ", s)
+    s = _HTML_TABLE_BOUNDARY_RE.sub(" ", s)
+    # Generic tags after table structure.
+    s = _HTML_OPEN_TAG_RE.sub(" ", s)
+    # Markdown tables: drop the rule row first (so pipe flatten below
+    # doesn't leave bare hyphens), then flatten cell pipes only on
+    # lines that look like real table rows.
+    s = _MD_TABLE_RULE_RE.sub("", s)
+    s = _flatten_md_table_pipes(s)
+    # LaTeX superscripts.
+    s = _LATEX_SUP_RE.sub(" ", s)
+    # Whitespace collapse last.
+    s = _MULTI_SPACE_RE.sub(" ", s)
+    s = _MULTI_BLANK_RE.sub("\n", s)
+    return s.strip()
 
 
 # Pure-punctuation list separators commonly used in Chinese product
@@ -42,11 +155,11 @@ _CATALOG_LIST_SEP_RE = regex.compile(r"[、；;•｜|，]+")
 def split_catalog_mentions(text: str) -> List[str]:
     """Fan out a catalog/list span into one surface per mention.
 
-    spaCy occasionally captures a Chinese product list (``A、B、C`` or
-    ``A；B；C``) as a single entity span. Split on the safe set of
-    pure-punctuation list separators so each sub-mention enters the
-    canonicaliser independently. Surfaces with no separator come back
-    as a single-element list, so callers can iterate uniformly.
+    GLiNER (like spaCy before it) occasionally captures a Chinese product
+    list (``A、B、C`` or ``A；B；C``) as a single entity span. Split on the
+    safe set of pure-punctuation list separators so each sub-mention
+    enters the canonicaliser independently. Surfaces with no separator
+    come back as a single-element list, so callers can iterate uniformly.
 
     This function lives on the **NER side** of the pipeline (mention
     boundary repair) — distinct from ``normalize.cleanup`` which only
@@ -61,127 +174,173 @@ def split_catalog_mentions(text: str) -> List[str]:
     return out or [stripped]
 
 
-# OntoNotes labels that almost always carry numeric / temporal /
-# measurement content rather than a reference-able entity. Dropping these
-# at NER time is **domain-neutral** — they correspond to what one would
-# normally call "facts" rather than "things".
-DEFAULT_DROP_LABELS: FrozenSet[str] = frozenset(
-    {
-        "CARDINAL",   # 42, three, 1.5
-        "ORDINAL",    # 1st, second
-        "PERCENT",    # 25%
-        "MONEY",      # USD500, $1.5M
-        "QUANTITY",   # 5 km, 3kg
-        "DATE",       # 2024, last Tuesday
-        "TIME",       # 4 pm, 03:00
-    }
+# Default open-set label list. Mirrors what the empirical study against
+# 4 real insurance documents showed to give the best mix of recall and
+# precision: domain-specific surfaces (product names, codes, regulatory
+# terms) AND noise-control labels (currency, person role) so we don't
+# accidentally absorb pronouns / measurements / dates into the entity
+# universe. English wording is intentional — GLiNER's mT5 backbone
+# tokenises English label tokens more stably than Chinese ones.
+DEFAULT_LABELS: Tuple[str, ...] = (
+    "product",
+    "term",
+    "concept",
+    "organization",
+    "code",
+    "law",
+    "regulation",
+    "person role",
 )
 
 
-def _detect_lang(text: str) -> str:
-    """Return ``"zh"`` if text contains a Han ideograph, ``"en"`` otherwise.
+class GLiNERAdapter:
+    """GLiNER-backed NER façade compatible with the prior SpacyNER call shape.
 
-    Any-Han-char → zh works once passage text is the document body alone
-    (no metadata prefix). Stray Han characters inside an English passage
-    are rare in practice; if they show up the trf-en pipeline still
-    handles them gracefully (transformer tokenizers don't crash on OOV
-    scripts), the worst case is a misroute on a single passage.
-    """
-    import regex
+    Same public surface as the old SpacyNER (``batch_ner``,
+    ``question_ner``, ``extract_entities_sentences``) so all existing
+    callsites in ``LinearRAG`` and ``GraphPPRChannel`` swap in without
+    touching their orchestration logic.
 
-    if regex.search(r"\p{Han}", text or ""):
-        return "zh"
-    return "en"
+    Per-passage flow:
 
-
-class SpacyNER:
-    """spaCy NER wrapper with configurable label filtering and per-passage
-    language routing.
-
-    ``spacy_model`` is the path to the EN pipeline. ``zh_spacy_model`` is
-    the optional ZH path; if unset the routing falls back to EN for every
-    passage.
+    1. ``pysbd`` splits the passage into sentences.
+    2. One batched ``model.batch_predict_entities`` call scores all
+       sentences against the runtime label list.
+    3. Each entity span goes through ``split_catalog_mentions`` so a
+       single span like ``"A、B、C"`` fans out to three surfaces.
+    4. Results are aggregated into the same ``(passage_to_entities,
+       sentence_to_entities)`` dict shape ``LinearRAG`` already
+       consumes.
     """
 
     def __init__(
         self,
-        spacy_model: str,
-        zh_spacy_model: Optional[str] = None,
-        drop_labels: Optional[Iterable[str]] = None,
+        model_id: str,
+        labels: Optional[Sequence[str]] = None,
+        threshold: float = 0.3,
+        batch_size: int = 16,
     ):
-        # Pipelines come from the process-wide cache (``config.shared``)
-        # so a parent that already pre-warmed an EN/ZH trf pipeline at
-        # lifespan and a per-ingest LinearRAG share the same Language
-        # object instead of paying ~1.5 GB per duplicate ``spacy.load``.
-        # Concurrent reads via ``nlp.pipe`` are documented thread-safe;
-        # mutation paths are serialised by ``INGEST_LOCK`` upstream.
-        self._pipelines: Dict[str, Any] = {"en": shared_spacy(spacy_model)}
-        if zh_spacy_model:
-            self._pipelines["zh"] = shared_spacy(zh_spacy_model)
-        self.drop_labels: FrozenSet[str] = (
-            frozenset(drop_labels) if drop_labels is not None else DEFAULT_DROP_LABELS
+        # Pulled from the process-wide cache so ingest workers and the
+        # lifespan-pinned PPR channel share a single resident copy of
+        # the GLiNER weights (see config.shared.shared_gliner).
+        self._model = shared_gliner(model_id)
+        self.labels: List[str] = list(labels) if labels else list(DEFAULT_LABELS)
+        self.threshold = float(threshold)
+        self.batch_size = int(batch_size)
+
+    # ----------------------------------------------- batch passage NER ----
+
+    def batch_ner(
+        self,
+        hash_id_to_passage: Dict[str, str],
+        max_workers: int,  # kept for SpacyNER-compatible signature; unused
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Run NER over a passage dict; return two maps GLM consumers want.
+
+        Returns ``(passage_hash_id_to_entities, sentence_to_entities)``.
+        Entity surfaces are deduplicated per passage and per sentence
+        (preserving first-occurrence order).
+
+        Sentence segmentation runs first across all passages so we can
+        feed one large batched forward to the model rather than one call
+        per passage. ``max_workers`` is ignored — the bottleneck used to
+        be NumPy/CPU spaCy forward; on GPU FP16 GLiNER, single-process
+        batched inference is faster than thread-fanned single-passage
+        calls (no GIL release benefit on a CUDA forward).
+        """
+        # Build a flat list of (passage_hash, sentence_text) pairs so we
+        # can run one big batched forward and re-associate at the end.
+        # Empty passages are kept as keys so the caller's diff logic
+        # (load_existing_data → new_passage_hash_ids) stays consistent.
+        # ``preclean_for_ner`` strips HTML / table / LaTeX markup BEFORE
+        # sentence splitting so each table row reads as one sentence —
+        # the shape GLiNER's mT5 backbone handles best.
+        sentence_index: List[Tuple[str, str]] = []
+        passage_hash_id_to_sentences: Dict[str, List[str]] = {}
+        for hash_id, passage in hash_id_to_passage.items():
+            cleaned = preclean_for_ner(passage)
+            sents = split_sentences(cleaned)
+            passage_hash_id_to_sentences[hash_id] = sents
+            for s in sents:
+                sentence_index.append((hash_id, s))
+
+        if not sentence_index:
+            return {h: [] for h in hash_id_to_passage}, {}
+
+        all_sentences = [s for _, s in sentence_index]
+        # GLiNER ``inference`` returns a list-of-lists of
+        # ``{text, label, score, start, end}`` dicts, parallel to
+        # inputs. Pass ``batch_size`` so multi-sentence forward
+        # passes get folded into GPU-batched matmuls instead of one
+        # forward per sentence (the deprecated
+        # ``batch_predict_entities`` did this implicitly; the new
+        # ``inference`` API requires the explicit knob).
+        all_results: List[List[Dict[str, Any]]] = self._model.inference(
+            all_sentences,
+            self.labels,
+            threshold=self.threshold,
+            batch_size=self.batch_size,
         )
 
-    @property
-    def spacy_model(self):
-        """The EN pipeline. Prefer :meth:`pipeline_for` when the language matters."""
-        return self._pipelines["en"]
-
-    def pipeline_for(self, lang: str):
-        """Return the pipeline for ``lang``, falling back to ``en``."""
-        return self._pipelines.get(lang, self._pipelines["en"])
-
-    def batch_ner(self, hash_id_to_passage, max_workers):
-        # Group passages by detected language so each pipeline runs once
-        # over a contiguous batch (spaCy's pipe is much faster than per-text
-        # calls, especially with the trf component).
-        by_lang: Dict[str, List[tuple]] = defaultdict(list)
-        for hash_id, passage in hash_id_to_passage.items():
-            by_lang[_detect_lang(passage)].append((hash_id, passage))
-
-        passage_hash_id_to_entities: Dict[str, List[str]] = {}
+        passage_to_entities: Dict[str, List[str]] = {
+            h: [] for h in hash_id_to_passage
+        }
+        passage_to_seen: Dict[str, set] = {h: set() for h in hash_id_to_passage}
         sentence_to_entities: Dict[str, List[str]] = defaultdict(list)
+        sentence_seen: Dict[str, set] = defaultdict(set)
 
-        for lang, items in by_lang.items():
-            nlp = self.pipeline_for(lang)
-            texts = [t for _, t in items]
-            batch_size = max(1, len(texts) // max(1, max_workers))
-            for (hash_id, _), doc in zip(items, nlp.pipe(texts, batch_size=batch_size)):
-                single_passage, single_sentence = self.extract_entities_sentences(
-                    doc, hash_id
-                )
-                passage_hash_id_to_entities.update(single_passage)
-                for sent, ents in single_sentence.items():
-                    for e in ents:
-                        if e not in sentence_to_entities[sent]:
-                            sentence_to_entities[sent].append(e)
-        return passage_hash_id_to_entities, sentence_to_entities
-
-    def extract_entities_sentences(self, doc, passage_hash_id):
-        sentence_to_entities = defaultdict(list)
-        unique_entities = set()
-        passage_hash_id_to_entities = {}
-        for ent in doc.ents:
-            if ent.label_ in self.drop_labels:
+        for (hash_id, sent_text), spans in zip(sentence_index, all_results):
+            if not spans:
                 continue
-            sent_text = ent.sent.text
-            # Fan out catalog/list spans into one surface per mention
-            # so each piece deduplicates through the canonicaliser.
-            # Surfaces with no separator come back as a single-element
-            # list, so the loop body stays uniform.
-            for piece in split_catalog_mentions(ent.text):
-                if piece not in sentence_to_entities[sent_text]:
-                    sentence_to_entities[sent_text].append(piece)
-                unique_entities.add(piece)
-        passage_hash_id_to_entities[passage_hash_id] = list(unique_entities)
-        return passage_hash_id_to_entities, sentence_to_entities
+            for span in spans:
+                raw = span.get("text") or ""
+                if not raw:
+                    continue
+                for piece in split_catalog_mentions(raw):
+                    if piece not in sentence_seen[sent_text]:
+                        sentence_seen[sent_text].add(piece)
+                        sentence_to_entities[sent_text].append(piece)
+                    if piece not in passage_to_seen[hash_id]:
+                        passage_to_seen[hash_id].add(piece)
+                        passage_to_entities[hash_id].append(piece)
 
-    def question_ner(self, question: str):
-        nlp = self.pipeline_for(_detect_lang(question))
-        doc = nlp(question)
-        question_entities = set()
-        for ent in doc.ents:
-            if ent.label_ in self.drop_labels:
-                continue
-            question_entities.add(ent.text.lower())
-        return question_entities
+        return passage_to_entities, dict(sentence_to_entities)
+
+    # ----------------------------------------------- query-side NER ----
+
+    def question_ner(self, question: str) -> set:
+        """Return a set of lowercased entity surfaces from the question.
+
+        Used by ``GraphPPRChannel._seed_entities`` to find PPR seeds.
+        Same return contract as the prior SpacyNER (set of lowercase
+        strings) so the caller is unchanged.
+        """
+        if not question or not question.strip():
+            return set()
+        sents = split_sentences(question) or [question]
+        spans = self._model.inference(
+            sents,
+            self.labels,
+            threshold=self.threshold,
+            batch_size=self.batch_size,
+        )
+        out: set = set()
+        for sent_spans in spans:
+            for span in sent_spans:
+                raw = (span.get("text") or "").strip().lower()
+                if raw:
+                    out.add(raw)
+        return out
+
+    # ------------------------------------- per-passage helper (test/api) ----
+
+    def extract_entities_sentences(
+        self, text: str, passage_hash_id: str
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+        """Single-passage convenience that mirrors the SpacyNER signature.
+
+        Returns ``({passage_hash_id: [entities]}, {sent_text: [entities]})``.
+        Internally just routes through :meth:`batch_ner`.
+        """
+        passage_map, sentence_map = self.batch_ner({passage_hash_id: text}, 1)
+        return passage_map, sentence_map

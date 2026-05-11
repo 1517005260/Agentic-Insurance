@@ -226,8 +226,8 @@ class ConfigStore:
     def chat_history_turns(self) -> int:
         """Recent (user, assistant) pairs replayed into the next request.
 
-        0 keeps every request stateless (the existing behaviour pre-
-        Phase 6); the chat route then skips the trace lookup entirely.
+        0 makes every request stateless and lets the chat route skip
+        the trace lookup entirely.
         """
         return int(self._values["chat.history_turns"])
 
@@ -235,7 +235,7 @@ class ConfigStore:
         """Cap on concurrent parse stages (faiss/graph index write stays serial).
 
         Powers the ``INGEST_PARSE_SEM`` semaphore in
-        :mod:`api.services.files`. 1 = original fully-serial behaviour.
+        :mod:`api.services.files`. 1 = fully-serial parse.
         """
         return int(self._values["ingest.parallel_workers"])
 
@@ -246,11 +246,11 @@ class ConfigStore:
 
         Same pattern as :meth:`materialize_rag_config` — preserve any
         constructor-time tuning of non-admin fields (embedding client,
-        spaCy model paths, alias thresholds) and only overwrite the
-        three literal-backfill knobs that the admin UI exposes. The
-        backfill defaults double as the query-time PPR gazetteer
-        defaults inside :class:`GraphPPRChannel`, so flipping them
-        here propagates to both ingest and retrieval.
+        alias thresholds) and only overwrite the literal-backfill +
+        GLiNER knobs that the admin UI exposes. The backfill defaults
+        double as the query-time PPR gazetteer defaults inside
+        :class:`GraphPPRChannel`, so flipping them here propagates to
+        both ingest and retrieval.
         """
         from config.linear_rag import LinearRAGConfig
         starting = base if base is not None else LinearRAGConfig()
@@ -261,6 +261,10 @@ class ConfigStore:
             literal_backfill_multi_word_only=bool(
                 self._values["linear_rag.literal_backfill_multi_word_only"]
             ),
+            gliner_model_id=str(self._values["linear_rag.gliner_model_id"]),
+            gliner_labels=list(self._values["linear_rag.gliner_labels"]),
+            gliner_threshold=float(self._values["linear_rag.gliner_threshold"]),
+            junk_max_han_chars=int(self._values["linear_rag.junk_max_han_chars"]),
         )
 
     def graph_explore_kwargs(self) -> Dict[str, Any]:
@@ -268,8 +272,8 @@ class ConfigStore:
 
         Pass straight as ``**kwargs`` to ``GraphExploreTool(...)`` from
         the agent factory; the tool's constructor accepts these as
-        kw-only with the pre-Phase-6 hardcoded defaults so direct
-        instantiations (experiment scripts) keep bytewise behaviour.
+        kw-only and falls back to its built-in defaults so direct
+        instantiations (experiment scripts) keep working unchanged.
         """
         return {
             "entity_lookup_min_sim": float(self._values["graph_explore.entity_lookup_min_sim"]),

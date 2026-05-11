@@ -1,30 +1,37 @@
-"""Sentence segmentation via spaCy's sentencizer.
+"""Sentence segmentation via pysbd.
 
-A blank pipeline (no model file, no torch) plus the rule-based ``sentencizer``
-component is enough for English / Chinese / multilingual splitting and is
-fast on CPU. We cache one pipeline per language code.
+Pure-Python rule-based sentence boundary disambiguation, 22 languages
+incl. zh/en. Replaces spaCy's blank+sentencizer for the lightweight
+passage→sentence split path used by ``text_dense`` / ``maintenance``.
+~320 KB package, no model files, sub-millisecond per call.
 """
 
 from typing import Dict, List
 
-import spacy
-from spacy.language import Language
+import pysbd
+import regex
 
-_NLP_CACHE: Dict[str, Language] = {}
+_HAN_RE = regex.compile(r"\p{Han}")
+_SEG_CACHE: Dict[str, pysbd.Segmenter] = {}
 
 
-def _get_nlp(lang: str) -> Language:
-    if lang not in _NLP_CACHE:
-        nlp = spacy.blank(lang)
-        if "sentencizer" not in nlp.pipe_names:
-            nlp.add_pipe("sentencizer")
-        _NLP_CACHE[lang] = nlp
-    return _NLP_CACHE[lang]
+def _segmenter_for(text: str) -> pysbd.Segmenter:
+    """Pick zh segmenter for any-Han input, else en. Cached per language."""
+    lang = "zh" if _HAN_RE.search(text) else "en"
+    seg = _SEG_CACHE.get(lang)
+    if seg is None:
+        seg = pysbd.Segmenter(language=lang, clean=False)
+        _SEG_CACHE[lang] = seg
+    return seg
 
 
 def split_sentences(text: str, lang: str = "xx") -> List[str]:
-    """Return non-empty stripped sentences. ``lang="xx"`` is multilingual."""
+    """Return non-empty stripped sentences. ``lang`` is ignored — the
+    language is auto-detected per call by a Han-character scan; explicit
+    routing was a leftover of the spaCy ``blank("zh"|"en")`` API and not
+    used by callers.
+    """
     if not text:
         return []
-    doc = _get_nlp(lang)(text)
-    return [s.text.strip() for s in doc.sents if s.text.strip()]
+    seg = _segmenter_for(text)
+    return [s.strip() for s in seg.segment(text) if s and s.strip()]

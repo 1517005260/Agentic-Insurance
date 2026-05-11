@@ -41,13 +41,12 @@ from config.settings import (
     faiss_graph_entity_dir,
     faiss_graph_passage_dir,
     faiss_graph_sentence_dir,
-    models_root,
 )
 from ingestion.index.linear_rag.backfill import (
     build_gazetteer_automaton,
     find_literal_matches,
 )
-from ingestion.index.linear_rag.ner import SpacyNER
+from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import normalize_for_hash
 from model_client import EmbeddingClient, get_cached_embedding_client
 from rag.channels.base import BaseChannel, ChannelHit
@@ -67,8 +66,6 @@ class GraphPPRChannel(BaseChannel):
         config: Optional[RAGConfig] = None,
         linear_config: Optional[LinearRAGConfig] = None,
         embedding_client: Optional[EmbeddingClient] = None,
-        spacy_model_name: str = "en_core_web_trf",
-        zh_spacy_model_name: Optional[str] = "zh_core_web_trf",
     ):
         self.config = config or RAGConfig()
         self.embedding_client = embedding_client or get_cached_embedding_client()
@@ -108,15 +105,13 @@ class GraphPPRChannel(BaseChannel):
                 ]
 
         # Lazy NER + lazy mention-graph init — not all queries reach PPR.
-        self._spacy: Optional[SpacyNER] = None
-        self._spacy_model_name = spacy_model_name
-        self._zh_spacy_model_name = zh_spacy_model_name
+        self._ner: Optional[GLiNERAdapter] = None
         self._entity_to_sents: Optional[Dict[str, List[str]]] = None
         self._sent_to_entities: Optional[Dict[str, List[str]]] = None
 
         # Lazy gazetteer Aho-Corasick automaton over entity surfaces, used
-        # as a query-side seed fallback when spaCy NER misses domain
-        # product names (e.g. "Heritage Protector Option"). Mirrors the
+        # as a query-side seed fallback when NER misses domain product
+        # names (e.g. "Heritage Protector Option"). Mirrors the
         # HippoRAG-2 query-to-node seeding idea.
         self._gazetteer_automaton = None
 
@@ -128,7 +123,7 @@ class GraphPPRChannel(BaseChannel):
         # ``last_debug`` so two concurrent agents (or the RAG pipeline +
         # an agent) sharing the same channel can't interleave a tool's
         # post-call ``self.last_debug`` read with another query's write.
-        # PPR is faiss + igraph + spaCy heavy; serializing has no
+        # PPR is faiss + igraph + GLiNER heavy; serializing has no
         # measurable throughput cost on a single-process dev box.
         import threading
 
@@ -136,7 +131,7 @@ class GraphPPRChannel(BaseChannel):
 
     # ----------------------------------------------------------- public API
 
-    def reload(self) -> None:
+    def reload(self, linear_config: Optional[LinearRAGConfig] = None) -> None:
         """Re-mmap faiss + re-read the GraphML so a fresh ingest is visible.
 
         The whole steady-state ``__init__`` is rebuilt:
@@ -153,13 +148,23 @@ class GraphPPRChannel(BaseChannel):
         * lazy NER / mention-map / gazetteer caches are dropped so the
           next query rebuilds from the current entity surfaces.
 
-        The spaCy model reference is preserved — it is heavy to load
-        (~8s, ~1.6 GB heap) and unaffected by ingest data.
+        ``linear_config`` (optional): swap in a freshly-materialised
+        ``LinearRAGConfig`` so admin-rotated NER knobs (``gliner_labels``
+        / ``gliner_threshold`` / ``gliner_model_id`` / literal-backfill
+        params) take effect on the query path without a process
+        restart. Without this, the channel kept the lifespan-time
+        snapshot and admin changes only landed at next ingest.
+
+        The shared GLiNER weights stay pinned by ``shared_gliner``'s
+        process-level cache; we drop the local adapter so the next
+        ``_ensure_ner()`` rebuilds it against the new linear_config.
 
         Held under ``_call_lock`` for the swap so a concurrent retrieve
         cannot read a half-rebuilt state.
         """
         with self._call_lock:
+            if linear_config is not None:
+                self.linear_config = linear_config
             # Same shared-cache lookup as ``__init__``. The cache
             # returns the *same* object as before, so reassignment is
             # idempotent. To force the cached store to pick up
@@ -206,6 +211,13 @@ class GraphPPRChannel(BaseChannel):
             self._entity_to_sents = None
             self._sent_to_entities = None
             self._gazetteer_automaton = None
+            # Drop the cached NER adapter too. The shared GLiNER model
+            # itself stays pinned by ``shared_gliner``'s lru_cache, but
+            # this adapter holds a frozen reference to the old
+            # labels / threshold from before the admin rotated config;
+            # forcing a re-construct on the next ``_ensure_ner()`` call
+            # picks up the current ``self.linear_config`` values.
+            self._ner = None
 
     def retrieve(self, ctx: QueryContext) -> List[ChannelHit]:
         # Hold ``_call_lock`` for the whole body so a downstream caller
@@ -271,16 +283,15 @@ class GraphPPRChannel(BaseChannel):
 
     # ----------------------------------------------------------- seeding
 
-    def _ensure_spacy(self) -> SpacyNER:
-        if self._spacy is None:
-            spacy_path = (models_root() / self._spacy_model_name).resolve()
-            zh_path: Optional[str] = None
-            if self._zh_spacy_model_name:
-                cand = (models_root() / self._zh_spacy_model_name).resolve()
-                if (cand / "config.cfg").is_file():
-                    zh_path = str(cand)
-            self._spacy = SpacyNER(str(spacy_path), zh_spacy_model=zh_path)
-        return self._spacy
+    def _ensure_ner(self) -> GLiNERAdapter:
+        if self._ner is None:
+            self._ner = GLiNERAdapter(
+                model_id=self.linear_config.gliner_model_id,
+                labels=self.linear_config.gliner_labels,
+                threshold=self.linear_config.gliner_threshold,
+                batch_size=self.linear_config.gliner_batch_size,
+            )
+        return self._ner
 
     def _seed_entities(
         self,
@@ -308,23 +319,26 @@ class GraphPPRChannel(BaseChannel):
         RAG pipeline keeps this off so the graph channel doesn't shadow
         the dense semantic channel under RRF fusion.
         """
-        try:
-            spacy = self._ensure_spacy()
-        except Exception as exc:  # spaCy model missing → skip NER, may still fall back
-            logger.warning("graph_ppr: NER unavailable (%s); falling back to dense-only", exc)
-            spacy = None
+        # GLiNER is a hard dependency by project policy ("zero fallback,
+        # NER as critical as the embedding API"). If the model fails to
+        # load — usually CUDA missing or HF cache corrupt — surface the
+        # error rather than silently downgrading PPR to dense-only mode,
+        # which previously masked the misconfiguration until graph
+        # answer quality degraded enough to trigger a user complaint.
+        ner = self._ensure_ner()
 
         canonical_seen: List[str] = []
         seen_set: set = set()
-        if spacy is not None:
-            raw_surfaces = spacy.question_ner(question)
-            for raw in raw_surfaces:
-                can = normalize_for_hash(
-                    raw, fold_traditional=self.linear_config.fold_traditional
-                )
-                if can and can not in seen_set:
-                    seen_set.add(can)
-                    canonical_seen.append(can)
+        raw_surfaces = ner.question_ner(question)
+        for raw in raw_surfaces:
+            can = normalize_for_hash(
+                raw,
+                fold_traditional=self.linear_config.fold_traditional,
+                han_fragment_max_chars=self.linear_config.junk_max_han_chars,
+            )
+            if can and can not in seen_set:
+                seen_set.add(can)
+                canonical_seen.append(can)
 
         best: Dict[str, Tuple[int, float]] = {}
 

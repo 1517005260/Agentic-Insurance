@@ -8,12 +8,12 @@ license = { text = "MIT" }
 
 # Dependency policy:
 #   - Generation / reranking / embedding go through OpenAI-compatible HTTP APIs.
-#   - Local models are NOT allowed except for one carve-out: the spaCy NER
-#     pipeline. Loading the transformer-based variants (en_core_web_trf,
-#     zh_core_web_trf) requires spacy-transformers, which transitively brings
-#     in transformers + torch — these are accepted ONLY as part of the NER
-#     exception. Do not introduce any other local-model runtime
-#     (sentence-transformers, accelerate, vllm, …).
+#   - Local models are NOT allowed except for one carve-out: the GLiNER NER
+#     pipeline. GLiNER (multi-v2.1) is an open-set NER that takes natural
+#     language label descriptions at runtime, so domain swap = prompt swap (no
+#     dictionary). Loading it pulls in torch + transformers transitively;
+#     these are accepted ONLY as part of the NER exception. Do not introduce
+#     any other local-model runtime (sentence-transformers, accelerate, vllm, …).
 dependencies = [
     # HTTP / API clients used by the model clients and PaddleOCR client.
     "requests>=2.28.0",
@@ -30,8 +30,7 @@ dependencies = [
     "pypdf>=4.0.0",
     # Numerics and columnar storage. scipy.sparse for the graph index;
     # parquet for embedding stores.
-    # spaCy 3.7 / thinc 8 are not numpy-2 compatible — pin <2 for ABI safety.
-    "numpy>=1.26.0,<2.0",
+    "numpy>=1.26.0",
     "scipy>=1.11.0",
     # numpy>=1.20 deprecated and 1.25 removed np.irr/np.npv/np.pmt/np.pv/np.fv/np.rate;
     # numpy_financial is the upstream successor — pure Python, ~30 KB, brings
@@ -51,28 +50,26 @@ dependencies = [
     # alternative regex-alternation path scales O(text * patterns) and is
     # noticeably slower once the entity vocabulary grows past ~50.
     "pyahocorasick>=2.1.0",
-    # spaCy NER (the local-model carve-out). The recent en/zh _trf models on
-    # HuggingFace ship the curated-transformers factory; older spacy-
-    # transformers is kept too because some downloaded models still
-    # reference its `transformer` factory. langdetect routes each page to
-    # the right pipeline.
-    "spacy>=3.7.0,<3.8.0",
-    "spacy-transformers>=1.4.0",
-    "spacy-curated-transformers>=0.2.0,<1.0.0",
-    # cupy enables spaCy's GPU backend via thinc. ``13.x`` is the last
-    # series compatible with thinc 8.2 (spacy 3.7 family) and with
-    # numpy 1.x; cupy 14 requires numpy 2 which breaks thinc's
-    # compiled C extensions. ``cupy-cuda12x`` matches the CUDA 12
-    # runtime that torch 2.x bundles in
-    # ``nvidia/cuda_runtime/lib/libcudart.so.12``; on a no-GPU host
-    # cupy still installs but ``spacy.prefer_gpu()`` returns False and
-    # we transparently fall back to the CPU pipeline.
-    "cupy-cuda12x>=13,<14",
+    # GLiNER multi-v2.1 — open-set NER (BERT-class, mT5 backbone). Takes a
+    # natural-language label list at runtime ("product", "term", "law", ...)
+    # and returns spans without retraining. Replaces the prior spaCy
+    # en/zh _trf + HanLP MTL stack: same VRAM footprint (FP16 ≈ 0.7 GB peak)
+    # but 4-20× higher entity recall on domain text (insurance / legal /
+    # medical) because the closed OntoNotes / MSRA tagsets miss
+    # PRODUCT / TERM / CONCEPT classes. GPU-only by project policy
+    # (CPU inference unsupported); the GLiNER weights live in the standard
+    # HuggingFace cache (~/.cache/huggingface/hub/), not in STORAGE_PATH.
+    "gliner>=0.2.0",
+    # Pure-Python sentence boundary disambiguation, 22 langs incl. zh/en,
+    # 320 KB. Replaces spaCy's blank+sentencizer for the lightweight
+    # passage→sentence split path used by text_dense / maintenance.
+    "pysbd>=0.3.4",
+    # langdetect drives query-side language routing in src/rag/preprocess.py;
+    # not on the NER hot path (NER routes by Han-character regex).
     "langdetect>=1.0.9",
     "ftfy>=6.3.1",
     "opencc-python-reimplemented>=0.1.7",
     "regex>=2026.4.4",
-    "spacy-pkuseg>=0.0.27",
     "babel>=2.18.0",
     "dateparser>=1.4.0",
     "portion>=2.6.1",

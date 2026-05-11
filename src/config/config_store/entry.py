@@ -14,12 +14,13 @@ from typing import Any, Optional
 @dataclass(frozen=True)
 class ConfigEntry:
     key: str
-    type: str            # "int" | "str" | "float" | "bool"
+    type: str            # "int" | "str" | "float" | "bool" | "list_str"
     default: Any         # imported live from the algorithm layer
     description: str = ""
     # Range / length bounds. Inclusive. For ``int`` / ``float`` both
     # apply; for ``str`` only ``max_length`` (and ``min_length`` if you
-    # want a non-empty constraint); ``bool`` ignores them.
+    # want a non-empty constraint); ``bool`` ignores them; ``list_str``
+    # uses ``min_length`` / ``max_length`` against the list length.
     min: Optional[float] = None
     max: Optional[float] = None
     min_length: Optional[int] = None
@@ -84,6 +85,30 @@ class ConfigEntry:
                     f"{self.key}: length {len(value)} > max_length {self.max_length}"
                 )
             return value
+        if self.type == "list_str":
+            # JSON arrays of strings — used for open-set NER prompt
+            # lists. ``str`` is rejected to force the admin UI's
+            # JSON-encoded payload contract; we don't auto-split a
+            # comma-separated string for the same reason ``int``
+            # doesn't auto-cast ``"5"``.
+            if not isinstance(value, list):
+                raise ValueError(
+                    f"{self.key}: expected list[str], got {type(value).__name__}"
+                )
+            for i, item in enumerate(value):
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"{self.key}[{i}]: expected str, got {type(item).__name__}"
+                    )
+            if self.min_length is not None and len(value) < self.min_length:
+                raise ValueError(
+                    f"{self.key}: length {len(value)} < min_length {self.min_length}"
+                )
+            if self.max_length is not None and len(value) > self.max_length:
+                raise ValueError(
+                    f"{self.key}: length {len(value)} > max_length {self.max_length}"
+                )
+            return list(value)  # defensive copy — the store snapshot is immutable
         raise ValueError(f"{self.key}: unsupported entry type {self.type!r}")
 
     def to_public_dict(self) -> dict:

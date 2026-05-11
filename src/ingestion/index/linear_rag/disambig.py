@@ -339,10 +339,6 @@ def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
 # ``surface_quality_score`` change so older cache files (which encode
 # the *previous* canonical-picker output) are silently invalidated and
 # recomputed on next read.
-#
-# v1: longest-surface canonical (legacy)
-# v2: surface_quality_score canonical + composite-aware admission gate
-#     (this PR — P1, P2 from codex review of 2026-05)
 CLUSTERS_CACHE_VERSION = 2
 
 

@@ -113,16 +113,16 @@ class RAGPipeline:
     # ----------------------------------------------------------- warm-up ----
 
     def warm_up(self) -> Dict[str, float]:
-        """Pre-load lazily-initialized heavy resources (spaCy NER, …).
+        """Pre-load lazily-initialized heavy resources (GLiNER NER, …).
 
-        Without this the first query absorbs the one-time cost — typically
-        ~10-15 s for the en + zh transformer NER models — and its timing
-        is not comparable to subsequent queries. Returns a per-component
-        warm-up timing dict for visibility.
+        Without this the first query absorbs the one-time cost —
+        ~3-10 s for the GLiNER multi-v2.1 weights depending on HF cache
+        warmth — and its timing is not comparable to subsequent queries.
+        Returns a per-component warm-up timing dict for visibility.
         """
         timings: Dict[str, float] = {}
         for ch in self.channels:
-            ensure = getattr(ch, "_ensure_spacy", None)
+            ensure = getattr(ch, "_ensure_ner", None)
             if not callable(ensure):
                 continue
             t0 = time.perf_counter()

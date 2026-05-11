@@ -249,11 +249,11 @@ def _build_indexes_serial(
     Used by the web ingest path on memory-constrained hosts (8 GB
     WSL): each builder's working set (NER pipeline buffers, embedding
     client batches, igraph snapshots) gets a chance to release before
-    the next stage starts. spaCy / torch native allocations don't
-    fully return to the OS through ``gc.collect`` alone, but the heavy
-    transformer weights stay pinned by the process-wide ``shared_spacy``
-    cache and reused across builders / files, so the across-file high-
-    water mark is bounded by one resident copy of EN+ZH ``_trf``.
+    the next stage starts. Torch native allocations don't fully return
+    to the OS through ``gc.collect`` alone, but the GLiNER weights stay
+    pinned by the process-wide ``shared_gliner`` cache and reused
+    across builders / files, so the across-file high-water mark is
+    bounded by one resident FP16 copy (~0.6 GB VRAM).
     """
     results: List[IndexBuildResult] = []
     for b in builders:

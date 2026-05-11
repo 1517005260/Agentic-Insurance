@@ -250,14 +250,22 @@ def remove_file(
             passage_to_entities.pop(h, None)
 
         # Recompute the surviving sentence universe from the surviving
-        # passage texts (rather than substring-matching, which would keep
-        # an A-only sentence that happens to appear inside a longer B
-        # sentence). We use spaCy's sentencizer to match what NER saw.
+        # passage texts (rather than substring-matching, which would
+        # keep an A-only sentence that happens to appear inside a
+        # longer B sentence). Must mirror the ingest-side NER input
+        # pipeline exactly — ``preclean_for_ner`` (HTML / table /
+        # LaTeX strip) then ``split_sentences`` — otherwise sentence
+        # keys here drift from the keys ingest wrote into
+        # ``sentence_to_entities`` and the membership test below
+        # rejects every legitimate entry. The bug surfaced as a
+        # cascading wipe of the NER mention map on any
+        # ``remove_file`` call against an HTML-heavy corpus.
         from ingestion.index._sentence import split_sentences
+        from ingestion.index.linear_rag.ner import preclean_for_ner
 
         surviving_sentence_set: set = set()
         for passage_text in surviving_passages.values():
-            for sent in split_sentences(passage_text):
+            for sent in split_sentences(preclean_for_ner(passage_text)):
                 surviving_sentence_set.add(sent)
 
         kept_sentences: Dict[str, List[str]] = {}
