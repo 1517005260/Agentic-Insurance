@@ -29,6 +29,7 @@ import type {
   IngestStageName,
   StageEvent,
 } from "@/lib/sse-types";
+import { acquireSlot } from "@/lib/fetchScheduler";
 import { cn } from "@/lib/utils";
 
 type StageStatus = "pending" | "running" | "done" | "error";
@@ -108,6 +109,7 @@ export function IngestProgress({
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
+    let releaseSlot: (() => void) | null = null;
 
     /**
      * 一次完整的 fetchSSE 循环。返回 true 表示流以 `done` 帧正常收尾，
@@ -143,41 +145,60 @@ export function IngestProgress({
     const maxRetries = 3;
 
     (async () => {
-      let attempt = 0;
-      while (!cancelled && attempt <= maxRetries) {
-        try {
-          const sawDone = await runOnce();
-          if (cancelled) return;
-          if (sawDone) {
+      // 排队拿 ingest_sse 槽位（cap=2）—— 这是 audit 里"4 文件 ingest
+      // SSE 把 HTTP/1.1 6/host 连接池干光"的 root cause 修复。8 个
+      // file 同时索引时，前 2 路开 SSE，剩下 6 路在这里 await 直到
+      // 前面的进度终态后接力。等待期间 streamState 还是 "connecting"，
+      // UI 显示"等待后端进度…"，与未拿槽位语义一致。
+      const release = await acquireSlot("ingest_sse");
+      if (cancelled) {
+        release();
+        return;
+      }
+      releaseSlot = release;
+      try {
+        let attempt = 0;
+        while (!cancelled && attempt <= maxRetries) {
+          try {
+            const sawDone = await runOnce();
+            if (cancelled) return;
+            if (sawDone) {
+              setStreamState("closed");
+              return;
+            }
+            // 拿到正常 EOF 但没 done — 后端 bus 提前关或代理截断。
+            // Don't retry; treat as failure so user sees a closed stream.
+            setStreamState("closed");
+            setErrorMsg((prev) =>
+              prev ?? "ingest stream ended without `done` frame",
+            );
+            return;
+          } catch (e) {
+            if (cancelled) return;
+            if ((e as DOMException)?.name === "AbortError") return;
+            if (e instanceof SSEHttpError && e.status === 503 && attempt < maxRetries) {
+              // bg task 还没起 / 短暂调度抖动；按 Retry-After 退避重试
+              attempt += 1;
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            }
+            setErrorMsg(e instanceof Error ? e.message : String(e));
             setStreamState("closed");
             return;
           }
-          // 拿到正常 EOF 但没 done — 后端 bus 提前关或代理截断。
-          // Don't retry; treat as failure so user sees a closed stream.
-          setStreamState("closed");
-          setErrorMsg((prev) =>
-            prev ?? "ingest stream ended without `done` frame",
-          );
-          return;
-        } catch (e) {
-          if (cancelled) return;
-          if ((e as DOMException)?.name === "AbortError") return;
-          if (e instanceof SSEHttpError && e.status === 503 && attempt < maxRetries) {
-            // bg task 还没起 / 短暂调度抖动；按 Retry-After 退避重试
-            attempt += 1;
-            await new Promise((r) => setTimeout(r, 2000));
-            continue;
-          }
-          setErrorMsg(e instanceof Error ? e.message : String(e));
-          setStreamState("closed");
-          return;
         }
+      } finally {
+        // 任何路径退出（cancelled / done / error / 503 用尽）都要归还
+        // 槽位，让排队的下一行接力。release 幂等，cleanup 再调一次也安全。
+        release();
+        releaseSlot = null;
       }
     })();
 
     return () => {
       cancelled = true;
       controller.abort();
+      releaseSlot?.();
     };
   }, [fileId]);
 

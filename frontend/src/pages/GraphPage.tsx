@@ -19,6 +19,7 @@ import { ProgressTimeline } from "@/components/chat/ProgressTimeline";
 import { useSSE } from "@/lib/sse";
 import type { CitationItem } from "@/lib/sse-types";
 import { cn } from "@/lib/utils";
+import { schedule } from "@/lib/fetchScheduler";
 
 // 两个 mode 共用一个 GraphCanvas，靠 overlay (mode 自己的子图) +
 // highlight (跟随 agent 高亮) 驱动；不重建画布。模式切换不重抽
@@ -462,6 +463,10 @@ function AgentModePanel({
   // 已处理的 graph_subgraph 帧数；之前 token 帧会污染 sse.events，
   // 现在已用 dropTokenFrames 拦截，但保留计数器避免重复 expand。
   const processedSubgraphCountRef = useRef(0);
+  // 当前 in-flight /graph/expand 的 AbortController。新一帧 subgraph
+  // 到达 / submit / reset / unmount 都会 abort 上一次，避免响应乱序
+  // 把更老的子图盖在更新焦点上、也不让浏览器为已无意义的请求占连接。
+  const expandAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const subgraphEvts = sse.events.filter(
@@ -502,29 +507,49 @@ function AgentModePanel({
       // 把最新焦点同步给画布，触发 pan 视角（保持当前 zoom）。
       setFocus(focusId);
       const myTurn = turnSeqRef.current;
-      api
-        .get<SubgraphData>(
-          `/graph/expand?node_id=${encodeURIComponent(focusId)}&hops=1&top_k=30`,
-        )
-        .then(({ data: subgraph }) => {
-          if (turnSeqRef.current !== myTurn) return;
-          if (subgraph.nodes.length === 0) {
-            // 静默失败让用户以为"图就是不动"——至少打印
+      // 取消上一次 expand：响应乱序时旧焦点子图会盖新焦点；同时也
+      // 不让浏览器把连接花在已无意义的请求上。新建 controller 走
+      // graph_expand 队列限并发 (cap=2)。
+      expandAbortRef.current?.abort();
+      const controller = new AbortController();
+      expandAbortRef.current = controller;
+      void schedule("graph_expand", () =>
+        api
+          .get<SubgraphData>(
+            `/graph/expand?node_id=${encodeURIComponent(focusId)}&hops=1&top_k=30`,
+            { signal: controller.signal },
+          )
+          .then(({ data: subgraph }) => {
+            if (turnSeqRef.current !== myTurn) return;
+            if (controller.signal.aborted) return;
+            if (subgraph.nodes.length === 0) {
+              // 静默失败让用户以为"图就是不动"——至少打印
+              // eslint-disable-next-line no-console
+              console.warn(
+                "[graph-agent] /graph/expand returned empty",
+                { focusId },
+              );
+              return;
+            }
+            setOverlay(subgraph);
+          })
+          .catch((e: unknown) => {
+            // axios 取消是正常 lifecycle，不报错。
+            if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
             // eslint-disable-next-line no-console
-            console.warn(
-              "[graph-agent] /graph/expand returned empty",
-              { focusId },
-            );
-            return;
-          }
-          setOverlay(subgraph);
-        })
-        .catch((e) => {
-          // eslint-disable-next-line no-console
-          console.warn("[graph-agent] /graph/expand failed", { focusId, error: e });
-        });
+            console.warn("[graph-agent] /graph/expand failed", { focusId, error: e });
+          }),
+      );
     }
   }, [sse.events, setHighlight, setOverlay, setFocus]);
+
+  // 卸载时取消任何 in-flight expand。
+  useEffect(() => {
+    return () => {
+      expandAbortRef.current?.abort();
+      expandAbortRef.current = null;
+    };
+  }, []);
 
   const finalAnswer = (() => {
     const f = sse.events.find((e) => e.event === "final");
@@ -557,6 +582,8 @@ function AgentModePanel({
     processedSubgraphCountRef.current = 0;
     turnSeqRef.current += 1;
     cancelPendingFlush();
+    expandAbortRef.current?.abort();
+    expandAbortRef.current = null;
     setFocus(null);
     setTurnKey(`t-${Date.now()}`);
     sse.start("/agent/stream", { query: q, kind: "graph" });
@@ -568,6 +595,8 @@ function AgentModePanel({
     processedSubgraphCountRef.current = 0;
     turnSeqRef.current += 1;
     cancelPendingFlush();
+    expandAbortRef.current?.abort();
+    expandAbortRef.current = null;
     setOverlay(null);
     setHighlight([]);
     setFocus(null);
@@ -595,7 +624,22 @@ function AgentModePanel({
             )}
           </Button>
           {busy && (
-            <Button type="button" variant="ghost" size="md" onClick={() => sse.abort()}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="md"
+              onClick={() => {
+                // 中止时 turnSeqRef 必须 +1 —— 否则任何已经发出的
+                // /graph/expand 响应在 turn 检查里都还认作"当前 turn"，
+                // 会继续 setOverlay 把画布盖上去。expandAbortRef.abort
+                // 立即断掉 in-flight 请求；turnSeqRef 兜底未捕获的迟到
+                // 响应（譬如已 resolve 但还没进 .then）。
+                sse.abort();
+                expandAbortRef.current?.abort();
+                expandAbortRef.current = null;
+                turnSeqRef.current += 1;
+              }}
+            >
               中止
             </Button>
           )}

@@ -12,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { isAxiosError } from "axios";
 
 import { api } from "@/api/client";
 import { Button } from "@/components/ui/button";
@@ -20,9 +21,11 @@ import { IngestProgress } from "@/components/files/IngestProgress";
 import { UploadDialog } from "@/components/files/UploadDialog";
 import FilePreviewDrawer from "@/components/files/FilePreviewDrawer";
 import { useFiles, type FileRow } from "@/hooks/useFiles";
+import { useInView } from "@/hooks/useInView";
 import { useAuthStore } from "@/stores/auth";
 import { useIngestQueue, type IngestEntry } from "@/stores/ingestQueue";
 import { cn } from "@/lib/utils";
+import { schedule } from "@/lib/fetchScheduler";
 
 /**
  * /files —— 文件浏览页（读写双角色）。
@@ -414,12 +417,20 @@ function FileCard({
   // ⋯ 菜单的"重新索引 / 删除"在任一过渡态都禁用，避免明显的 409 触发；
   // 但"查看进度"只在 ingest 过渡态有意义（delete 没有 stage 进度可看）。
   const isInFlight = isIngesting || isDeleting;
+  // 缩略图 lazy fetch：用 IntersectionObserver 推迟到卡片接近视口（提
+  // 前 200px）才发起 blob 拉取，配合 thumbnail 队列 cap=4 限流，避免
+  // 一屏 20 张全 fetch 把 HTTP/1.1 连接池抢光。triggerOnce 让一旦载入
+  // 就不再因滚出视口而被取消重拉。
+  const cardRef = useRef<HTMLDivElement>(null);
+  const inView = useInView(cardRef, "200px", true);
   const previewUrl = useAuthedBlobUrl(
     isReady ? `/files/${encodeURIComponent(row.file_id)}/preview` : null,
+    inView,
   );
 
   return (
     <div
+      ref={cardRef}
       className={cn(
         "group relative flex flex-col rounded-md border bg-surface-raised text-left overflow-hidden",
         "border-ink-line transition-colors",
@@ -714,9 +725,18 @@ function ProgressDrawer({
  *
  * 浏览器 <img src> 不会带 axios interceptor 加的 Authorization header，
  * 所以 /files/{id}/preview 必须经过 axios 走完整鉴权链路再 blob → URL。
- * 卸载时 revoke，避免泄漏。
+ *
+ *  - `enabled=false` 时不发起 fetch（与 IntersectionObserver 联动做
+ *    lazy loading）。
+ *  - 通过 `thumbnail` 队列限并发，避免一屏多张同时打满连接池。
+ *  - 内部用 AbortController：path / enabled 改变或 unmount 时立刻取消
+ *    in-flight 请求；axios cancel 的 ERR_CANCELED 静默忽略。
+ *  - 卸载时 revoke object URL，避免泄漏。
  */
-function useAuthedBlobUrl(path: string | null): { url: string | null; failed: boolean } {
+function useAuthedBlobUrl(
+  path: string | null,
+  enabled: boolean = true,
+): { url: string | null; failed: boolean } {
   // 用 path 当 useEffect 的 trigger，但只有 fetch 成功 / 失败 走 setState。
   // path 变 null 时不再 setState；改靠 useMemo 派生 url：path 为 null →
   // url 一定 null。这样 effect 体内不再有"清理性 setState"，规避
@@ -727,25 +747,36 @@ function useAuthedBlobUrl(path: string | null): { url: string | null; failed: bo
   });
 
   useEffect(() => {
-    if (!path) return;
+    if (!path || !enabled) return;
+    const controller = new AbortController();
     let cancelled = false;
     let objectUrl: string | null = null;
-    api
-      .get<Blob>(path, { responseType: "blob" })
-      .then((res) => {
-        if (cancelled) return;
+    void schedule("thumbnail", async () => {
+      // 早断短路：在排队期间 cleanup 已经 abort 时，不要再让 axios
+      // 启动一次"必然立刻 ERR_CANCELED"的 fetch —— 队列槽位空转一次
+      // 微任务也不必要。
+      if (cancelled || controller.signal.aborted) return;
+      try {
+        const res = await api.get<Blob>(path, {
+          responseType: "blob",
+          signal: controller.signal,
+        });
+        if (cancelled || controller.signal.aborted) return;
         objectUrl = URL.createObjectURL(res.data);
         setState({ url: objectUrl, failed: false });
-      })
-      .catch(() => {
-        if (cancelled) return;
+      } catch (e: unknown) {
+        if (cancelled || controller.signal.aborted) return;
+        // axios 取消（ERR_CANCELED）是 lifecycle 正常路径，不视为失败
+        if (isAxiosError(e) && e.code === "ERR_CANCELED") return;
         setState({ url: null, failed: true });
-      });
+      }
+    });
     return () => {
       cancelled = true;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [path]);
+  }, [path, enabled]);
 
   // path 切回 null 时把上一次的 state 屏蔽（不 setState 也能让消费者拿到
   // null —— 卡片状态从 ready 退回 indexing 极少见但理论可能）

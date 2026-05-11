@@ -358,6 +358,14 @@ export function useSSE(opts: UseSSEOptions = {}): UseSSEResult {
   }, [opts]);
 
   const abort = useCallback(() => {
+    // 推进 runIdRef，让所有还在 microtask 队列里的 flush() 看到的
+    // myRunId 都是过期的 → 直接丢弃缓冲事件，避免 abort 后 buffered
+    // 帧又流回 sse.events 触发下游 effect 当作"新事件"处理。典型现
+    // 场：GraphPage agent 中途点"中止"，对应 SSE 已 buffer 了一帧
+    // graph_subgraph，若不在这里 bump runId，下一次微任务 tick 就把
+    // 它 flush 进 events，effect 拿来又发一次 /graph/expand，把刚清
+    // 的 overlay 又盖回去。
+    runIdRef.current += 1;
     abortRef.current?.abort();
     abortRef.current = null;
   }, []);
@@ -371,8 +379,11 @@ export function useSSE(opts: UseSSEOptions = {}): UseSSEResult {
 
   const start = useCallback(
     (url: string, body?: unknown) => {
+      // 用 abort() 而不是直接 abortRef.current?.abort() —— 让 runIdRef
+      // 在 cancel old run 的同时 bump 一次，buffered flush 自然失效。
+      // 紧接着 ++runIdRef 再前进一格，这才是"新 run"的 myRunId。
+      abort();
       const myRunId = ++runIdRef.current;
-      abortRef.current?.abort();
       const controller = new AbortController();
       abortRef.current = controller;
 

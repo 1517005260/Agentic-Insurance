@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/button";
 import { IngestProgress } from "@/components/files/IngestProgress";
 import { useIngestQueue } from "@/stores/ingestQueue";
 import { cn } from "@/lib/utils";
+import { schedule } from "@/lib/fetchScheduler";
 
 interface UploadResponse {
   file_id: string;
@@ -183,34 +184,37 @@ export function UploadDialog({ onClose }: Props) {
   }, [phase, items]);
 
   /**
-   * 同时发起多个 multipart POST；后端 PARSE_SEM 自己限流。前端不串
-   * 行是因为 fetch 上传阶段是网络 IO，没有共享状态；并行更快、出错
-   * 也独立。每个文件一行，POST 成功后挂 IngestProgress。
+   * 多文件提交：把每个文件丢进 ``upload`` 队列（cap=2），由
+   * fetchScheduler 限制 in-flight 并发，避免一次 8 个 multipart POST
+   * 把浏览器 6/host 连接池抢光（导致 /auth/me / chat 列表被 Queued
+   * 数秒）。等待中的项保持 ``queued`` 状态，被调度起跑后再翻
+   * ``uploading``。
    *
-   * 一个文件 POST 失败不影响其它文件。所有任务结束（无论成败）即
-   * 进入 progress 阶段渲染 IngestProgress 列表。
+   * 所有文件状态各自独立；任一文件失败不影响其它文件。所有任务结束
+   * （无论成败）后进 progress 阶段，挂 IngestProgress 列表。
    */
   const onSubmit = async () => {
     if (items.length === 0) return;
     setPhase("uploading");
-    // 并行起多个 POST（axios 会自动按 FormData 设 Content-Type）
     await Promise.allSettled(
-      items.map(async (it) => {
-        updateItem(it.key, { status: "uploading", error: null });
-        const fd = new FormData();
-        fd.append("file", it.file);
-        try {
-          const { data } = await api.post<UploadResponse>("/files", fd);
-          updateItem(it.key, {
-            fileId: data.file_id,
-            status: "indexing",
-          });
-        } catch (e: unknown) {
-          const msg =
-            extractAxiosErr(e) ?? (e instanceof Error ? e.message : String(e));
-          updateItem(it.key, { status: "failed", error: msg });
-        }
-      }),
+      items.map((it) =>
+        schedule("upload", async () => {
+          updateItem(it.key, { status: "uploading", error: null });
+          const fd = new FormData();
+          fd.append("file", it.file);
+          try {
+            const { data } = await api.post<UploadResponse>("/files", fd);
+            updateItem(it.key, {
+              fileId: data.file_id,
+              status: "indexing",
+            });
+          } catch (e: unknown) {
+            const msg =
+              extractAxiosErr(e) ?? (e instanceof Error ? e.message : String(e));
+            updateItem(it.key, { status: "failed", error: msg });
+          }
+        }),
+      ),
     );
     qc.invalidateQueries({ queryKey: ["files"] });
     // 哪怕全部上传失败，也进 progress 让用户看到错误列表 + 自己关

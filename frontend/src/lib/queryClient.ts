@@ -13,6 +13,11 @@ export const queryClient = new QueryClient({
     queries: {
       // 后端中转站偶发慢；不要乐观地频繁 refetch。
       staleTime: 30_000,
+      // GC: 默认 5min 在频繁切 chat session / 浏览文件 / 切图谱视角
+      // 时会让多份未引用的 cache 同时驻留几分钟，长会话内存压力可
+      // 见。1min 已足够覆盖"快速回切上一个 query"的常见 UX，更长
+      // 的稳定性场景（如 schema 列表）单独在调用点声明 gcTime。
+      gcTime: 60_000,
       refetchOnWindowFocus: false,
       retry: 1,
     },

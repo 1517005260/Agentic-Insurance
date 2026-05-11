@@ -29,6 +29,10 @@ export function useWorkbenchStream(modeLabel: string): UseWorkbenchStreamReturn 
   const activeIdRef = useRef<string | null>(null);
 
   const { status, start, abort: sseAbort } = useSSE({
+    // token 帧不进 useSSE.events 数组，避免长答案下 events 越积越大
+    // （每次 onEvent 都拷贝整个 events array）—— 与 ChatPage / GraphPage
+    // 保持一致。reducer 内仍能通过 onEvent 拿到 token 累计 turn.answer。
+    dropTokenFrames: true,
     onEvent: (ev: SSEEvent) => {
       const id = activeIdRef.current;
       if (!id) return;

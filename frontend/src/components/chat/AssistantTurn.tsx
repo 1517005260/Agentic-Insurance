@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { Sparkles, AlertTriangle, FileText, Globe } from "lucide-react";
 
 import { ProgressTimeline } from "./ProgressTimeline";
@@ -12,7 +12,14 @@ interface Props {
   turn: AssistantTurnT;
 }
 
-export function AssistantTurn({ turn }: Props) {
+/**
+ * memo 化：长会话下 MessageList 的 turns 数组在 token 流期间频繁
+ * 替换，但只有"当前 streaming"那一条 turn 内容实际变化。把
+ * AssistantTurn memo 化后，已 done 的历史 turn 引用稳定就直接跳过
+ * 重渲，避免每次 token 都把整个对话重新走一遍 ProgressTimeline /
+ * MarkdownWithSup 的子树。
+ */
+export const AssistantTurn = memo(function AssistantTurn({ turn }: Props) {
   const open_ = useCitationStore((s) => s.open_);
   const showProgress =
     turn.progressEvents.length > 0 || turn.status === "connecting";
@@ -100,7 +107,7 @@ export function AssistantTurn({ turn }: Props) {
       </div>
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------- chip row
 
