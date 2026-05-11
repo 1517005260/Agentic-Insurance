@@ -11,11 +11,11 @@ Hash-keyed dedup via md5 of normalized text. Stores are designed to be
 column on meta.parquet, used for filtering, not for partitioning.
 
 **Process-level cache**: the lifespan PPR channel and per-ingest LinearRAG
-both used to construct independent ``EmbeddingStore`` handles for the
-same on-disk artifact, doubling the resident set (each store's
-``faiss.read_index`` materialises 100 MB - 1 GB depending on corpus).
-Use :func:`get_or_create_store` (alias :func:`shared_store`) at every
-callsite that previously did ``EmbeddingStore(dir, namespace)`` directly;
+both target the same on-disk artifact. Constructing independent
+``EmbeddingStore`` handles would double the resident set, since each
+store's ``faiss.read_index`` materialises 100 MB - 1 GB depending on
+corpus. Always go through :func:`get_or_create_store` (alias
+:func:`shared_store`) instead of constructing ``EmbeddingStore`` directly;
 the helper deduplicates by ``(canonical-dir-path, namespace)`` so the
 cached instance is reused.
 
@@ -241,9 +241,7 @@ class EmbeddingStore:
         if len(hash_ids) != embeddings.shape[0] or len(texts) != embeddings.shape[0]:
             raise ValueError("hash_ids / texts / embeddings length mismatch")
         # Validate ``extra_metadata`` shapes BEFORE any mutation so a
-        # length-mismatch raise can't leave behind a half-written index
-        # (was previously checked after ``faiss.add`` ran, which would
-        # corrupt the store on bad input).
+        # length-mismatch raise can't leave behind a half-written index.
         if extra_metadata:
             for col, values in extra_metadata.items():
                 if len(values) != len(hash_ids):

@@ -68,18 +68,15 @@ async def init_db() -> None:
 
     1. **Fresh DB** (no app tables) → ``alembic upgrade head`` builds
        everything from migrations.
-    2. **Pre-Phase-6 DB** (app tables exist from a prior
-       ``Base.metadata.create_all`` run, no recorded version) → stamp
-       ``head`` so Alembic considers the schema current, skipping
-       the would-be table creation that would CREATE TABLE rows that
-       already exist.
+    2. **Unmanaged DB** (app tables exist but no alembic version row)
+       → stamp ``head`` so Alembic treats the schema as current and
+       skips CREATE TABLE for rows that already exist.
     3. **Already-managed DB** (alembic_version row at head) →
        ``upgrade head`` is a no-op; no work, no errors.
 
-    The check is "does the canonical ``users`` table exist AND has no
-    alembic version been recorded yet" — this catches both the
-    pre-Phase-6 case AND the case where a previous boot's failed
-    upgrade left an empty ``alembic_version`` table behind.
+    Case 2 is detected by "users exists AND alembic_version is empty",
+    which also covers the case where a prior failed upgrade left an
+    empty ``alembic_version`` table behind.
 
     Why we DON'T share the lifespan's AsyncConnection with Alembic:
     SQLite migrations run with ``transactional_ddl=False`` (Alembic's
@@ -94,7 +91,7 @@ async def init_db() -> None:
 
     from sqlalchemy import inspect as sa_inspect, text
 
-    # Phase 1 — quick state probe (no transaction).
+    # Probe schema state without holding a transaction.
     async with engine.connect() as conn:
         existing_tables = await conn.run_sync(
             lambda sync_conn: sa_inspect(sync_conn).get_table_names()
@@ -107,8 +104,8 @@ async def init_db() -> None:
             ).first()
             has_version_row = row is not None
 
-    # Phase 2 — Alembic in its own thread + own sync engine. Don't
-    # share connections with the async lifespan engine.
+    # Hand off to Alembic on its own thread with its own sync engine —
+    # never share the async lifespan engine's connections.
     loop = asyncio.get_running_loop()
     if users_present and not has_version_row:
         await loop.run_in_executor(None, _alembic_stamp_head)

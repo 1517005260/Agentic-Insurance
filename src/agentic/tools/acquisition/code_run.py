@@ -62,10 +62,10 @@ _DEFAULT_WALL_SECONDS = 10
 # numpy / scipy / sympy reserve a lot of virtual address up-front
 # (OpenBLAS thread pool, scipy submodule mmap arenas) so anything
 # tighter than ~2 GiB SIGKILLs them somewhere between import and the
-# first call. 1 GiB used to be enough for plain numpy + sympy but
-# scipy.optimize / scipy.sparse push past that on first lazy-load.
-# The number is "won't crash a typical laptop" rather than a tight
-# bound — the wall + CPU clocks are the real DoS guard.
+# first call. scipy.optimize / scipy.sparse alone can push past 1 GiB
+# on first lazy-load. The number is "won't crash a typical laptop"
+# rather than a tight bound — the wall + CPU clocks are the real
+# DoS guard.
 _DEFAULT_MEM_BYTES = 2 * 1024 * 1024 * 1024
 _DEFAULT_NOFILE = 256
 _STREAM_LIMIT_BYTES = 16 * 1024

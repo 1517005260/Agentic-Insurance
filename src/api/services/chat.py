@@ -177,10 +177,12 @@ def build_rag_assistant_metadata(
     model: Optional[str] = None,
     error: Optional[str] = None,
     original_exit_reason: Optional[str] = None,
-    # Web RAG 多轮重写产物 — 用户原 query 与最终送给 Tavily 的
-    # standalone search query 通常不同；同时记录 rewrite_error 让
-    # 审计/answer detail UI 能解释"为什么这一轮的 search query 没
-    # 被重写"。本地 RAG 路径不会传这几项，全为 None → 全跳过。
+    # Web RAG multi-turn rewrite outputs — the user's original query
+    # and the standalone search query finally sent to Tavily usually
+    # differ. ``rewrite_error`` lets the audit / answer-detail UI
+    # explain why a turn's search query wasn't rewritten. The local
+    # RAG path passes nothing here, so all three stay None and are
+    # skipped below.
     search_query: Optional[str] = None,
     original_query: Optional[str] = None,
     rewrite_error: Optional[str] = None,

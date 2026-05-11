@@ -240,10 +240,11 @@ class ProofAgent:
             messages.append(message)
 
             tool_calls = message.get("tool_calls") or []
-            # 仅在「有 tool_calls + 有 content」时 emit thought —— ProofAgent
-            # 在 strict 模式下「没有 tool_call 即停」，那种 content 不是
-            # reasoning 而是被 abstain 的尾声，应该走 final.answer 不该
-            # 进时间线。
+            # Emit "thought" only when tool_calls are also present.
+            # ProofAgent's strict mode stops the loop the moment a tool
+            # call is missing; that ``content`` isn't reasoning but the
+            # tail of an abstain, so it should flow through final.answer
+            # and not into the timeline.
             content_str = (message.get("content") or "").strip()
             if content_str and tool_calls:
                 emit(

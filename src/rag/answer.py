@@ -106,9 +106,9 @@ def answer(
     ``(prior_user_query, prior_assistant_answer)`` pairs that gets
     spliced between the system prompt and the current user message.
     The current turn's pages-block + legend stays anchored to the
-    *current* query — prior turns' citations don't carry over because
-    sup numbering is per-turn (Phase 2-Δ contract). Default ``None``
-    keeps the single-turn behaviour for experiment scripts.
+    *current* query — sup numbering is scoped to one turn, so prior
+    turns' citations are not carried over. Default ``None`` keeps the
+    single-turn behaviour for experiment scripts.
     """
     cfg = config or RAGConfig()
     client = llm or LLMClient()

@@ -278,8 +278,8 @@ class LLMClient:
         # ``(connect, read)`` tuple: see chat() for the rationale.
         # ``read=120`` doubles as a between-byte watchdog — if the
         # provider stalls between SSE chunks, ``iter_lines`` raises
-        # rather than appearing to hang for the full 5-min wall the
-        # old single-int timeout used to allow.
+        # rather than waiting out a full 5-min wall on a single-int
+        # timeout.
         with self._session.post(
             url, headers=headers, json=payload, timeout=(10, 120), stream=True
         ) as response:

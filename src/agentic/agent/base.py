@@ -54,7 +54,7 @@ class BaseAgent:
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
         self.verbose = verbose
-        # Process-cached encoder — six callsites used to each hold ~50 MB.
+        # Process-cached encoder — one tiktoken instance is ~50 MB.
         self.tokenizer = shared_tiktoken_encoder("gpt-4o")
 
     def warm_up(self) -> Dict[str, float]:
@@ -152,21 +152,19 @@ class BaseAgent:
         ``on_event`` (optional) is a sync callback invoked at every
         observable boundary so a streaming consumer (e.g. SSE runner)
         can mirror progress. Signature ``(event_name: str, data: dict)``.
-        Default ``None`` means no callbacks — experiment scripts and the
-        existing CLI path are unaffected.
+        Default ``None`` skips callbacks — useful for experiment scripts
+        and the CLI.
 
         ``max_loops`` / ``max_token_budget`` / ``system_prompt`` (all
-        optional) override the constructor values for this run only.
-        ``None`` falls back to the per-instance defaults so existing
-        call sites — every experiment script — keep their byte-identical
-        behavior.
+        optional) override the constructor values for this run only;
+        ``None`` falls back to the per-instance defaults.
 
         ``cancel_check`` (optional) is a no-arg predicate polled at
         each loop boundary; when it returns True the loop exits with
         ``exit_reason='client_disconnect'``. The runner side wires it
         to ``EventBus.is_closed`` so a TCP disconnect stops the agent
-        from spending more LLM tokens. Default ``None`` is the legacy
-        always-False behavior.
+        from spending more LLM tokens. Default ``None`` disables the
+        check (always-False).
 
         Emitted events:
         * ``status`` — phase transitions (``thinking`` per loop,
@@ -300,10 +298,12 @@ class BaseAgent:
                 print(f"Assistant: {message['content'][:200]}...")
 
             tool_calls = message.get("tool_calls")
-            # 仅在「有 tool_calls + 有 content」时把 content 作为 "thought" 发出 ——
-            # 这是 LLM 在调用工具前的 reasoning。如果 message 没有 tool_calls，
-            # 那它的 content 就是最终答案，会通过 final 事件 + answer 字段
-            # 流到前端答案区，不能也塞进时间线，否则会跟答案区重复。
+            # Emit ``content`` as a "thought" only when tool_calls are
+            # also present — that's the LLM's reasoning before invoking
+            # a tool. Without tool_calls, ``content`` is the final
+            # answer and will reach the frontend via the ``final`` event
+            # / ``answer`` field; routing it to the timeline too would
+            # duplicate the text in the UI.
             content_str = (message.get("content") or "").strip()
             if content_str and tool_calls:
                 emit(

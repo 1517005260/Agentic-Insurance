@@ -761,10 +761,10 @@ async def run_reingest(
     final_emitted = False
     try:
         # ----- pre-parse purge: serial under INGEST_LOCK -----
-        # 必须在 parse **之前**清旧 indexes —— purge_file_artifacts 会
-        # 删 paddle_ocr/<file_id>/，如果放到 parse 之后 (像之前那样)
-        # 会把刚 OCR 出来的 meta.json 也删掉，下一步 build_page_assets
-        # 立刻 FileNotFoundError。
+        # The purge MUST run **before** parse: ``purge_file_artifacts``
+        # deletes ``paddle_ocr/<file_id>/``, so running it after parse
+        # would wipe the freshly-OCR'd ``meta.json`` and the next
+        # ``build_page_assets`` would FileNotFoundError immediately.
         async with INGEST_LOCK:
             await _start_job(job_id)
             try:

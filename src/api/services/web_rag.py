@@ -272,9 +272,8 @@ def _build_messages(
 
     ``history`` (chronological prior (user, assistant) pairs) is
     spliced between the system prompt and the current user turn so
-    the model can answer follow-up questions in context. Sup
-    numbering remains per-turn (Phase 2-Δ contract); prior turns'
-    citations don't carry over.
+    the model can answer follow-up questions in context. Sup numbering
+    is scoped to one turn — prior turns' citations don't carry over.
     """
     if not sources:
         sources_block = "(no sources retrieved — answer with abstain)"
@@ -568,8 +567,8 @@ def stream_chat(
         {
             # ``answer`` carries the full assembled body so the frontend
             # can recover when token frames were dropped (network jitter
-            # or hidden-reasoning relays); previously only ``answer_chars``
-            # was reported and the UI had no way to render the text.
+            # or hidden-reasoning relays). ``answer_chars`` alone would
+            # leave the UI without the text to render.
             "answer": answer,
             "answer_chars": len(answer),
             "n_results": len(sources),

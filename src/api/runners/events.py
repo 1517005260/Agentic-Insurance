@@ -17,12 +17,12 @@ to the loop that ``stream()`` was called on, so construct it inside
 the route handler (where the running loop is available).
 
 Two operating modes, selected by the ``replay_buffered`` constructor
-flag (default False = legacy):
+flag (default False):
 
 * **single-consumer / no replay** (chat runners) — one queue, one
   ``stream()``. ``is_closed`` flips when the consumer disconnects so
   the worker thread can short-circuit LLM token generation. This is
-  the existing behavior the chat path relies on.
+  what the chat path relies on.
 * **multi-consumer / replay** (ingest) — push() also appends to a
   history buffer. Each ``stream()`` subscriber gets its own queue,
   is seeded with the full history on subscribe, then receives any
@@ -60,7 +60,7 @@ class EventType:
     CITATIONS = "citations"       # final list[CitationItem]
 
     # Agent-specific
-    THOUGHT = "thought"           # 中间 LLM content (推理 / 计划)，非 final answer
+    THOUGHT = "thought"           # intermediate LLM content (reasoning / plan), not the final answer
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
     OBLIGATION = "obligation"     # proof
@@ -124,7 +124,7 @@ class EventBus:
             # threading.Lock — push()/close() run on the worker thread;
             # subscribe() runs on the event loop. asyncio.Lock won't do.
             self._state_lock = threading.Lock()
-            self._queue = None  # legacy single queue unused in this mode
+            self._queue = None  # single-queue field unused in this mode
         else:
             self._queue: asyncio.Queue = asyncio.Queue()
             self._subscribers = []
@@ -254,8 +254,8 @@ class EventBus:
         Heartbeat: when the queue is idle for ``heartbeat_interval``
         seconds, yields a single ``: keepalive`` comment frame.
 
-        Single-consumer mode: legacy semantics — finally flips
-        ``_closed`` so the worker can stop generating.
+        Single-consumer mode: ``finally`` flips ``_closed`` on consumer
+        exit so the worker can stop generating.
 
         Multi-consumer mode: subscribe to a fresh per-call queue,
         seeded with the full history under the state lock so we
