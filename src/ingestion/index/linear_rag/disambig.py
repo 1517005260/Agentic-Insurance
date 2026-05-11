@@ -1,15 +1,22 @@
-"""Entity disambiguation: gradient top-k + mutual filter + cluster.
+"""Entity disambiguation: dual-query gradient top-k + cluster.
 
 Pipeline for each new entity ``e`` (already embedded):
 
-    1. faiss top-k against the entity store → candidates sorted by cos sim
-    2. Walk down candidates; cut at the first relative similarity drop > g
-       (default g=0.3, i.e. 30% drop between consecutive candidates)
-    3. mutual top-k filter: keep candidate ``c`` only if ``e`` would also
-       appear in ``c``'s top-k
-    4. add (e, c) alias edges with weight = cos sim
-    5. logical entities = connected components of the alias subgraph
-       (computed lazily and cached to clusters.json)
+    1. Two faiss top-k queries against the entity store:
+       - bare-surface query (symmetric: query and store are both
+         bare-surface embeddings → same space, true cos sim)
+       - mention-context centroid query (semantic recall path)
+       Their results are merged by max cosine similarity per candidate.
+       The bare-surface arm carries character-level variants
+       (singular/plural, abbreviation, light reordering); the centroid
+       arm carries semantic synonyms. Symmetric bare-vs-bare scoring
+       removes the need for a separate mutual top-k step.
+    2. Apply absolute floor ``alias_min_sim`` to the merged list.
+    3. Walk down candidates; cut at the first relative similarity drop
+       > g (default g=0.3, i.e. 30% drop between consecutive candidates).
+    4. Add (e, c) alias edges with weight = max cos sim from step 1.
+    5. Logical entities = connected components of the alias subgraph
+       (computed lazily and cached to clusters.json).
 
 The new entity is always added as a separate physical node (no merging) so
 mistakes are reversible by deleting an alias edge.
@@ -34,9 +41,6 @@ DEFAULT_GRADIENT = 0.3  # relative drop threshold (sim[i] - sim[i+1]) / sim[i]
 # entities); 0.85 keeps real synonym/variant pairs while dropping the bulk of
 # noise. Tunable via ``LinearRAGConfig.alias_min_sim``.
 DEFAULT_MIN_SIM = 0.85
-# Slightly stricter floor for entities with too few mentions to form a stable
-# context centroid — see :func:`_add_alias_edges_for_new_entities` in linear_rag.py.
-DEFAULT_MIN_SIM_LOW_CONTEXT = 0.90
 
 
 @dataclass
@@ -88,39 +92,65 @@ def gradient_topk_candidates(
     return cands[:cut]
 
 
-def mutual_topk_filter(
-    new_hash_id: str,
-    new_embedding: np.ndarray,
+def merge_topk_candidates(
+    *candidate_lists: Sequence[AliasCandidate],
+) -> List[AliasCandidate]:
+    """Merge multiple top-k result lists, keeping the max score per hash_id.
+
+    Used to combine the bare-surface and centroid query result lists in
+    the dual-query recall path: a candidate that surfaces in either
+    list at sufficient similarity should be considered, and we keep
+    whichever score is higher so the gradient cutoff downstream sees
+    the strongest signal.
+    """
+    by_hash: Dict[str, float] = {}
+    for cands in candidate_lists:
+        for c in cands:
+            prev = by_hash.get(c.hash_id)
+            if prev is None or c.score > prev:
+                by_hash[c.hash_id] = c.score
+    merged = [AliasCandidate(h, s) for h, s in by_hash.items()]
+    merged.sort(key=lambda c: c.score, reverse=True)
+    return merged
+
+
+def reranker_veto(
+    anchor_text: str,
     candidates: Sequence[AliasCandidate],
     store: EmbeddingStore,
-    k: int = DEFAULT_TOP_K,
-    min_sim: float = DEFAULT_MIN_SIM,
+    *,
+    threshold: float,
+    instruction: str,
 ) -> List[AliasCandidate]:
-    """Keep candidate ``c`` iff the new entity is in ``c``'s top-k as well.
+    """Drop candidates whose pairwise reranker score is below ``threshold``.
 
-    Pulls k+1 from each candidate's neighborhood since the candidate sits at
-    rank 0 of its own search; after dropping self we have its k actual peers
-    and check whether the new entity would have made that cutoff. The same
-    absolute ``min_sim`` floor applies — even a "mutual top-k" pair below
-    the floor is dropped.
+    Cross-encoder pairwise score is used as a **low-confidence veto** —
+    the rerank AUC on cold-start short-surface ER measured around 0.66,
+    enough to filter ordered-tier false merges (`option 1` vs `option 2`)
+    and a few range/scope variants, but not high enough to use the score
+    as an identity classifier. High scores do not certify alias status
+    on their own; they only mean "the reranker did not veto". The
+    upstream cos-sim + gradient cutoff + composite gate still set the
+    real admission criteria.
+
+    Surface-only input (not surface + mention) — empirically the model
+    treats long sentence context as semantic-relevance signal, which
+    dilutes the identity decision. The hardened instruction is what
+    forces the yes/no head toward identity rather than relevance.
     """
     if not candidates:
         return []
-    surviving: List[AliasCandidate] = []
-    for cand in candidates:
-        cand_emb = store.get_embedding(cand.hash_id).reshape(1, -1)
-        cand_topk = store.topk(cand_emb[0], k + 1)
-        cand_peers = [(h, s) for h, s in cand_topk if h != cand.hash_id][:k]
-        new_to_cand_sim = float(np.dot(new_embedding, cand_emb.T).flatten()[0])
-        if new_to_cand_sim < min_sim:
-            continue
-        if not cand_peers:
-            surviving.append(cand)
-            continue
-        kth_score = cand_peers[-1][1]
-        if len(cand_peers) < k or new_to_cand_sim >= kth_score:
-            surviving.append(cand)
-    return surviving
+    # Lazy import — keeps `disambig.py` cheap when only the gradient
+    # path is exercised (e.g. test fixtures without a downloaded
+    # reranker checkpoint).
+    from model_client import get_cached_rerank_client
+
+    client = get_cached_rerank_client()
+    pairs = [
+        (anchor_text, store.get_text(c.hash_id)) for c in candidates
+    ]
+    scores = client.score_pairs(pairs, instruction=instruction)
+    return [c for c, s in zip(candidates, scores) if s >= threshold]
 
 
 def add_alias_edges(

@@ -61,13 +61,25 @@ class LinearRAGConfig:
     gliner_threshold: float = 0.3
     gliner_batch_size: int = 16
 
+    # Structural span-shape filter applied to every GLiNER output BEFORE
+    # surface normalization (see ``ner.is_misbound_span``). Rejects spans
+    # with >``ner_max_span_chars`` raw characters AND no bracket (real
+    # product / clause names rarely exceed 80 chars; bracketed surfaces
+    # are kept regardless of length) OR with interior hard sentence-end
+    # punctuation. 80 is a defensive cap — measured longest legitimate
+    # legal/insurance surface in the benchmark sits at ~50 chars.
+    ner_max_span_chars: int = 80
+
     max_workers: int = 4
 
     # Alias-edge thresholds — see disambig.DEFAULT_MIN_SIM.
-    alias_top_k: int = 5
+    # The dual-query recall path (bare-surface + centroid) needs
+    # headroom for sequence-/pluralization-/abbreviation-level variants
+    # to make the cut; the gradient cutoff still trims unrelated
+    # long-tail candidates.
+    alias_top_k: int = 20
     alias_gradient: float = 0.3
     alias_min_sim: float = 0.85
-    alias_min_sim_low_context: float = 0.90
 
     # Mention-context centroid: dedup mention sentences and cap per entity
     # so high-frequency entities don't get pulled toward boilerplate noise.
@@ -84,8 +96,11 @@ class LinearRAGConfig:
     # Domain-tuned: insurance product names top out at ~10, legal
     # clause titles can reach 18-25 ("中华人民共和国证券法第一百四十二条"),
     # patent technique names similar. Bracketed surfaces (product codes,
-    # SKU markers) are always kept regardless of length.
-    junk_max_han_chars: int = 15
+    # SKU markers) are always kept regardless of length. 12 was chosen
+    # from a 56-sample benchmark (precision 95.5%, recall 52.5%, one
+    # false-positive on the boundary clause "保单分拆预设指示权益条款");
+    # legal / patent admins should raise it back to 18-25.
+    junk_max_han_chars: int = 12
 
     # Literal-substring backfill (KAG-style "domain mount"). NER is
     # contextual, so the same surface gets tagged on its introduction page
@@ -95,3 +110,27 @@ class LinearRAGConfig:
     literal_backfill_enabled: bool = True
     literal_backfill_min_chars: int = 4          # drops "us", "irs"
     literal_backfill_multi_word_only: bool = True  # drops "axa", "company"
+
+    # Reranker veto layer — final gate on alias-edge creation.
+    # The dual-query gradient_topk recall is generous (top-K=20); a
+    # pairwise cross-encoder scores each surviving (anchor, candidate)
+    # pair and rejects below ``reranker_threshold``. The score is true
+    # pairwise (Qwen3-Reranker yes/no logit), so the threshold is a
+    # stable absolute boundary across calls. AUC vs hand-labelled set
+    # is ~0.66 — high enough to use as a low-confidence veto, NOT as
+    # an identity classifier; high scores do not auto-confirm alias on
+    # their own.
+    reranker_enabled: bool = True
+    reranker_threshold: float = 0.7
+    # ER-specific instruction. Spelled out as a hard-negative checklist
+    # because the model defaults to retrieval relevance ("are these
+    # topically related") and we need identity ("are these the same
+    # entity"); the negative-class enumeration is the difference.
+    reranker_instruction: str = (
+        "Score yes only if the two strings refer to the exact same real-world "
+        "entity or accepted alias (synonym, abbreviation, pluralization, "
+        "traditional/simplified Chinese variant). Reply no for any of: "
+        "related-but-distinct concepts; broader/narrower scope; ordered "
+        "options or tiers; negation or quantifier flips; modifier-introduced "
+        "variants; action vs entity phrases; sentence fragments."
+    )

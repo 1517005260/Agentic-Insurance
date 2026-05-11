@@ -136,6 +136,98 @@ def preclean_for_ner(text: str) -> str:
     return s.strip()
 
 
+# GLiNER occasionally emits whole sentences (or multi-sentence runs)
+# as a single "term" / "concept" span — the mT5 backbone has no
+# structural bias toward NP-shape outputs. Two structural shapes are
+# safely rejectable without any domain wordlist:
+#
+# 1. Excessive raw length without a bracket. Real product / clause /
+#    regulation names rarely exceed 80 characters; surfaces that do AND
+#    carry no ``(``/``（``/``[`` bracket (SKU markers, version tags) are
+#    almost always sentence-level spans. Bracketed surfaces of any
+#    length are kept ("万通危疾加护保(优越版)(BISP5)" type).
+# 2. Interior sentence-ending punctuation. A genuine entity surface
+#    never spans across ``。``/``！``/``？``/``；``/``;`` — these are
+#    hard sentence boundaries. (ASCII ``.`` is intentionally OUT of
+#    this set: product codes / version strings like ``v1.0`` and
+#    abbreviations like ``Co.`` use it as an internal character.)
+#
+# Han-character-count rejection lives in ``normalize.is_junk`` (gated
+# by ``LinearRAGConfig.junk_max_han_chars``) — that's the third channel,
+# enforced after this layer because canonical_form may compress length.
+_MISBOUND_INTERIOR_PUNCT_RE = regex.compile(r"[。！？；;]")
+_BRACKET_OR_CODE_RE = regex.compile(r"[(（\[【]")
+
+
+# Han ideographs — when present we additionally run a POS-aware
+# sentence-shape check (R3 below). jieba.posseg is imported lazily so
+# the dictionary load (~5MB, 700ms warmup) is paid once on first call,
+# not at import time.
+_HAN_RE = regex.compile(r"\p{Han}")
+_JIEBA_POSSEG = None
+
+
+def _pos_tag(text: str):
+    """Lazy jieba.posseg.cut. Returns list of (word, flag)."""
+    global _JIEBA_POSSEG
+    if _JIEBA_POSSEG is None:
+        import jieba.posseg as pseg
+        _JIEBA_POSSEG = pseg
+        # Force dictionary build now so the first real call is fast.
+        list(pseg.cut("warmup"))
+    return list(_JIEBA_POSSEG.cut(text))
+
+
+def _is_chinese_sentence_shape(text: str) -> bool:
+    """POS-aware sentence-fragment detector for Chinese spans.
+
+    Real entity surfaces (product / clause / role names) are noun
+    phrases — POS pattern is mostly noun (n*) with optional 形容词 /
+    量词 / 限定词. GLiNER's misbound output is sentence-shaped:
+    contains a verb AND at least one functional token (介词 p /
+    助词 u / 副词 d / 连词 c) that ties the verb to its arguments.
+    Pure noun phrases rarely carry both signals together.
+
+    Empirical fit on a 13-fragment / 50-entity benchmark: precision
+    0.69, recall 0.85; the 4-5 misses are jieba dictionary noise
+    ('身故'/'载有' mistagged as n/b instead of v) which a different
+    segmenter (pkuseg) did not improve on this corpus.
+    """
+    tags = [f for _, f in _pos_tag(text)]
+    has_verb = any(t.startswith("v") for t in tags)
+    has_func = any(t.startswith(("p", "u", "d", "c")) for t in tags)
+    return has_verb and has_func
+
+
+def is_misbound_span(text: str, max_span_chars: int) -> bool:
+    """Return True if the GLiNER span has the structural shape of a sentence.
+
+    Three language-aware rules — any one match rejects the span:
+
+    * R1 — character length above ``max_span_chars`` AND no bracket.
+      Bracketed surfaces of any length are kept (real product/SKU
+      markers legitimately extend the name).
+    * R2 — any hard sentence-ending punctuation (``。``/``！``/``？``/
+      ``；``/``;``) appearing inside the span. ASCII ``.`` is excluded
+      because it appears inside product codes / abbreviations.
+    * R3 — Chinese-only POS-aware sentence detector (see
+      :func:`_is_chinese_sentence_shape`). Catches 11-15 char clauses
+      below the ``junk_max_han_chars`` cutoff that R1 / R2 cannot see.
+    """
+    if not text:
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    if len(s) > max_span_chars and not _BRACKET_OR_CODE_RE.search(s):
+        return True
+    if _MISBOUND_INTERIOR_PUNCT_RE.search(s):
+        return True
+    if _HAN_RE.search(s) and _is_chinese_sentence_shape(s):
+        return True
+    return False
+
+
 # Pure-punctuation list separators commonly used in Chinese product
 # catalog OCR output. Splitting an entity surface on these is safe:
 # Chinese registration rules (PRC 企业名称登记管理规定) disallow these
@@ -219,6 +311,7 @@ class GLiNERAdapter:
         labels: Optional[Sequence[str]] = None,
         threshold: float = 0.3,
         batch_size: int = 16,
+        max_span_chars: int = 80,
     ):
         # Pulled from the process-wide cache so ingest workers and the
         # lifespan-pinned PPR channel share a single resident copy of
@@ -227,6 +320,7 @@ class GLiNERAdapter:
         self.labels: List[str] = list(labels) if labels else list(DEFAULT_LABELS)
         self.threshold = float(threshold)
         self.batch_size = int(batch_size)
+        self.max_span_chars = int(max_span_chars)
 
     # ----------------------------------------------- batch passage NER ----
 
@@ -296,6 +390,8 @@ class GLiNERAdapter:
                 raw = span.get("text") or ""
                 if not raw:
                     continue
+                if is_misbound_span(raw, self.max_span_chars):
+                    continue
                 for piece in split_catalog_mentions(raw):
                     if piece not in sentence_seen[sent_text]:
                         sentence_seen[sent_text].add(piece)
@@ -327,9 +423,10 @@ class GLiNERAdapter:
         out: set = set()
         for sent_spans in spans:
             for span in sent_spans:
-                raw = (span.get("text") or "").strip().lower()
-                if raw:
-                    out.add(raw)
+                raw = (span.get("text") or "").strip()
+                if not raw or is_misbound_span(raw, self.max_span_chars):
+                    continue
+                out.add(raw.lower())
         return out
 
     # ------------------------------------- per-passage helper (test/api) ----

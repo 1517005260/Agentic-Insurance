@@ -43,7 +43,8 @@ from ingestion.index.linear_rag.disambig import (
     gradient_topk_candidates,
     is_composite_surface,
     invalidate_clusters,
-    mutual_topk_filter,
+    merge_topk_candidates,
+    reranker_veto,
 )
 from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import canonical_form, normalize_for_hash
@@ -83,6 +84,7 @@ class LinearRAG:
             labels=self.config.gliner_labels,
             threshold=self.config.gliner_threshold,
             batch_size=self.config.gliner_batch_size,
+            max_span_chars=self.config.ner_max_span_chars,
         )
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"
@@ -103,13 +105,11 @@ class LinearRAG:
     # Schema version for ``ner_results.json``. Bump when the surface
     # extraction / split / cleanup pipeline changes so older caches are
     # invalidated and every passage re-runs through the new path.
-    #
-    # v3: switched from spaCy en/zh _trf + HanLP MTL to GLiNER multi-v2.1
-    #     open-set NER + pysbd sentence segmentation + HTML/table/LaTeX
-    #     pre-clean + 4 new structural ``is_junk`` rules. The label set,
-    #     span boundaries, and noise floor are all different from v2 so
-    #     v2 caches are not safely reusable.
-    NER_CACHE_VERSION = 3
+    # A cache built under an older pipeline can carry sentence-shaped
+    # entities or alias edges the current filters would reject, so
+    # merging cached and freshly-extracted entities is unsafe; force
+    # a clean rebuild on every schema change.
+    NER_CACHE_VERSION = 4
 
     def load_existing_data(self, passage_hash_ids: Iterable[str]):
         if self._ner_results_path.exists():
@@ -292,12 +292,13 @@ class LinearRAG:
         # 7. Augment graph: add new vertices, append new edges (preserve existing).
         self._augment_graph(new_passage_hash_set, new_entity_hash_set)
 
-        # 8. Entity disambiguation — add alias edges from each new entity to
-        #    its gradient-cutoff + mutual-top-k candidates among existing
-        #    entities. Physical nodes are NOT merged.
+        # 8. Entity disambiguation — add alias edges via dual-query
+        #    (bare-surface + mention-centroid) gradient-cutoff recall,
+        #    composite-surface admission gates, and a final pairwise
+        #    Qwen3-Reranker veto. Physical nodes are NOT merged.
         added_alias_edges = self._add_alias_edges_for_new_entities(new_entity_hash_set)
 
-        # 9. Literal mention backfill (KAG-style "domain mount"). spaCy NER
+        # 9. Literal mention backfill (KAG-style "domain mount"). NER
         #    is contextual, so the same surface gets tagged on the page that
         #    introduces it but missed on later pages that refer back; this
         #    pass closes that gap by sweeping every passage with the union
@@ -358,13 +359,25 @@ class LinearRAG:
     # ------------------------------------------------------ disambiguation
 
     def _add_alias_edges_for_new_entities(self, new_entity_hashes: Set[str]) -> int:
-        """Run gradient ER + mutual top-k for every newly added entity.
+        """Run dual-query gradient ER for every newly added entity.
 
-        Each entity's *query embedding* is the **centroid of the embeddings
-        of sentences mentioning it** (deduped, capped to
-        ``config.centroid_max_mentions``). Entities with too few mentions to
-        form a stable centroid (≤1) fall back to the bare-surface embedding
-        and pay a stricter ``alias_min_sim_low_context`` floor.
+        Two parallel queries against the entity store, merged by max
+        score per candidate:
+
+        * **Bare-surface query** — the entity's own surface embedding.
+          Since the store also holds bare-surface entries, this is a
+          true symmetric cos sim and reliably surfaces character-level
+          variants (singular/plural, abbreviation, light reordering).
+        * **Mention-context centroid query** — average of up to
+          ``config.centroid_max_mentions`` distinct sentence embeddings
+          mentioning the entity. Provides the semantic recall path.
+          Falls back to the bare-surface embedding when fewer than 2
+          mentions are available (no second signal to combine).
+
+        ``alias_min_sim`` applies uniformly to the merged list. The
+        bare-surface arm is symmetric (query and store are both
+        bare-surface embeddings), so a single floor is sufficient even
+        when the centroid arm is asymmetric.
         """
         if not new_entity_hashes:
             return 0
@@ -388,28 +401,28 @@ class LinearRAG:
             if is_composite_surface(entity_text):
                 continue
             mention_sentences = entity_text_to_mentions.get(entity_text, [])
-            query_emb, low_context = self._entity_query_embedding(
-                hash_id, mention_sentences
-            )
-            min_sim = (
-                cfg.alias_min_sim_low_context if low_context else cfg.alias_min_sim
-            )
-            cands = gradient_topk_candidates(
-                query_emb,
+            bare_emb = self.entity_embedding_store.get_embedding(hash_id)
+            bare_cands = gradient_topk_candidates(
+                bare_emb,
                 self.entity_embedding_store,
                 k=cfg.alias_top_k,
                 g=cfg.alias_gradient,
-                min_sim=min_sim,
+                min_sim=cfg.alias_min_sim,
                 self_hash_id=hash_id,
             )
-            cands = mutual_topk_filter(
-                hash_id,
-                query_emb,
-                cands,
-                self.entity_embedding_store,
-                k=cfg.alias_top_k,
-                min_sim=min_sim,
-            )
+            centroid_emb = self._mention_centroid(mention_sentences)
+            if centroid_emb is not None:
+                centroid_cands = gradient_topk_candidates(
+                    centroid_emb,
+                    self.entity_embedding_store,
+                    k=cfg.alias_top_k,
+                    g=cfg.alias_gradient,
+                    min_sim=cfg.alias_min_sim,
+                    self_hash_id=hash_id,
+                )
+                cands = merge_topk_candidates(bare_cands, centroid_cands)
+            else:
+                cands = bare_cands
             # Composite-surface admission gate — candidate-side.
             # Mirror the entity-side check: never add an alias edge
             # whose **target** is composite either, otherwise a clean
@@ -421,6 +434,20 @@ class LinearRAG:
                     self.entity_embedding_store.get_text(c.hash_id)
                 )
             ]
+            # Reranker veto — final low-confidence gate that filters
+            # ordered-tier false merges (option 1 vs option 2 etc) the
+            # cosine-similarity path cannot tell apart. The threshold is
+            # an absolute pairwise score boundary; below it we don't
+            # build the edge. See disambig.reranker_veto for the AUC
+            # caveat (~0.66 — veto only, not identity classification).
+            if cfg.reranker_enabled and cands:
+                cands = reranker_veto(
+                    entity_text,
+                    cands,
+                    self.entity_embedding_store,
+                    threshold=cfg.reranker_threshold,
+                    instruction=cfg.reranker_instruction,
+                )
             total_added += add_alias_edges(self.graph, hash_id, cands)
         return total_added
 
@@ -447,15 +474,16 @@ class LinearRAG:
                     out[ent].append(sent)
         return out
 
-    def _entity_query_embedding(
-        self, hash_id: str, mention_sentences: List[str]
-    ) -> tuple[np.ndarray, bool]:
-        """Pick the query embedding for alias detection.
+    def _mention_centroid(
+        self, mention_sentences: List[str]
+    ) -> Optional[np.ndarray]:
+        """L2-normalized centroid of up to N distinct mention-sentence embeddings.
 
-        Returns ``(embedding, low_context_flag)``. ``low_context_flag`` is
-        True when the entity has <2 distinct mention sentences and we fall
-        back to the bare-surface entity embedding; the caller raises the
-        similarity floor in that case.
+        Returns ``None`` when fewer than 2 distinct mention sentences
+        are available — in that case the caller relies on the
+        bare-surface query alone (no semantic second signal to add).
+        Centroid is L2-normalized so its cos sim against bare-surface
+        store entries is in the same range as the bare-vs-bare query.
         """
         cap = max(1, int(self.config.centroid_max_mentions))
         sentence_embeddings: List[np.ndarray] = []
@@ -466,14 +494,13 @@ class LinearRAG:
             sentence_embeddings.append(
                 self.sentence_embedding_store.get_embedding(sent_hash)
             )
-        if len(sentence_embeddings) >= 2:
-            centroid = np.mean(np.stack(sentence_embeddings, axis=0), axis=0)
-            norm = np.linalg.norm(centroid)
-            if norm > 0:
-                centroid = centroid / norm
-            return centroid.astype(np.float32), False
-        # Low-context fallback: bare entity surface embedding.
-        return self.entity_embedding_store.get_embedding(hash_id), True
+        if len(sentence_embeddings) < 2:
+            return None
+        centroid = np.mean(np.stack(sentence_embeddings, axis=0), axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+        return centroid.astype(np.float32)
 
     @staticmethod
     def _normalize_entity_surfaces(

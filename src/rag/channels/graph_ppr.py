@@ -290,6 +290,7 @@ class GraphPPRChannel(BaseChannel):
                 labels=self.linear_config.gliner_labels,
                 threshold=self.linear_config.gliner_threshold,
                 batch_size=self.linear_config.gliner_batch_size,
+                max_span_chars=self.linear_config.ner_max_span_chars,
             )
         return self._ner
 
