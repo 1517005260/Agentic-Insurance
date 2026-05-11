@@ -96,6 +96,7 @@ dependencies = [
     # PDFium, which is what Chromium ships for in-browser PDF rendering.
     "pypdfium2>=4.30.0",
     "pillow>=12.2.0",
+    "jieba>=0.42.1",
 ]
 
 [project.optional-dependencies]
