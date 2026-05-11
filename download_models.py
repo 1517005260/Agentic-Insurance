@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Pre-download model weights into the standard HuggingFace cache.
+"""Pre-download model weights for offline-first deployment.
 
-GLiNER's ``from_pretrained(repo_id)`` already downloads on demand into
-``~/.cache/huggingface/hub/`` the first time it runs, but pre-downloading
-at deploy time keeps the lifespan startup latency below the FastAPI
-worker's first health-check, and surfaces network errors before user
-traffic arrives.
+Two destinations:
+
+* **HF cache** (``~/.cache/huggingface/hub/``) — GLiNER NER backbone.
+  GLiNER's tokenizer probes the HF Hub for the base-model repo even on
+  a local-path load (see ``config.shared._gliner_cached`` notes), so
+  the standard HF cache layout is what its offline mode expects.
+* **STORAGE_PATH/models/** — Qwen3-Reranker. Loaded via plain
+  ``AutoModelForCausalLM.from_pretrained(local_dir)`` so a
+  fully-materialised snapshot in the project's storage volume keeps
+  the model with the rest of the data (faiss / bm25 / paddle_ocr
+  caches) instead of in a per-user directory.
 
 Defaults to the ``hf-mirror.com`` mirror for HuggingFace traffic;
 override with ``--endpoint`` or ``HF_ENDPOINT``.
@@ -19,6 +25,7 @@ Usage::
 """
 import argparse
 import os
+from pathlib import Path
 from typing import Iterable, List
 
 from huggingface_hub import snapshot_download
@@ -26,24 +33,65 @@ from huggingface_hub import snapshot_download
 
 DEFAULT_ENDPOINT = "https://hf-mirror.com"
 
-# Models the project depends on at runtime. GLiNER multi-v2.1 is the
-# open-set NER backbone (mT5, ~1.1 GB FP32 / ~0.6 GB FP16) used by
-# every ingest + the PPR seeding path. Add to this list as new local
-# components come online.
-DEFAULT_MODELS: List[str] = [
+
+def _project_storage_models() -> Path:
+    """Resolve ``STORAGE_PATH/models`` without depending on settings.py.
+
+    ``settings`` imports a large config tree (RAG / agent / web defaults);
+    keeping ``download_models.py`` independent lets it run on a fresh
+    deploy where Python deps for those modules might not yet be present.
+    Mirrors the convention in ``src/config/settings.py::models_root``.
+    """
+    storage = os.environ.get("STORAGE_PATH") or "local_storage"
+    storage_path = Path(storage)
+    if not storage_path.is_absolute():
+        storage_path = Path(__file__).parent / storage_path
+    return storage_path / "models"
+
+
+# Models that go into the HF cache (~/.cache/huggingface/hub/). GLiNER's
+# tokenizer expects this layout because its ``_load_tokenizer`` probes
+# the Hub for the base-model repo even with a local snapshot path.
+HF_CACHE_MODELS: List[str] = [
     "urchade/gliner_multiv2.1",
 ]
 
+# Models that go under STORAGE_PATH/models/<basename>. The reranker is
+# loaded by ``AutoModelForCausalLM.from_pretrained(local_dir)`` with no
+# upstream tokenizer probe, so a flat local snapshot is sufficient.
+#
+# The reranker repo id is read from RERANK_MODEL_ID so that switching
+# the runtime model (e.g. to Qwen3-Reranker-4B) needs only one env var
+# change — the loader (``settings.rerank_model_dir``) and this script
+# stay in lockstep. Default matches ``settings.RERANK_MODEL_ID``.
+STORAGE_MODELS: List[str] = [
+    os.environ.get("RERANK_MODEL_ID") or "Qwen/Qwen3-Reranker-0.6B",
+]
 
-def download_repo(repo_id: str, endpoint: str, force: bool = False) -> None:
-    """Snapshot the repo into the standard HF cache."""
-    print(f"[{repo_id}] endpoint={endpoint}", flush=True)
+
+def download_to_hf_cache(repo_id: str, endpoint: str, force: bool = False) -> None:
+    """Snapshot ``repo_id`` into the standard HF cache."""
+    print(f"[hf-cache:{repo_id}] endpoint={endpoint}", flush=True)
     local_path = snapshot_download(
         repo_id=repo_id,
         endpoint=endpoint,
         force_download=force,
     )
-    print(f"[{repo_id}] cached at {local_path}", flush=True)
+    print(f"[hf-cache:{repo_id}] cached at {local_path}", flush=True)
+
+
+def download_to_storage(repo_id: str, endpoint: str, force: bool = False) -> None:
+    """Snapshot ``repo_id`` into ``STORAGE_PATH/models/<basename>``."""
+    target = _project_storage_models() / repo_id.split("/")[-1]
+    target.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[storage:{repo_id}] endpoint={endpoint} → {target}", flush=True)
+    local_path = snapshot_download(
+        repo_id=repo_id,
+        endpoint=endpoint,
+        force_download=force,
+        local_dir=str(target),
+    )
+    print(f"[storage:{repo_id}] materialised at {local_path}", flush=True)
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
@@ -52,8 +100,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "repos",
         nargs="*",
         help=(
-            "HuggingFace repo ids to download. "
-            "If omitted, downloads the project defaults."
+            "HuggingFace repo ids to download. If omitted, downloads "
+            "the project defaults (GLiNER NER + Qwen3-Reranker)."
         ),
     )
     parser.add_argument(
@@ -71,11 +119,28 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    repos = args.repos or DEFAULT_MODELS
     endpoint = args.endpoint.rstrip("/")
     print(f"HF endpoint: {endpoint}", flush=True)
-    for repo_id in repos:
-        download_repo(repo_id=repo_id, endpoint=endpoint, force=args.force)
+
+    if args.repos:
+        # Manual override — route by **basename** match against
+        # STORAGE_MODELS. Basename comparison (rather than full
+        # ``org/name``) is the right granularity: ``settings.rerank_model_dir``
+        # also routes by basename, so a manual download of a Qwen3-Reranker
+        # variant ends up where the loader will look for it even if the
+        # owner prefix differs (e.g. a private mirror of the same repo).
+        storage_basenames = {m.split("/")[-1] for m in STORAGE_MODELS}
+        for repo in args.repos:
+            if repo.split("/")[-1] in storage_basenames:
+                download_to_storage(repo, endpoint, args.force)
+            else:
+                download_to_hf_cache(repo, endpoint, args.force)
+        return 0
+
+    for repo_id in HF_CACHE_MODELS:
+        download_to_hf_cache(repo_id, endpoint, args.force)
+    for repo_id in STORAGE_MODELS:
+        download_to_storage(repo_id, endpoint, args.force)
     return 0
 
 

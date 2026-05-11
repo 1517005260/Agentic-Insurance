@@ -1,4 +1,4 @@
-"""Rerank candidate pages with the DashScope rerank API."""
+"""Rerank candidate pages with the local Qwen3-Reranker cross-encoder."""
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
@@ -24,8 +24,10 @@ def rerank_pages(
     """Send page Markdowns to the reranker and return the top-N.
 
     Each page's Markdown is truncated to ``config.rerank_doc_max_chars`` so
-    a single huge page can't blow the request budget. The reranker's
-    ``relevance_score`` is comparable only within this request.
+    a single huge page can't blow the request budget. Local Qwen3-Reranker
+    is true pairwise (no cross-request normalization) so the
+    ``relevance_score`` is directly comparable across calls — caller can
+    cache or threshold without rescoring.
     """
     cfg = config or RAGConfig()
     rc = client or get_cached_rerank_client()

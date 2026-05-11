@@ -340,15 +340,21 @@ TAVILY_API_BASE_URL: str = _get("TAVILY_API_BASE_URL") or "https://api.tavily.co
 
 # -------------------------------------------------------------- reranker ----
 
-# DashScope native rerank API. Base URL ends at /api/v1; the client appends
-# /services/rerank/text-rerank/text-rerank. Default model is gte-rerank-v2
-# because it's available on both Beijing and Singapore endpoints; switch to
-# qwen3-rerank with the -intl URL for higher quality where available.
-RERANKER_API_KEY: str | None = _get("RERANKER_API_KEY")
-RERANKER_API_BASE_URL: str = (
-    _get("RERANKER_API_BASE_URL") or "https://dashscope.aliyuncs.com/api/v1"
-)
-RERANKER_MODEL: str = _get("RERANKER_MODEL") or "gte-rerank-v2"
+# Local Qwen3-Reranker-0.6B (pairwise cross-encoder, instruction-tuned).
+# Weights live under ``STORAGE_PATH/models/<model_id basename>`` so they
+# move with the storage volume and don't depend on the user-level HF
+# cache. Pre-fetch with ``python download_models.py``.
+RERANK_MODEL_ID: str = _get("RERANK_MODEL_ID") or "Qwen/Qwen3-Reranker-0.6B"
+
+
+def rerank_model_dir() -> Path:
+    """Local-snapshot directory for the reranker weights.
+
+    Uses just the repo basename (``Qwen3-Reranker-0.6B``) so the
+    on-disk layout stays flat and predictable; the HF repo owner
+    prefix lives only in the env var / config-store ``model id``.
+    """
+    return models_root() / RERANK_MODEL_ID.split("/")[-1]
 
 
 __all__ = [
@@ -408,9 +414,8 @@ __all__ = [
     "VISUAL_EMBEDDING_API_KEY",
     "VISUAL_EMBEDDING_API_BASE_URL",
     "VISUAL_EMBEDDING_MODEL",
-    "RERANKER_API_KEY",
-    "RERANKER_API_BASE_URL",
-    "RERANKER_MODEL",
+    "RERANK_MODEL_ID",
+    "rerank_model_dir",
     "TAVILY_API_KEY",
     "TAVILY_API_BASE_URL",
 ]

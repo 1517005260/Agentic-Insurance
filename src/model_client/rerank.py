@@ -1,41 +1,59 @@
-"""Reranker client — DashScope text-rerank (native API).
+"""Reranker client — local Qwen3-Reranker (instruction-tuned cross-encoder).
 
-The endpoint sits at
+The model is a causal LM with a yes/no scoring head: each (query, doc)
+pair is scored independently as ``softmax([logit(no), logit(yes)])[yes]``.
+This is true *pairwise* — no cross-request normalization, so the score
+of pair A is comparable to the score of pair B from a different call.
+That property is what makes the score usable as a threshold for the
+alias-edge veto layer (see ``src/ingestion/index/linear_rag/disambig.py``).
 
-    POST {base_url}/services/rerank/text-rerank/text-rerank
+The instruction-tuned framing lets the caller pin the label space:
+``"Retrieve passages relevant to the query"`` for RAG page reranking,
+``"Are these the same real-world entity?"`` for ER alias verification.
+The instruction is the **only** lever that lets one model serve both
+use cases without fine-tuning.
 
-All DashScope rerank models use the *nested* body shape
-``{"model", "input": {...}, "parameters": {...}}``. Two flavors:
+Two public entry points:
 
-* **Plain-text rerankers** (``qwen3-rerank``, ``gte-rerank-v2``, …) —
-  query/documents are bare strings::
+* :meth:`RerankClient.rerank` — query + N documents → top-N sorted by
+  score; used by ``src/rag/rerank.py`` for page reranking.
+* :meth:`RerankClient.score_pairs` — list of (query, doc) tuples →
+  list of scores, no sorting; the ER use case where every pair has a
+  different query.
 
-    {"model": "qwen3-rerank",
-     "input": {"query": str, "documents": [str, ...]},
-     "parameters": {"top_n", "return_documents"}}
-
-* **Multimodal reranker** (``qwen3-vl-rerank``) — each item carries a
-  content-type tag::
-
-    {"model": "qwen3-vl-rerank",
-     "input": {"query": {"text": str},
-               "documents": [{"text": str} | {"image": url} | {"video": url}, ...]},
-     "parameters": {"top_n", "return_documents"}}
-
-The response is uniform: ``output.results`` is a list of
-``{"index", "relevance_score"}`` tuples; ``relevance_score`` is only
-comparable WITHIN a single request — never across calls.
+GPU FP16 is mandatory. Weights live at
+``settings.rerank_model_dir()`` (``STORAGE_PATH/models/Qwen3-Reranker-0.6B``),
+pre-fetched by ``python download_models.py``.
 """
 
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence, Tuple
 
-from config.http import make_retry_session
-from config.shared import shared_session
-from config.settings import RERANKER_API_BASE_URL, RERANKER_API_KEY, RERANKER_MODEL
+import torch
+
+from config.settings import RERANK_MODEL_ID, rerank_model_dir
+from config.shared import shared_qwen_reranker
 
 
-_DASHSCOPE_PATH = "/services/rerank/text-rerank/text-rerank"
+# Default instruction — biased toward the *retrieval* label space
+# because ``rerank(query, documents)`` is a passage-relevance task.
+# The ER alias path passes its own ER-specific instruction at call
+# time (see ``disambig.reranker_veto``).
+DEFAULT_INSTRUCTION = (
+    "Given a search query, retrieve passages that are relevant to the query."
+)
+
+# Qwen3-Reranker chat template — model-card-prescribed wrappers around
+# the (instruction, query, document) triple. The prefix/suffix tokens
+# are computed once per (tokenizer, instruction) combo and concatenated
+# around the body tokens at score time. Keep these in lockstep with the
+# Qwen3-Reranker model card if you upgrade the checkpoint.
+_PREFIX_TEMPLATE = (
+    "<|im_start|>system\nJudge whether the Document meets the requirements "
+    "based on the Query and the Instruct provided. Note that the answer can "
+    "only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+)
+_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
 class RerankResult(dict):
@@ -43,97 +61,128 @@ class RerankResult(dict):
 
 
 class RerankClient:
+    """Pairwise cross-encoder reranker backed by Qwen3-Reranker-0.6B.
+
+    Thread-safe: the cached (tokenizer, model) handle is shared across
+    threads under PyTorch's read-only forward; per-instance state is
+    immutable after ``__init__``.
+    """
+
     def __init__(
         self,
-        model: Optional[str] = None,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        timeout: float = 60.0,
+        model_dir: Optional[Any] = None,
+        max_length: int = 1024,
+        batch_size: int = 8,
     ):
-        self.model = model or RERANKER_MODEL
-        self.api_key = api_key or RERANKER_API_KEY
-        self.base_url = (base_url or RERANKER_API_BASE_URL).rstrip("/")
-        self.timeout = timeout
-        self._session = shared_session(
-            "rerank-default", lambda: make_retry_session()
+        # ``model_dir`` overrides the default location (rarely useful
+        # outside tests); production callers leave it None so the
+        # standard ``STORAGE_PATH/models/...`` resolution applies.
+        resolved_dir = model_dir if model_dir is not None else rerank_model_dir()
+        self.model_id = RERANK_MODEL_ID
+        self.model_dir = resolved_dir
+        self.max_length = int(max_length)
+        self.batch_size = int(batch_size)
+        # Tokenizer + model + cached yes/no token ids — see shared.py.
+        self._tokenizer, self._model, self._yes_id, self._no_id = (
+            shared_qwen_reranker(resolved_dir)
         )
+        self._prefix_tokens = self._tokenizer.encode(_PREFIX_TEMPLATE, add_special_tokens=False)
+        self._suffix_tokens = self._tokenizer.encode(_SUFFIX, add_special_tokens=False)
 
     def available(self) -> bool:
-        return bool(self.model and self.api_key)
+        # Always True once construction succeeds — failures raise in
+        # ``__init__``. Kept as a method so callers can probe with a
+        # uniform interface (test doubles can return False).
+        return True
+
+    @torch.no_grad()
+    def score_pairs(
+        self,
+        pairs: Sequence[Tuple[str, str]],
+        instruction: Optional[str] = None,
+    ) -> List[float]:
+        """Score each (query, document) pair independently.
+
+        Returns a list of floats in ``[0, 1]`` parallel to ``pairs``;
+        ``>0.5`` means the model favors "yes" (= relevant / same entity
+        depending on the instruction). Pairs are batched in
+        ``self.batch_size`` chunks for GPU throughput; no truncation
+        beyond ``self.max_length`` minus the prefix/suffix budget.
+        """
+        if not pairs:
+            return []
+        instruct = instruction or DEFAULT_INSTRUCTION
+        scores: List[float] = []
+        for start in range(0, len(pairs), self.batch_size):
+            chunk = pairs[start : start + self.batch_size]
+            bodies = [
+                f"<Instruct>: {instruct}\n<Query>: {q}\n<Document>: {d}"
+                for q, d in chunk
+            ]
+            inputs = self._tokenizer(
+                bodies,
+                padding=False,
+                truncation="longest_first",
+                return_attention_mask=False,
+                max_length=self.max_length - len(self._prefix_tokens) - len(self._suffix_tokens),
+            )
+            # Wrap each body with the chat-template prefix/suffix —
+            # see Qwen3-Reranker model card. We add them at the token
+            # level (not the string level) so a long body never bumps
+            # the prefix tokens out under truncation.
+            for i in range(len(inputs["input_ids"])):
+                inputs["input_ids"][i] = (
+                    self._prefix_tokens + inputs["input_ids"][i] + self._suffix_tokens
+                )
+            inputs = self._tokenizer.pad(
+                inputs,
+                padding=True,
+                return_tensors="pt",
+                max_length=self.max_length,
+            ).to("cuda")
+            logits = self._model(**inputs).logits[:, -1, :]
+            yes_logits = logits[:, self._yes_id]
+            no_logits = logits[:, self._no_id]
+            stacked = torch.stack([no_logits, yes_logits], dim=1)
+            log_prob = torch.nn.functional.log_softmax(stacked, dim=1)
+            scores.extend(log_prob[:, 1].exp().tolist())
+        return scores
 
     def rerank(
         self,
         query: str,
         documents: Sequence[str],
         top_n: int,
+        instruction: Optional[str] = None,
     ) -> List[RerankResult]:
-        """Return top-``top_n`` results sorted by relevance_score desc."""
-        if not self.available():
-            raise RuntimeError(
-                "RerankClient is not configured (set RERANKER_API_KEY and "
-                "RERANKER_MODEL)."
-            )
+        """Score every (query, doc) pair, return the top ``top_n`` sorted desc.
+
+        ``index`` is the position in ``documents``; ``relevance_score``
+        is the yes-probability. Identical pairs always produce identical
+        scores — no cross-request normalization, so scores are
+        comparable across calls.
+        """
         if not documents:
             return []
-        if "compatible-mode" in self.base_url:
-            raise RuntimeError(
-                f"RERANKER_API_BASE_URL is '{self.base_url}', the OpenAI-compatible "
-                f"path. DashScope rerank only works on the native '/api/v1' path."
-            )
-
-        url = (
-            self.base_url + _DASHSCOPE_PATH
-            if not self.base_url.endswith(_DASHSCOPE_PATH)
-            else self.base_url
+        pairs = [(query, d) for d in documents]
+        raw_scores = self.score_pairs(pairs, instruction=instruction)
+        ranked = sorted(
+            enumerate(raw_scores), key=lambda kv: kv[1], reverse=True
         )
-        capped_top_n = int(min(top_n, len(documents)))
-        payload = self._build_payload(query, list(documents), capped_top_n)
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        response = self._session.post(url, headers=headers, json=payload, timeout=self.timeout)
-        if response.status_code >= 400:
-            # Surface the server's error body — DashScope returns useful
-            # diagnostics (invalid_parameter, bad model name, …) that
-            # raise_for_status() would otherwise hide.
-            raise RuntimeError(
-                f"DashScope rerank {response.status_code}: {response.text!r} "
-                f"(payload model={self.model!r})"
-            )
-        body = response.json()
-        results = (body.get("output") or {}).get("results")
-        if results is None:
-            raise RuntimeError(f"DashScope rerank response missing output.results: {body!r}")
+        cap = min(int(top_n), len(documents))
         return [
-            RerankResult(index=int(r["index"]), relevance_score=float(r["relevance_score"]))
-            for r in results
+            RerankResult(index=idx, relevance_score=float(score))
+            for idx, score in ranked[:cap]
         ]
-
-    def _build_payload(
-        self, query: str, documents: List[str], top_n: int
-    ) -> Dict[str, Any]:
-        # qwen3-vl-rerank is the only model that needs content-type tags
-        # because it can mix text/image/video items in one request.
-        if self.model == "qwen3-vl-rerank":
-            return {
-                "model": self.model,
-                "input": {
-                    "query": {"text": query},
-                    "documents": [{"text": d} for d in documents],
-                },
-                "parameters": {"top_n": top_n, "return_documents": False},
-            }
-        # All plain-text rerankers (qwen3-rerank, gte-rerank-v2, …) take
-        # the same nested body with bare-string query/documents.
-        return {
-            "model": self.model,
-            "input": {"query": query, "documents": documents},
-            "parameters": {"top_n": top_n, "return_documents": False},
-        }
 
 
 @lru_cache(maxsize=1)
 def get_cached_rerank_client() -> "RerankClient":
-    """Process-wide singleton for the no-arg :class:`RerankClient`."""
+    """Process-wide singleton for the no-arg :class:`RerankClient`.
+
+    Construction is cheap (the heavy model load is memoised in
+    ``shared_qwen_reranker``); this layer memoises the thin wrapper so
+    callers using the ``client or get_cached(...)`` pattern don't
+    re-run the constructor on every request.
+    """
     return RerankClient()

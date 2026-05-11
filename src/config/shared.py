@@ -51,7 +51,6 @@ SessionProfile = Literal[
     "chat-no-read-retry",
     "embedding-default",
     "visual-embedding-default",
-    "rerank-default",
     "tavily-tight",
     "paddle-ocr-default",
     "web-fetch-tight",
@@ -67,7 +66,9 @@ _VALID_SESSION_PROFILES: frozenset[str] = frozenset(get_args(SessionProfile))
 if TYPE_CHECKING:  # pragma: no cover — types only
     import requests
     import tiktoken
+    import torch
     from gliner import GLiNER
+    from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
     from storage.embedding_store import EmbeddingStore
 
@@ -223,6 +224,75 @@ def shared_gliner(model_id: str) -> "GLiNER":
     """
     with _key_lock(f"gliner:{model_id}"):
         return _gliner_cached(model_id)
+
+
+# ----------------------------------------------------- Qwen3-Reranker ----
+
+# Cache key is the on-disk model directory (a Path resolved by
+# settings.rerank_model_dir()), not a HF repo id — the reranker is
+# loaded from a fully-materialised local snapshot under
+# STORAGE_PATH/models/<basename>, so two consumers of the same dir get
+# the same tokenizer/model handle without a hub probe. Same offline-mode
+# discipline as GLiNER: HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE set
+# BEFORE the first transformers import.
+
+
+@lru_cache(maxsize=2)
+def _qwen_reranker_cached(model_dir_str: str) -> "tuple[PreTrainedTokenizerBase, PreTrainedModel, int, int]":
+    """Inner cached loader. Returns (tokenizer, model, yes_id, no_id).
+
+    The reranker is a causal LM scored by yes/no logit at the last
+    position; we pre-compute the two token ids so the hot path is one
+    forward + one tensor slice (no per-call token lookup).
+    """
+    import os
+
+    # Match GLiNER's offline-before-import discipline — see notes in
+    # ``_gliner_cached``. Without this, transformers / huggingface_hub
+    # cache the offline flag at import time and the tokenizer load
+    # below silently hits the Hub for ``additional_chat_templates``.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Qwen3-Reranker requires CUDA; CPU inference is unsupported by "
+            "project policy. Set up a CUDA-enabled torch build or run on a "
+            "GPU host."
+        )
+    if not Path(model_dir_str).is_dir():
+        raise FileNotFoundError(
+            f"Reranker model dir not found: {model_dir_str}. Run "
+            f"`python download_models.py` to fetch Qwen3-Reranker-0.6B."
+        )
+    logger.debug("_qwen_reranker_cached: loading %s on cuda fp16", model_dir_str)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir_str, padding_side="left")
+    model = (
+        AutoModelForCausalLM.from_pretrained(model_dir_str, torch_dtype=torch.float16)
+        .cuda()
+        .eval()
+    )
+    yes_id = tokenizer.convert_tokens_to_ids("yes")
+    no_id = tokenizer.convert_tokens_to_ids("no")
+    return tokenizer, model, yes_id, no_id
+
+
+def shared_qwen_reranker(
+    model_dir: Path,
+) -> "tuple[PreTrainedTokenizerBase, PreTrainedModel, int, int]":
+    """Return the cached Qwen3-Reranker handle for ``model_dir``.
+
+    Returns ``(tokenizer, model, yes_token_id, no_token_id)``. First call
+    materialises the model on GPU FP16 (~1.2 GB VRAM resident); the
+    handle is shared across threads because the model is in ``eval()``
+    mode and the forward path is read-only.
+    """
+    canonical = str(model_dir.expanduser().resolve(strict=False))
+    with _key_lock(f"qwen_reranker:{canonical}"):
+        return _qwen_reranker_cached(canonical)
 
 
 # ----------------------------------------------------------- tiktoken ----
@@ -395,6 +465,17 @@ def clear_caches() -> None:
     via the admin route actually returns VRAM to the system.
     """
     _gliner_cached.cache_clear()
+    _qwen_reranker_cached.cache_clear()
+    # The outer ``get_cached_rerank_client`` wrapper holds a strong
+    # reference to the constructed RerankClient (which pins the tokenizer
+    # / model handle in its __init__); clear that too so a model-id
+    # swap actually returns VRAM.
+    try:
+        from model_client.rerank import get_cached_rerank_client
+
+        get_cached_rerank_client.cache_clear()
+    except Exception:  # noqa: BLE001
+        logger.debug("clear_caches: rerank client clear skipped", exc_info=True)
     _tiktoken_cached.cache_clear()
     _embedding_store_cached.cache_clear()
     with _SESSION_LOCK:
@@ -476,6 +557,7 @@ def canonical_store_key(store_dir: Path, namespace: str) -> "tuple[str, str]":
 
 __all__ = [
     "shared_gliner",
+    "shared_qwen_reranker",
     "shared_tiktoken_encoder",
     "shared_embedding_store",
     "shared_embedding_store_for",
