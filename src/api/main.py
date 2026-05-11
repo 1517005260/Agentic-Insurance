@@ -134,7 +134,9 @@ async def lifespan(_app: FastAPI):
     # (read-only) — admin patches mutate the same object and the next
     # request sees the new value.
     _app.state.config = await ConfigStore.from_app_db(SessionLocal)
-    logger.info("config store loaded (34 keys)")
+    logger.info(
+        "config store loaded (%d keys)", len(_app.state.config.snapshot())
+    )
 
     # Three agent singletons, one per chat session ``agent_kind``.
     # Each instance is per-process state-free (``run()`` builds fresh
