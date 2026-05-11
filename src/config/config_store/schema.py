@@ -353,8 +353,64 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description=(
             "Max Han-character length for an unbraced entity surface. "
             "Surfaces above this are rejected as sentence-fragment leakage. "
-            "Insurance product names top out at ~10 (default 15 safe); "
-            "legal / patent corpora typically need 20-25."
+            "Insurance product names top out at ~10 (default 12 from a "
+            "56-sample benchmark); legal / patent corpora typically need 20-25."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.ner_max_span_chars",
+        type="int",
+        default=_LINEAR_RAG_DEFAULTS.ner_max_span_chars,
+        min=20,
+        max=200,
+        group="linear_rag",
+        description=(
+            "Raw-character cap on GLiNER output spans. Bracketed surfaces "
+            "(SKU markers, version tags) are kept regardless of length; "
+            "non-bracketed spans above this are rejected as sentence-shape "
+            "noise. Defensive ceiling — measured longest legitimate "
+            "insurance / legal surface sits at ~50 chars."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.reranker_enabled",
+        type="bool",
+        default=_LINEAR_RAG_DEFAULTS.reranker_enabled,
+        group="linear_rag",
+        description=(
+            "Enable the Qwen3-Reranker veto on alias-edge generation. "
+            "When True, every candidate surviving cos-sim + composite gates "
+            "is also scored by the cross-encoder and dropped below "
+            "``reranker_threshold``. Disable to fall back to the pre-veto "
+            "behaviour for debugging or for corpora where the reranker "
+            "checkpoint is unavailable."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.reranker_threshold",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.reranker_threshold,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description=(
+            "Pairwise yes-probability floor for the reranker veto. "
+            "Below this score the alias edge is not created. 0.7 was "
+            "the F1-optimal threshold on the 60-pair insurance benchmark; "
+            "raise toward 0.9 to be stricter (recall drops fast)."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.reranker_instruction",
+        type="str",
+        default=_LINEAR_RAG_DEFAULTS.reranker_instruction,
+        group="linear_rag",
+        description=(
+            "ER-specific instruction passed to Qwen3-Reranker. The model "
+            "defaults to retrieval relevance; the instruction is what "
+            "pins the label space to identity. The hard-negative checklist "
+            "(tiers / negation / modifier / sentence fragment) is the "
+            "essential part — without it the model drifts back to relevance."
         ),
     ),
     # ---------- graph_explore.* (entity_lookup tool runtime) ----------

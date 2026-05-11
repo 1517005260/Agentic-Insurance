@@ -265,6 +265,10 @@ class ConfigStore:
             gliner_labels=list(self._values["linear_rag.gliner_labels"]),
             gliner_threshold=float(self._values["linear_rag.gliner_threshold"]),
             junk_max_han_chars=int(self._values["linear_rag.junk_max_han_chars"]),
+            ner_max_span_chars=int(self._values["linear_rag.ner_max_span_chars"]),
+            reranker_enabled=bool(self._values["linear_rag.reranker_enabled"]),
+            reranker_threshold=float(self._values["linear_rag.reranker_threshold"]),
+            reranker_instruction=str(self._values["linear_rag.reranker_instruction"]),
         )
 
     def graph_explore_kwargs(self) -> Dict[str, Any]:

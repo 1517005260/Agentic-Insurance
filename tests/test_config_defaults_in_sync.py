@@ -95,11 +95,13 @@ def test_tavily_defaults():
     assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
 
 
-def test_entry_count_is_39():
+def test_entry_count_is_43():
     # rag/rerank/agent core (15) + agent.web (2) + tavily (2) + prompt (9) +
     # chat.history_turns (1) + linear_rag.literal_backfill_* (3) +
     # linear_rag.gliner_* (3) + linear_rag.junk_max_han_chars (1) +
-    # graph_explore.entity_lookup_* (2) + ingest.parallel_workers (1) = 39.
+    # linear_rag.ner_max_span_chars (1) +
+    # linear_rag.reranker_* (3) +
+    # graph_explore.entity_lookup_* (2) + ingest.parallel_workers (1) = 43.
     # The 9th prompt key is ``prompt.risk_predict`` (proactive
     # pre-issuance risk prediction workbench, GraphAgent-driven).
     # ``ingest.parallel_workers`` (admin-tuned) caps the per-process
@@ -109,5 +111,12 @@ def test_entry_count_is_39():
     # ``junk_max_han_chars`` is the per-domain cutoff for the Chinese
     # sentence-fragment rejection rule in ``normalize.is_junk`` — pulled
     # out of the algorithm layer because legal/patent corpora need
-    # 20-25 vs insurance's 15.
-    assert len(CONFIG_ENTRIES_BY_KEY) == 39
+    # 20-25 vs insurance's 12 default.
+    # ``ner_max_span_chars`` is the language-agnostic raw-character cap
+    # applied to GLiNER output spans BEFORE normalization — catches
+    # sentence-shape outputs that the Han-char rule (CJK-only) misses.
+    # The 3 ``reranker_*`` entries (enabled, threshold, instruction)
+    # let admins tune the alias-edge veto layer (Qwen3-Reranker-0.6B
+    # pairwise score). Instruction is exposed because the hard-negative
+    # checklist is what pins the model from retrieval to identity.
+    assert len(CONFIG_ENTRIES_BY_KEY) == 43
