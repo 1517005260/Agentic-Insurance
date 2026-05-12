@@ -67,6 +67,37 @@ def err(
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+# ---------------------------------------------------------------- file_id
+
+
+# `list_files` returns both `file_id` ("<...>_<hash>") and `filename`
+# ("<...>_<hash>.pdf"). LLMs routinely confuse the two and pass the
+# filename into downstream tools, which then fail with file_not_found
+# or — worse, in scope-based tools — silently filter to zero hits.
+# Stripping the source-file suffix at the boundary turns the common
+# confusion into a no-op. The list is intentionally narrow: extensions
+# we know the ingest pipeline accepts. Adding new accepted source
+# formats means updating this list.
+_FILENAME_EXTS_STRIPPED_AS_FILE_ID = (".pdf",)
+
+
+def normalize_file_id(raw: Any) -> str:
+    """Strip whitespace and one known source-file extension from ``raw``.
+
+    Idempotent: a real ``file_id`` (no extension) passes through unchanged.
+    Returns ``""`` for ``None`` / non-string inputs so callers' existing
+    "empty → error" branches keep working.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    lower = s.lower()
+    for ext in _FILENAME_EXTS_STRIPPED_AS_FILE_ID:
+        if lower.endswith(ext):
+            return s[: -len(ext)]
+    return s
+
+
 # ---------------------------------------------------------------- scope
 
 
@@ -137,7 +168,8 @@ def parse_scope(
     """
     fids: Optional[frozenset[str]] = None
     if file_ids:
-        cleaned = [str(f).strip() for f in file_ids if str(f).strip()]
+        cleaned = [normalize_file_id(f) for f in file_ids]
+        cleaned = [f for f in cleaned if f]
         if cleaned:
             fids = frozenset(cleaned)
 

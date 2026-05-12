@@ -16,7 +16,7 @@ The first call for a given file populates
 
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from agentic.tools.acquisition._common import err, ok
+from agentic.tools.acquisition._common import err, normalize_file_id, ok
 from agentic.tools.base import BaseTool
 from storage.inventory_store import InventoryStore
 from storage.page_store import PageStore
@@ -128,7 +128,11 @@ class TocTool(BaseTool):
                 {"error": "invalid_argument"},
             )
 
-        file_id_s = str(file_id).strip()
+        # ``list_files`` returns filename = "<file_id>.pdf" alongside the
+        # canonical file_id; the LLM routinely passes the filename here.
+        # Normalize before the page-index check so a single ".pdf" slip
+        # doesn't surface as file_not_found.
+        file_id_s = normalize_file_id(file_id)
         # Reach into PageStore once just to confirm the file is indexed —
         # an empty inventory could mean either "no headings" or "no
         # such file"; we want a distinct error for the latter.
