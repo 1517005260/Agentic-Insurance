@@ -206,7 +206,7 @@ def build_graph_agent(
     graph_channel: Optional[GraphPPRChannel] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 8,
+    max_loops: int = 14,
     max_token_budget: int = 64_000,
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
@@ -224,9 +224,13 @@ def build_graph_agent(
     neighbors / ppr) and the standard "navigate → read → cite"
     trajectory.
 
-    Defaults are tighter than the multi-tool agent (``max_loops=8``,
+    Defaults are tighter than the multi-tool agent (``max_loops=14``,
     ``max_token_budget=64k``): graph traversals are cheap but the loop
-    wastes budget quickly if it meanders. Override per call site.
+    wastes budget quickly if it meanders. ``max_loops`` is intentionally
+    a few rounds over the typical 2-3 turn trajectory — ``graph_explore``
+    occasionally fails (rate-limit, transient PPR seed miss) and the
+    extra headroom lets the agent retry without giving up mid-thought.
+    Override per call site.
     """
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)

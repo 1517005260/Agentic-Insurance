@@ -93,9 +93,9 @@ mode="ppr"
   random walk internally, then propagates over passages. Returns
   candidate pages ranked by relevance (file_id, page_id,
   page_number, score) — **no text**, you must read_page to read.
-  Args: `question` (required), `file_ids`, `page_range`,
-  `section_ids`, `top_k`. Best when you do NOT have an anchor
-  entity, or the question is topical ("which sections discuss X?").
+  Args: `question` (required), `file_ids`, `page_range`, `top_k`.
+  Best when you do NOT have an anchor entity, or the question is
+  topical ("which sections discuss X?").
 
   Caveat: PPR seeds via NER on the question; if the question
   contains no named entity (e.g. "what are the conditions for X?"),
@@ -150,9 +150,7 @@ returns nothing.
 
 - `file_ids`   — honored by ppr (full scope) and neighbors
                  (page-side only).
-- `page_range` — `[start, end]` inclusive, ppr only.
-- `section_ids` — `'<file_id>:sec_NNN'` from a `toc` result; ppr
-                  only; UNION across listed sections."""
+- `page_range` — `[start, end]` inclusive, ppr only."""
 
 
 _RESPONSE = """\
