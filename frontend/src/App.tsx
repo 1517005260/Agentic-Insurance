@@ -17,6 +17,7 @@ import { lazyWithRetry } from "@/lib/lazyWithRetry";
 // 时 reload 一次，避免把"chunk 404"暴露成全屏 ErrorBoundary。
 import LoginPage from "@/pages/LoginPage";
 import NotFoundPage from "@/pages/NotFoundPage";
+import RegisterPage from "@/pages/RegisterPage";
 
 const ChatPage = lazyWithRetry(() => import("@/pages/ChatPage"), "ChatPage");
 const FilesPage = lazyWithRetry(() => import("@/pages/FilesPage"), "FilesPage");
@@ -68,6 +69,7 @@ export default function App() {
       >
         <Routes>
           <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
 
           <Route
             element={

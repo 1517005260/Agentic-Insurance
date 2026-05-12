@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 
 import { authApi } from "@/api/auth";
 import { explainAxiosError } from "@/api/client";
@@ -8,42 +8,54 @@ import { Card, CardBody, CardHeader, CardSubtitle, CardTitle } from "@/component
 import { FieldHint, Input, Label } from "@/components/ui/input";
 import { useAuthStore } from "@/stores/auth";
 
-export default function LoginPage() {
+/**
+ * 自助注册页。后端 ``POST /auth/register`` 创建 ``analyst`` 账号并
+ * 直接回 token —— 注册成功 = 已登录，不再走 /login 二次回环。
+ *
+ * 两次密码校验只在前端做：用户体验上的"打字错了"防错；后端不接
+ * confirm 字段，避免把同样的明文重复发一次。
+ */
+export default function RegisterPage() {
   const navigate = useNavigate();
-  const location = useLocation();
   const setSession = useAuthStore((s) => s.setSession);
   const isVerified = useAuthStore((s) => s.verified && !!s.token);
 
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // 已登录访问 /login → 直接跳主页（避免重复登录覆盖 token）。
-  // 注意：必须等 verified 后才跳，否则冷启动还在 verify 时 token 已
-  // 经 hydrate 出来会一帧误跳到 /chat。
+  // 已登录访问 /register 同 /login 处理 —— 直接跳主页。
   useEffect(() => {
     if (isVerified) navigate("/chat", { replace: true });
   }, [isVerified, navigate]);
 
+  // 客户端的纯展示性校验。真正的"够不够安全"判定在后端
+  // ``enforce_password_policy`` —— 这里只是把常见错误（两次不
+  // 一致、长度不足）拦在请求前，少跑一次网络。
+  const mismatch = confirm.length > 0 && password !== confirm;
+  const tooShort = password.length > 0 && password.length < 8;
+  const canSubmit =
+    username.length >= 2 &&
+    password.length >= 8 &&
+    password === confirm &&
+    !busy;
+
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (busy) return;
+    if (!canSubmit) return;
     setError(null);
     setBusy(true);
     try {
-      // 1) 拿 token (flat TokenOut)
-      const tok = await authApi.login({ username, password });
-      // 2) 用显式 Authorization header 调 /me（不污染全局 store），
-      //    成功后一次性 setSession。这样 RequireAuth 的 verified
-      //    标记和 user 总是一致 — 不会出现 "token 已设但 user.id=
-      //    -1" 的中间帧。
+      const tok = await authApi.register({ username, password });
+      // 拿到 token 后再调一次 /me 以保证 store 里写入的 user
+      // 字段和 RequireAuth 看到的一致 —— 同 LoginPage 的设计。
       const me = await authApi.meWithToken(tok.access_token);
       setSession(tok.access_token, me);
-      const from = (location.state as { from?: string } | null)?.from;
-      navigate(from && from !== "/login" ? from : "/chat", { replace: true });
+      navigate("/chat", { replace: true });
     } catch (err) {
-      setError(explainAxiosError(err) || "登录失败");
+      setError(explainAxiosError(err) || "注册失败");
     } finally {
       setBusy(false);
     }
@@ -57,15 +69,15 @@ export default function LoginPage() {
             Agentic Insurance
           </div>
           <div className="mt-2 text-sm text-ink-muted">
-            香港 + 内地 保险业咨询智能终端
+            注册新账号 · 默认 analyst 角色
           </div>
         </div>
 
         <Card>
           <CardHeader>
-            <CardTitle>登录</CardTitle>
+            <CardTitle>注册</CardTitle>
             <CardSubtitle>
-              请使用管理员或分析师账号登录。默认管理员 admin / admin123
+              用户名 2–64 位，仅限字母 / 数字 / <code>._-</code>；密码 ≥ 8 位且至少 1 个字母 + 1 个数字。
             </CardSubtitle>
           </CardHeader>
 
@@ -79,8 +91,11 @@ export default function LoginPage() {
                   autoFocus
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
-                  placeholder="admin"
+                  placeholder="2–64 位"
                   required
+                  minLength={2}
+                  maxLength={64}
+                  pattern="[A-Za-z0-9._\-]+"
                 />
               </div>
 
@@ -89,11 +104,29 @@ export default function LoginPage() {
                 <Input
                   id="password"
                   type="password"
-                  autoComplete="current-password"
+                  autoComplete="new-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  minLength={8}
+                  maxLength={128}
                 />
+                {tooShort && <FieldHint tone="danger">密码至少 8 位</FieldHint>}
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="confirm">确认密码</Label>
+                <Input
+                  id="confirm"
+                  type="password"
+                  autoComplete="new-password"
+                  value={confirm}
+                  onChange={(e) => setConfirm(e.target.value)}
+                  required
+                  minLength={8}
+                  maxLength={128}
+                />
+                {mismatch && <FieldHint tone="danger">两次输入的密码不一致</FieldHint>}
               </div>
 
               {error && <FieldHint tone="danger">{error}</FieldHint>}
@@ -102,18 +135,19 @@ export default function LoginPage() {
                 type="submit"
                 size="lg"
                 loading={busy}
+                disabled={!canSubmit}
                 className="w-full"
               >
-                登录
+                注册并登录
               </Button>
 
               <p className="text-center text-sm text-ink-muted">
-                还没有账号？
+                已有账号？
                 <Link
-                  to="/register"
+                  to="/login"
                   className="ml-1 text-accent-700 underline underline-offset-2 decoration-accent-300 hover:decoration-accent-600"
                 >
-                  立即注册
+                  返回登录
                 </Link>
               </p>
             </form>

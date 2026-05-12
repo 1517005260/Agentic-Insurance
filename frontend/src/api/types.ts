@@ -33,6 +33,16 @@ export interface LoginRequest {
 }
 
 /**
+ * Self-registration payload. `role` is fixed server-side (`analyst`)
+ * so the frontend doesn't send one — the backend ignores anything
+ * the client would put here.
+ */
+export interface RegisterRequest {
+  username: string;
+  password: string;
+}
+
+/**
  * 后端 `TokenOut` 是 flat shape；登录成功后我们再调一次 /auth/me 把
  * 完整 user 拿回来，避免在前端解 JWT。
  */

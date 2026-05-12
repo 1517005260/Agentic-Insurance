@@ -75,12 +75,13 @@ api.interceptors.response.use(
           // 任何 protected 401（且属于当前会话）都先把 store 清掉。
           useAuthStore.getState().clear();
 
-          // 真正可能 replace 时才置 flag；当前已经在 /login 时不
-          // 设，防止 flag 永久卡死。
-          if (
-            !isRedirectingToLogin &&
-            window.location.pathname !== "/login"
-          ) {
+          // 真正可能 replace 时才置 flag；当前已经在 auth 页（/login
+          // 或 /register）时不设，防止 flag 永久卡死，也防止在注册
+          // 页因为一个无关 401 把刚弹出的内联错误信息冲掉。
+          const onAuthPage =
+            window.location.pathname === "/login" ||
+            window.location.pathname === "/register";
+          if (!isRedirectingToLogin && !onAuthPage) {
             isRedirectingToLogin = true;
             // location.replace 而不是 assign：浏览器 back 不会回到
             // 已失效的 protected page。

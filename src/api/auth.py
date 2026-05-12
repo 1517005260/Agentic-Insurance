@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import bcrypt
+from fastapi import HTTPException, status
 from jose import JWTError, jwt
 
 from config.settings import JWT_ALGORITHM, JWT_EXP_MINUTES, JWT_SECRET
@@ -56,6 +57,21 @@ def verify_password(plain: str, hashed: str) -> bool:
     except ValueError:
         # Malformed stored hash — treat as a non-match rather than 500.
         return False
+
+
+def enforce_password_policy(pw: str) -> None:
+    """Cheap policy gate shared by admin user-creation and self-register.
+
+    Pydantic constrains length [8, 128] at the schema layer; this adds
+    the one rule we care about beyond raw length: a password must mix
+    letters and digits. Raises 422 on violation so the frontend can
+    surface a field-level error.
+    """
+    if not any(c.isdigit() for c in pw) or not any(c.isalpha() for c in pw):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="password must contain at least one letter and one digit",
+        )
 
 
 def create_access_token(*, uid: int, username: str, role: str) -> str:

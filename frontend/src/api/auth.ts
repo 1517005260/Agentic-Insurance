@@ -1,5 +1,5 @@
 import { api } from "@/api/client";
-import type { LoginRequest, TokenOut, User } from "@/api/types";
+import type { LoginRequest, RegisterRequest, TokenOut, User } from "@/api/types";
 
 export const authApi = {
   /**
@@ -14,6 +14,15 @@ export const authApi = {
     const { data } = await api.post<TokenOut>("/auth/login", form, {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
     });
+    return data;
+  },
+
+  /**
+   * 后端 ``POST /auth/register`` 接 JSON。响应同 login —
+   * 一个可直接用的 access_token，前端可以一步登录、不用再调 /login。
+   */
+  async register(body: RegisterRequest): Promise<TokenOut> {
+    const { data } = await api.post<TokenOut>("/auth/register", body);
     return data;
   },
 

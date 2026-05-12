@@ -25,7 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.auth import hash_password
+from api.auth import enforce_password_policy, hash_password
 from api.deps import get_session, require_admin
 from api.models import AuditLog, User
 from api.schemas.users import (
@@ -119,15 +119,6 @@ async def _ensure_actor_still_admin(db: AsyncSession, actor_id: int) -> None:
         )
 
 
-def _enforce_password_policy(pw: str) -> None:
-    """Cheap policy gate. Pydantic already pinned length [8, 128]."""
-    if not any(c.isdigit() for c in pw) or not any(c.isalpha() for c in pw):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="password must contain at least one letter and one digit",
-        )
-
-
 def _audit(
     db: AsyncSession,
     *,
@@ -183,7 +174,7 @@ async def create_user(
     actor: User = Depends(require_admin),
     db: AsyncSession = Depends(get_session),
 ) -> UserOut:
-    _enforce_password_policy(body.password)
+    enforce_password_policy(body.password)
 
     # UNIQUE constraint on username will catch duplicates at flush
     # time, but checking up front lets us return a clean 409 instead
@@ -317,7 +308,7 @@ async def reset_password(
     actor: User = Depends(require_admin),
     db: AsyncSession = Depends(get_session),
 ) -> Response:
-    _enforce_password_policy(body.new_password)
+    enforce_password_policy(body.new_password)
     user = await _load_user_or_404(db, user_id)
     user.password_hash = hash_password(body.new_password)
     _audit(
