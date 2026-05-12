@@ -21,33 +21,105 @@ import { useCitationStore } from "@/stores/citation";
 import { cn } from "@/lib/utils";
 
 /**
- * Pre-process the LLM's math output so KaTeX can read it. The model
- * frequently emits ``\[4pt]`` (LaTeX line-break with vertical skip)
- * inside an ``align`` / ``cases`` block. In Markdown source, the
- * single backslash often arrives as ``\[4pt]`` literally — KaTeX then
- * tries to parse it as ``\[`` (begin math) and chokes. We rewrite
- * those into the canonical ``\\[4pt]`` form before handing the math
- * blocks off to remark-math.
+ * Pre-process the LLM's math output so KaTeX can read it. Three concerns:
  *
- * Only touches ``$$...$$`` and ``$...$`` regions to avoid mangling
- * regular prose that happens to contain a literal ``\[`` (e.g.
- * Bash array snippets in code blocks).
+ *   1. Upstream models often emit OpenAI-style delimiters — ``\(...\)``
+ *      for inline math and ``\[...\]`` for block math — which
+ *      ``remark-math`` does not recognise. The result is a raw ``$``-free
+ *      string of ``\(``/``\[`` markers rendered as literal text.
+ *
+ *   2. ``remark-math`` refuses ``$ x $`` (whitespace adjacent to the
+ *      delimiter). LLMs sometimes pad math with spaces, and the
+ *      delimiters then survive as literal ``$`` characters in the
+ *      output.
+ *
+ *   3. Inside an ``align`` / ``cases`` block the model writes
+ *      ``\[4pt]`` (LaTeX line-break with vertical skip). KaTeX would
+ *      otherwise parse the single backslash as a begin-math ``\[`` and
+ *      choke; we rewrite to the canonical ``\\[4pt]`` form.
+ *
+ * Code fences and inline code are pulled out first via placeholders so
+ * a backticked snippet containing ``$`` or ``\[`` is never rewritten.
  */
 function normalizeMathDelimiters(src: string): string {
   if (!src) return src;
-  // Block math first (greedy match across newlines, then inline)
+
+  // 0) Pull every code region out before any math rewrite. The
+  //    placeholder uses the private-use code point U+E000 (written as
+  //    a ``\uE000`` escape in source so the .tsx file stays ASCII-
+  //    clean — git keeps it text, code review sees a normal diff).
+  //    Private-use code points never appear in normal LLM output and
+  //    contain no regex-special characters, so a placeholder cannot
+  //    collide with real prose. Backtick (```` ``` ````) and tilde
+  //    (``~~~``) fenced blocks are both protected, plus single-
+  //    backtick inline code.
+  const SENTINEL = "\uE000";
+  const placeholders: string[] = [];
+  const protect = (chunk: string): string => {
+    const i = placeholders.length;
+    placeholders.push(chunk);
+    return `${SENTINEL}C${i}${SENTINEL}`;
+  };
+  let s = src
+    .replace(/```[\s\S]*?```/g, protect)
+    .replace(/~~~[\s\S]*?~~~/g, protect)
+    .replace(/`[^`\n]+`/g, protect);
+
+  // 1) OpenAI-style delimiters → dollar-sign forms. Bodies are bounded
+  //    so an unclosed opener cannot drive O(N^2) backtracking on
+  //    adversarial input — each ``\(`` or ``\[`` scans at most
+  //    ``CAP`` characters before the regex engine gives up and moves
+  //    on. The negative lookbehind on ``\\`` rules out ``\\(`` /
+  //    ``\\[`` (a LaTeX line break inside an already-delimited math
+  //    region) and the closing lookbehind likewise protects ``\\)``
+  //    / ``\\]``.
+  const INLINE_CAP = 400;
+  const BLOCK_CAP = 4000;
+  const inlineOpenAI = new RegExp(
+    `(?<!\\\\)\\\\\\(([\\s\\S]{1,${INLINE_CAP}}?)(?<!\\\\)\\\\\\)`,
+    "g",
+  );
+  const blockOpenAI = new RegExp(
+    `(?<!\\\\)\\\\\\[([\\s\\S]{1,${BLOCK_CAP}}?)(?<!\\\\)\\\\\\]`,
+    "g",
+  );
+  s = s.replace(inlineOpenAI, (_m, b) => `$${b.trim()}$`);
+  s = s.replace(blockOpenAI, (_m, b) => `\n\n$$\n${b.trim()}\n$$\n\n`);
+
+  // 2) Tighten ``$ x $`` → ``$x$`` so remark-math will accept it. The
+  //    opener lookbehind excludes both ``$`` (so the block-math
+  //    ``$$`` delimiter isn't shredded) and ``\\`` (so a deliberately
+  //    escaped ``\$`` literal — common in prose about money — stays a
+  //    literal dollar). Currency-style ``$50`` has no whitespace
+  //    adjacent to the dollar and is therefore untouched.
+  s = s.replace(
+    /(?<![$\\])\$[ \t]+([^\n$]{1,300}?)[ \t]+\$(?!\$)/g,
+    (_m, b) => `$${b.trim()}$`,
+  );
+
+  // 3) ``\[4pt]`` → ``\\[4pt]`` inside an existing math region, and
+  //    a bare ``\[`` at the end of a math line → ``\\``. Only
+  //    applied within math regions so BibTeX-ish prose containing
+  //    ``\[`` outside math is left alone.
+  const fixLineBreak = (body: string): string =>
+    body
+      .replace(/(?<!\\)\\(\[\s*\d+(?:\.\d+)?\s*[a-zA-Z]+\s*\])/g, "\\\\$1")
+      .replace(/(?<!\\)\\\[(?=\s*$)/gm, "\\\\");
   const blockRe = /(\${2})([\s\S]*?)\1/g;
   const inlineRe = /(?<!\$)(\$)(?!\$)([\s\S]*?)(?<!\$)\1(?!\$)/g;
-  const fix = (body: string): string =>
-    body
-      // ``\[4pt]`` → ``\\[4pt]`` (line-break with optional skip)
-      .replace(/(?<!\\)\\(\[\s*\d+(?:\.\d+)?\s*[a-zA-Z]+\s*\])/g, "\\\\$1")
-      // bare ``\[`` (no number) at end of line → also a line-break
-      .replace(/(?<!\\)\\\[(?=\s*$)/gm, "\\\\");
-  return src
-    .replace(blockRe, (_m, d, b) => `${d}${fix(b)}${d}`)
-    .replace(inlineRe, (_m, d, b) => `${d}${fix(b)}${d}`);
+  s = s
+    .replace(blockRe, (_m, d, b) => `${d}${fixLineBreak(b)}${d}`)
+    .replace(inlineRe, (_m, d, b) => `${d}${fixLineBreak(b)}${d}`);
+
+  // Restore protected code chunks. If a sentinel index points at a
+  // hole (should not happen, but cheap to defend), keep the literal
+  // marker rather than throwing.
+  return s.replace(
+    new RegExp(`${SENTINEL}C(\\d+)${SENTINEL}`, "g"),
+    (_m, k) => placeholders[Number(k)] ?? _m,
+  );
 }
+
 
 interface Props {
   /** LLM 输出的原始 markdown 文本（可能含 [^k] 角标）。 */

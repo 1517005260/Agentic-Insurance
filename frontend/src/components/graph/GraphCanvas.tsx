@@ -448,27 +448,33 @@ export function GraphCanvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [highlightKey, autoFitHighlight]);
 
-  // 视角跟随单点：用 translateTo 仅平移、不改 zoom，避免 focusElement
-  // 那种 fit-to-bounds 行为把镜头拉远又拉近。空 focusId / 节点未上
-  // stage 时跳过。依赖项里同时包含 dataKey：focusId 帧可能在节点 setData
-  // 之前到（agent 流：先收到 graph_subgraph，再 expand 拉子图覆盖
-  // overlay），第一次 getElementPosition 会 miss；data 更新触发本
-  // effect 重跑就能命中刚挂上 stage 的节点。
+  // 视角跟随单点：把节点平移到视口中心，保持当前 zoom。空 focusId /
+  // 节点未上 stage 时跳过。依赖项里同时包含 dataKey：focusId 帧可能在
+  // 节点 setData 之前到（agent 流：先收到 graph_subgraph，再 expand
+  // 拉子图覆盖 overlay），第一次 getViewportByCanvas 会 miss；data 更
+  // 新触发本 effect 重跑就能命中刚挂上 stage 的节点。
+  //
+  // G6 v5 的 ``translateTo([x, y])`` 是把 canvas 原点放到视口 (x, y)
+  // 的"绝对平移"，不是"把这个点居中"——之前这里调它的写法既传错了
+  // 形参（PointObject 而非 Point 元组）也用错了语义，所以视角看起来
+  // 只在第一帧"动了"（实际是 setData 之后 autoFit 在动），后续帧静默
+  // 失败。改成 ``translateBy([dx, dy])``，dx/dy = viewport 中心 − 节
+  // 点当前在视口里的位置；相对平移天然支持重复调用。
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph || !focusId) return;
     void renderChainRef.current.then(() => {
       if (graphRef.current !== graph) return; // destroyed
       try {
-        const getPos = (graph as unknown as {
-          getElementPosition?: (id: string) => [number, number] | undefined;
-        }).getElementPosition;
-        const pos = getPos?.call(graph, focusId);
+        const pos = graph.getElementPosition(focusId);
         if (!pos) return;
-        const translateTo = (graph as unknown as {
-          translateTo?: (point: { x: number; y: number }, animate?: boolean) => void;
-        }).translateTo;
-        translateTo?.call(graph, { x: pos[0], y: pos[1] }, true);
+        const viewportPos = graph.getViewportByCanvas(pos);
+        const [w, h] = graph.getSize();
+        const dx = w / 2 - viewportPos[0];
+        const dy = h / 2 - viewportPos[1];
+        // 微抖动直接忽略——避免每帧都触发一次过渡动画。
+        if (Math.abs(dx) < 1 && Math.abs(dy) < 1) return;
+        void graph.translateBy([dx, dy], { duration: 300, easing: "ease-in-out" });
       } catch {
         /* node still not on stage; next data update will retry */
       }
