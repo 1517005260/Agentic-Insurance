@@ -20,7 +20,6 @@ the agent's ``graph_explore`` tool already emits ``candidate_*`` /
 ``paths`` directly into the SSE ``tool_result`` payload.
 """
 import logging
-import random
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -509,17 +508,19 @@ class GraphService:
     # -------------------------------------------------- 5. sample ----
 
     def sample(self, n: int = _SAMPLE_DEFAULT_N) -> Dict[str, Any]:
-        """Random vertex sample (entity-first) + induced edges.
+        """Entity-only sample of ``n`` vertices that each have at least
+        one entity-entity edge, plus the induced edges among them.
 
-        Drives the GraphPage's first paint and mode-switch fallback so
-        the canvas always has *something* to draw before the user picks
-        a seed. Stratification: take entities until budget exhausts,
-        then fall back to sentence + passage padding. We deliberately
-        prefer entities — they carry semantic labels the user can
-        recognise; raw passage hashes are noise on a cold canvas.
-
-        Cached per ``n`` for the process lifetime: a stable random draw
-        avoids the "graph reshuffles every time I switch tabs" UX trap.
+        Drives the GraphPage's first paint. The previous random draw
+        kept dropping isolated entities on the canvas; the previous
+        degree-rank draw oversampled the dense core and made the canvas
+        an illegible blob. So we look for entities that participate in
+        an entity↔entity edge (mention edges to passage/sentence don't
+        count — those vertices aren't on the canvas in sample mode), and
+        keep up to ``n`` of them in graph order. If the corpus has
+        fewer than ``n`` such entities, return everything we have —
+        better a sparse-but-honest first paint than padding with
+        orphans.
         """
         n_clamped = max(_SAMPLE_MIN_N, min(int(n), _SAMPLE_MAX_N))
         with self._sample_cache_lock:
@@ -528,36 +529,45 @@ class GraphService:
                 return cached
 
             g = self.graph
-            by_type: Dict[str, List[int]] = {"entity": [], "sentence": [], "passage": []}
-            for v in g.vs:
-                t = self._vertex_type(v)
-                if t in by_type:
-                    by_type[t].append(v.index)
+            entity_set = {
+                v.index for v in g.vs if self._vertex_type(v) == "entity"
+            }
 
-            rng = random.Random()
-            picked: List[int] = []
-            # Entity-first: take up to budget. shuffle in-place is fine —
-            # the lists live only in this method.
-            rng.shuffle(by_type["entity"])
-            picked.extend(by_type["entity"][:n_clamped])
-            for fill_type in ("sentence", "passage"):
-                remaining = n_clamped - len(picked)
-                if remaining <= 0:
+            # Walk entity-entity edges and add their endpoints in pairs.
+            # A node is only ever added together with a partner already in
+            # (or being added in) the picked set, so no node in the
+            # response can be isolated. Edge-id order is the graphml
+            # insertion order — deterministic + cache-stable.
+            picked_set: set = set()
+            for e in g.es:
+                src, tgt = e.tuple
+                if src not in entity_set or tgt not in entity_set:
+                    continue
+                need = (0 if src in picked_set else 1) + (0 if tgt in picked_set else 1)
+                if need == 0:
+                    continue
+                if len(picked_set) + need > n_clamped:
+                    # Not enough budget for this edge's new endpoints.
+                    # Don't break — a later edge may extend an already-
+                    # picked node (need=1) and still fit.
+                    continue
+                picked_set.add(src)
+                picked_set.add(tgt)
+                if len(picked_set) >= n_clamped:
                     break
-                rng.shuffle(by_type[fill_type])
-                picked.extend(by_type[fill_type][:remaining])
+            picked: List[int] = sorted(picked_set)
 
             nodes_out = [
                 {
                     "id": g.vs[vidx]["name"],
                     "label": self._vertex_label(g.vs[vidx]),
-                    "vertex_type": self._vertex_type(g.vs[vidx]),
+                    "vertex_type": "entity",
                     "hop": 0,
                     "score": 0.0,
                 }
                 for vidx in picked
             ]
-            edges_out = self._induced_edges(g, set(picked))
+            edges_out = self._induced_edges(g, picked_set)
             result = {"nodes": nodes_out, "edges": edges_out}
             self._sample_cache[n_clamped] = result
             return result
