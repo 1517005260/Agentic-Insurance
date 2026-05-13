@@ -1,6 +1,5 @@
 /**
- * SSE event payloads — typed mirror of `docs/webapp.md §5` and
- * `src/api/runners/events.py:EventType`.
+ * SSE event payloads — typed mirror of `src/api/runners/events.py:EventType`.
  *
  * 设计选择：用 discriminated union（按 `event` 字段分支）而不是
  * 每个事件单独一个 callback。理由：
@@ -11,7 +10,7 @@
  *   3) discriminated union 让 TS 在 switch(event.event) 里自动收窄，
  *      下游消费者写 narrowing 不丢类型。
  *
- * 失败模式约定（docs §5）：
+ * 失败模式约定：
  *   - `done` 永远是最后一帧；client 收到 done 即可关流。
  *   - `error` 之后必有 `done`，所以 error 不是终止信号 —— 只是把
  *     reason 暴露出来，关闭由 done 兜底。
@@ -291,8 +290,8 @@ export interface RiskSubgraph {
 
 /**
  * `final` 是 "终态摘要"；payload shape 取决于 runner 类型。我们用
- * 宽松 union — Phase 2 SSE 联调阶段先收下整包 dict 给下游消费，
- * 等 ChatPage / workbench 真正消费时再按 runner 类型 narrow。
+ * 宽松 union 先收下整包 dict 给下游消费，由具体消费方按 runner
+ * 类型 narrow。
  */
 export interface FinalEvent {
   event: "final";

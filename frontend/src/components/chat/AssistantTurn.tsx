@@ -88,7 +88,7 @@ export const AssistantTurn = memo(function AssistantTurn({ turn }: Props) {
         )}
 
         {turn.errorMessage && (
-          // 后端 contract: error 帧之后必有 done 帧（docs §5）。done 抵
+          // 后端 contract: error 帧之后必有 done 帧。done 抵
           // 达时 status 会变 "done"，所以仅判 status==='error' 会让
           // error 文案被吃掉。这里凡是 errorMessage 存在就显示。
           <div className="flex items-start gap-2 rounded-md bg-danger-soft border border-danger/20 px-3 py-2 text-sm text-danger">

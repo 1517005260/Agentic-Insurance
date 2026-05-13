@@ -6,7 +6,7 @@
  * body。EventSource 只支持 GET 且无法塞 Authorization header。fetch
  * + ReadableStream 是唯一干净的路径。
  *
- * 协议（docs §5）：
+ * 协议：
  *   event: <name>\n           （ASCII，单词，runner 限词表）
  *   data: <one-line JSON>\n   （ensure_ascii=False，CJK 直出）
  *   \n                         （帧分隔）
@@ -176,7 +176,7 @@ export interface FetchSSEOptions {
  *   - 每帧 data 走 JSON.parse；解析失败 console.warn 不中断流
  *   - 收到 done 后 break；server-side EventBus 会观察到 cancel 释
  *     放 LLM stream
- *   - 收到 error 不 break，等下一帧 done（docs §5 契约）
+ *   - 收到 error 不 break，等下一帧 done（error → done 契约）
  */
 export async function* fetchSSE(
   url: string,
@@ -332,7 +332,7 @@ export interface UseSSEOptions {
  *   1) `runIdRef` 防 race：用户连点发送时，旧流的回调用过期 runId
  *      直接吞，不污染新流的 events。
  *   2) abort 用 AbortController + DOMException("AbortError") 识别。
- *   3) sawErrorFrame：docs §5 contract 是 `error→done`。如果只看
+ *   3) sawErrorFrame：协议契约是 `error→done`。如果只看
  *      最后一帧 done 就 setStatus("done") 会丢 error 信号。这里
  *      跟踪是否在流过程中见过 error 帧，done 时按需 setStatus("error")。
  *   4) allEvents：onDone 的回调拿到完整列表（用户回调可以遍历）。
@@ -448,7 +448,7 @@ export function useSSE(opts: UseSSEOptions = {}): UseSSEResult {
               flush();
               if (runIdRef.current === myRunId) {
                 if (sawErrorFrame) {
-                  // docs §5: error 帧之后必有 done。流"做完了但有错"。
+                  // error 帧之后必有 done — 流"做完了但有错"。
                   setStatus("error");
                   setError(
                     new Error(

@@ -2,17 +2,17 @@
  * Hand-written API surface — kept thin to avoid drift from the
  * backend Pydantic schemas.
  *
- * Phase 6.D added a codegen escape hatch: ``pnpm gen:api`` regenerates
- * ``src/api/types.gen.ts`` (3000+ lines: full ``paths`` + ``components``
- * map) straight from ``http://localhost:8000/openapi.json``. Use it
- * for any new component:
+ * Codegen escape hatch: ``pnpm gen:api`` regenerates
+ * ``src/api/types.gen.ts`` (full ``paths`` + ``components`` map)
+ * from ``http://localhost:8000/openapi.json``. Use it for any new
+ * component:
  *
  *   import type { components } from "@/api/types.gen";
  *   type FileOut = components["schemas"]["FileOut"];
  *
  * The hand-written types below stay because they're load-bearing for
- * the auth bootstrap path (``stores/auth.ts``, ``api/auth.ts``);
- * migrate to the generated forms lazily as consumers change.
+ * the auth bootstrap path (``stores/auth.ts``, ``api/auth.ts``); prefer
+ * the generated forms in new consumers.
  *
  * Naming convention: same as backend Pydantic (MeOut → User) for easy swap.
  */
@@ -53,7 +53,7 @@ export interface TokenOut {
   username: string;
 }
 
-/** /files endpoints — Phase 1 only needs a list shape. */
+/** /files endpoints — list shape used by the file manager. */
 export interface FileRecord {
   file_id: string;
   filename: string;

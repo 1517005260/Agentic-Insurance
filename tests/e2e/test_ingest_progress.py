@@ -197,7 +197,7 @@ def test_ingest_one_builder_failure_emits_error_in_done(parse_module, builders_m
 
 
 def test_ingest_one_silent_when_on_event_none(parse_module, builders_module, monkeypatch):
-    """on_event=None keeps the legacy path — no recorded events, no errors."""
+    """on_event=None: ingest runs silently with no event emission and no errors."""
     parse, _ = _fake_parse(monkeypatch, parse_module, n_pages=1)
     b = _make_stub_builder(builders_module, "bm25")
     pages, results = parse_module._ingest_one(parse, [b], parallel_builders=False)

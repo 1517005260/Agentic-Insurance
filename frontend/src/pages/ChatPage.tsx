@@ -113,7 +113,7 @@ type Action =
       errorMessage?: string;
     }
   /** 切换 session / 新对话：直接换 turn list（用 historic detail
-   * 转换得到 / 或 [] 表示空对话）。**Phase 6**。 */
+   * 转换得到 / 或 [] 表示空对话）。 */
   | { type: "reset"; turns: Turn[] };
 
 function reducer(state: Turn[], action: Action): Turn[] {
@@ -253,8 +253,8 @@ export default function ChatPage() {
     onDone: (events) => {
       const id = activeAssistantIdRef.current;
       if (!id) return;
-      // docs §5：error 帧之后必有 done。useSSE 已经把 status 设
-      // 成 "error"，但 ChatPage 的 reducer 是另一套 state；这里
+      // error 帧之后必有 done。useSSE 已经把 status 设成
+      // "error"，但 ChatPage 的 reducer 是另一套 state；这里
       // 必须根据快照里有没有 error 帧来决定 finish 状态，否则
       // useStatusFinisher 看到 done 不动就被 onDone 覆盖成 done。
       const errEv = events.find(

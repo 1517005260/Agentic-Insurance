@@ -180,10 +180,11 @@ export function GraphCanvas({
         manyBody: { strength: config.layoutForce },
         collide: { radius: config.nodeSize + 4 },
       },
-      // **关键修复**：G6 v5 的 drag-canvas 默认 `enable: true`，会吞掉
-      // 节点的 mousedown 事件，drag-element 拿不到 pointer capture →
-      // "鼠标在节点上按住拖不动"。显式给 drag-canvas 一个 target 过滤器，
-      // 只在画布空白处生效。drag-element 用默认 enable（node + combo）。
+      // G6 v5 的 drag-canvas 默认 `enable: true`，会吞掉节点的
+      // mousedown 事件，drag-element 拿不到 pointer capture →
+      // "鼠标在节点上按住拖不动"。显式给 drag-canvas 一个 target
+      // 过滤器，只在画布空白处生效。drag-element 用默认 enable
+      // （node + combo）。
       behaviors: [
         "zoom-canvas",
         {
@@ -334,11 +335,11 @@ export function GraphCanvas({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // **关键性能修复**：data prop 的 reference 经常因父组件 re-render 而
-  // 变化（即便内容不变），如果直接用 [data] 作 dep 会每次都 setData →
-  // re-layout → 用户 drag 中的节点跳回原位 + 整个图卡顿。这里用浅 hash
-  // (节点 id 拼成字符串)，topology 真变化才执行 setData。隐藏类型 filter
-  // 也参与 hash，因为它影响 rendered set。
+  // data prop 的 reference 经常因父组件 re-render 而变化（即便内容不变），
+  // 如果直接用 [data] 作 dep 会每次都 setData → re-layout → 用户 drag 中的
+  // 节点跳回原位 + 整个图卡顿。这里用浅 hash（节点 id 拼成字符串），
+  // topology 真变化才执行 setData。隐藏类型 filter 也参与 hash，因为它
+  // 影响 rendered set。
   const dataKey = useMemo(() => {
     const hidden = config.hideTypes.length
       ? `|h=${config.hideTypes.slice().sort().join(",")}`
