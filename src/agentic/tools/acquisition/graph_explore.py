@@ -49,7 +49,12 @@ import numpy as np
 from agentic.tools.acquisition._common import err, ok, parse_scope
 from agentic.tools.base import BaseTool
 from config.settings import faiss_graph_dir
-from ingestion.index.linear_rag.disambig import gradient_topk_candidates, get_clusters
+from ingestion.index.linear_rag.disambig import (
+    compute_clusters_for_collapse,
+    get_clusters,
+    gradient_topk_candidates,
+    load_reverse_map,
+)
 from ingestion.index.linear_rag.normalize import normalize_for_hash
 from rag.channels.graph_ppr import GraphPPRChannel
 from rag.preprocess import QueryContext
@@ -92,7 +97,9 @@ class GraphExploreTool(BaseTool):
         self._entity_lookup_min_sim = float(entity_lookup_min_sim)
         self._entity_lookup_gradient = float(entity_lookup_gradient)
         self._clusters_cache_path: Path = faiss_graph_dir() / "clusters.json"
+        self._reverse_map_path: Path = faiss_graph_dir() / "reverse_map.json"
         self._cluster_index: Optional[Dict[str, Dict[str, Any]]] = None
+        self._reverse_map_cache: Optional[Dict[str, str]] = None
         # Passage meta is stable for the life of the agent (graph is
         # built once at ingest). Cache the hash<->meta maps so neighbors
         # mode doesn't rebuild them per node render.
@@ -123,6 +130,7 @@ class GraphExploreTool(BaseTool):
         self._passage_meta_by_hash = None
         self._passage_hash_by_meta = None
         self._cluster_index = None
+        self._reverse_map_cache = None
 
     # ----------------------------------------------------------- warm-up
 
@@ -361,6 +369,17 @@ class GraphExploreTool(BaseTool):
                 break
 
         seeds_dbg = debug_snapshot.get("seeds", [])
+        cluster_scores = debug_snapshot.get("cluster_scores", {}) or {}
+        # Trim cluster_scores to the top-N by mass — agents and the
+        # workbench only need a coarse logical-entity ranking, not the
+        # full physical-singleton dump. Keep `limit` to stay symmetric
+        # with the passage-side cut.
+        if isinstance(cluster_scores, dict) and cluster_scores:
+            top_cluster_scores = dict(
+                sorted(cluster_scores.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+            )
+        else:
+            top_cluster_scores = {}
         log_meta = {
             "mode": "ppr",
             "question": question,
@@ -381,6 +400,7 @@ class GraphExploreTool(BaseTool):
                     for s in (seeds_dbg if isinstance(seeds_dbg, list) else [])
                 ],
                 candidate_pages=results,
+                cluster_scores=top_cluster_scores,
             ),
             {"retrieved_tokens": 0, "hits": len(results)},
         )
@@ -572,7 +592,14 @@ class GraphExploreTool(BaseTool):
             s = str(raw).strip()
             if not s:
                 continue
-            hash_id = self._resolve_one(s, passage_lookup, entity_text_to_hash)
+            # Fast path: the agent often pipes ``entity_lookup`` hashes
+            # straight into ``neighbors`` as seeds. The original resolver
+            # only handled surfaces / page-refs and rejected raw hashes
+            # with ``no_seeds_resolved`` even though the vertex existed.
+            if s in name_to_vidx:
+                hash_id: Optional[str] = s
+            else:
+                hash_id = self._resolve_one(s, passage_lookup, entity_text_to_hash)
             if hash_id is None or hash_id not in name_to_vidx:
                 unresolved.append(s)
                 continue
@@ -590,8 +617,8 @@ class GraphExploreTool(BaseTool):
             )
         return {"found": found, "unresolved": unresolved}
 
-    @staticmethod
     def _resolve_one(
+        self,
         s: str,
         passage_lookup: Dict[Tuple[str, Optional[int]], str],
         entity_text_to_hash: Dict[str, str],
@@ -868,6 +895,7 @@ class GraphExploreTool(BaseTool):
             )
 
         cluster_idx = self._cluster_index_lookup()
+        reverse_map = self._reverse_map_lookup()
         physical: List[Dict[str, Any]] = []
         for cand in cands:
             row = store.get_meta_row(cand.hash_id)
@@ -880,6 +908,14 @@ class GraphExploreTool(BaseTool):
             }
             if cluster_info is not None:
                 entry["logical_cluster"] = cluster_info
+            # Collapse-mode citation bridge: walk the reverse_map chain
+            # to the live canonical so a hidden intermediate hop is
+            # never surfaced. Overlay mode never populates reverse_map
+            # so this is a zero-cost path there.
+            if cand.hash_id in reverse_map:
+                from ingestion.index.linear_rag.disambig import follow_reverse_map
+
+                entry["collapsed_to"] = follow_reverse_map(cand.hash_id, reverse_map)
             physical.append(entry)
 
         log_meta = {"mode": "entity_lookup", "surface": surface, "physical_hits": len(physical)}
@@ -927,17 +963,32 @@ class GraphExploreTool(BaseTool):
             return "sentence"
         return "unknown"
 
+    def _reverse_map_lookup(self) -> Dict[str, str]:
+        """Lazy-load the on-disk reverse_map (collapse mode); empty in overlay."""
+        if self._reverse_map_cache is None:
+            self._reverse_map_cache = load_reverse_map(self._reverse_map_path)
+        return self._reverse_map_cache
+
     def _cluster_index_lookup(self) -> Dict[str, Dict[str, Any]]:
         """Map ``entity_hash → {cluster_id, canonical, members}``.
 
         Built lazily because the cache file may not exist on a corpus
-        that was indexed before clusters were enabled.
+        that was indexed before clusters were enabled. Falls through to
+        reverse_map-derived synthetic clusters when the graph was
+        ingested under a collapse handler (no alias subgraph exists in
+        that case so :func:`get_clusters` would return empty).
         """
         if self._cluster_index is not None:
             return self._cluster_index
         idx: Dict[str, Dict[str, Any]] = {}
+        reverse_map = self._reverse_map_lookup()
         try:
-            clusters = get_clusters(self._channel.graph, self._clusters_cache_path)
+            if reverse_map:
+                clusters = compute_clusters_for_collapse(
+                    self._channel.graph, reverse_map
+                )
+            else:
+                clusters = get_clusters(self._channel.graph, self._clusters_cache_path)
         except Exception as exc:
             logger.warning("graph_explore: cluster cache load failed: %s", exc)
             clusters = []

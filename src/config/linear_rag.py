@@ -134,3 +134,36 @@ class LinearRAGConfig:
         "options or tiers; negation or quantifier flips; modifier-introduced "
         "variants; action vs entity phrases; sentence fragments."
     )
+
+    # Acceptance handler. ``overlay`` is the default reversible path
+    # (alias edges only, never collapses); ``collapse_basic`` /
+    # ``collapse_provenance`` are the B7a / B7b baselines (canonical
+    # absorbs members, reverse_map persisted). Collapse modes break
+    # native surface-path attribution (P4) and have non-zero rollback
+    # locality (P2) — only flip in for ablation experiments.
+    acceptance_handler: str = "overlay"
+
+    # Propagation policy. Decouples per-edge audit features
+    # (cos_sim / reranker_score) from the PPR-propagation weight.
+    # ``cos`` matches the historical ``weight = cos_sim`` behaviour,
+    # so the default is bit-stable with pre-v0.5 ingest.
+    alias_propagation_policy: str = "cos"
+    alias_prop_const: float = 1.0
+    alias_prop_lo: float = 0.7
+    alias_prop_hi: float = 1.0
+    alias_prop_tau_cos: float = 0.85
+    alias_prop_tau_rerank: float = 0.7
+    # Calibrated policy — z-score normalisation params + linear weights
+    # for the sigmoid. Defaults are an unfitted "best-guess" prior; in
+    # production they're meant to come from a fit on a held-out
+    # alias-judgement set.
+    # TODO admin panel: expose alias_prop_calib_* via config_store/schema.py
+    # once the held-out fit pipeline lands. Currently kwarg-injectable
+    # only (memory: feedback_admin_panel_all_tunables.md).
+    alias_prop_calib_a: float = 1.0
+    alias_prop_calib_b: float = 1.0
+    alias_prop_calib_c: float = 0.0
+    alias_prop_calib_cos_mean: float = 0.9
+    alias_prop_calib_cos_std: float = 0.05
+    alias_prop_calib_rerank_mean: float = 0.8
+    alias_prop_calib_rerank_std: float = 0.1

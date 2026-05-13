@@ -269,6 +269,13 @@ class ConfigStore:
             reranker_enabled=bool(self._values["linear_rag.reranker_enabled"]),
             reranker_threshold=float(self._values["linear_rag.reranker_threshold"]),
             reranker_instruction=str(self._values["linear_rag.reranker_instruction"]),
+            acceptance_handler=str(self._values["linear_rag.acceptance_handler"]),
+            alias_propagation_policy=str(self._values["linear_rag.alias_propagation_policy"]),
+            alias_prop_const=float(self._values["linear_rag.alias_prop_const"]),
+            alias_prop_lo=float(self._values["linear_rag.alias_prop_lo"]),
+            alias_prop_hi=float(self._values["linear_rag.alias_prop_hi"]),
+            alias_prop_tau_cos=float(self._values["linear_rag.alias_prop_tau_cos"]),
+            alias_prop_tau_rerank=float(self._values["linear_rag.alias_prop_tau_rerank"]),
         )
 
     def graph_explore_kwargs(self) -> Dict[str, Any]:

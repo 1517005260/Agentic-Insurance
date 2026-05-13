@@ -413,6 +413,82 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "essential part — without it the model drifts back to relevance."
         ),
     ),
+    # ---------- linear_rag.acceptance_handler + propagation policy ----------
+    ConfigEntry(
+        key="linear_rag.acceptance_handler",
+        type="str",
+        default=_LINEAR_RAG_DEFAULTS.acceptance_handler,
+        group="linear_rag",
+        description=(
+            "How accepted alias pairs land in the graph. 'overlay' (default) "
+            "adds an alias edge; physical nodes are preserved for "
+            "surface-path attribution and 1-edge rollback. 'collapse_basic' "
+            "absorbs the other into the canonical (B7a baseline). "
+            "'collapse_provenance' adds per-edge source_member sidecar "
+            "(B7b baseline). Switching away from overlay breaks P4 "
+            "native attribution and increases P2 rollback cost — only "
+            "set for ablation experiments."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_propagation_policy",
+        type="str",
+        default=_LINEAR_RAG_DEFAULTS.alias_propagation_policy,
+        group="linear_rag",
+        description=(
+            "Per-edge propagation-weight policy. 'cos' "
+            "(default) reproduces the historical weight = cos_sim "
+            "behaviour. 'const' / 'clipped_cos' / 'threshold_gate' / "
+            "'calibrated' decouple audit features from propagation "
+            "strength so PPR mass control can be tuned without "
+            "modifying admission."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_prop_const",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.alias_prop_const,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description="Constant propagation weight for policy=const.",
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_prop_lo",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.alias_prop_lo,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description="Lower clip bound for policy=clipped_cos.",
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_prop_hi",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.alias_prop_hi,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description="Upper clip bound for policy=clipped_cos.",
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_prop_tau_cos",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.alias_prop_tau_cos,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description="Cosine threshold τ_c for policy=threshold_gate.",
+    ),
+    ConfigEntry(
+        key="linear_rag.alias_prop_tau_rerank",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.alias_prop_tau_rerank,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description="Reranker threshold τ_r for policy=threshold_gate.",
+    ),
     # ---------- graph_explore.* (entity_lookup tool runtime) ----------
     ConfigEntry(
         key="graph_explore.entity_lookup_min_sim",

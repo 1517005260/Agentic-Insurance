@@ -39,12 +39,22 @@ from config.settings import (
     faiss_graph_sentence_dir,
 )
 from ingestion.index.linear_rag.disambig import (
+    ACCEPTANCE_HANDLER_OVERLAY,
+    ADMISSION_RULE_VERSION,
     add_alias_edges,
+    cluster_shape_metrics,
+    compute_clusters,
+    compute_clusters_for_collapse,
+    get_clusters,
     gradient_topk_candidates,
     is_composite_surface,
     invalidate_clusters,
+    load_reverse_map,
     merge_topk_candidates,
+    on_alias_accepted,
+    propagation_policy,
     reranker_veto,
+    save_reverse_map,
 )
 from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import canonical_form, normalize_for_hash
@@ -89,6 +99,10 @@ class LinearRAG:
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"
         self._graphml_path = faiss_graph_dir() / "LinearRAG.graphml"
+        # Collapse-mode persistence — empty / absent in overlay mode, so
+        # this is a zero-cost read for the default ingest path.
+        self._reverse_map_path = faiss_graph_dir() / "reverse_map.json"
+        self._reverse_map: dict = load_reverse_map(self._reverse_map_path)
 
         if self._graphml_path.exists():
             self.graph = ig.Graph.Read_GraphML(str(self._graphml_path))
@@ -325,6 +339,13 @@ class LinearRAG:
         if added_alias_edges:
             invalidate_clusters(clusters_path)
 
+        # Persist reverse_map for collapse handlers; in overlay mode the
+        # map stays empty and we skip the write to keep ingest output
+        # bit-identical to the pre-v0.5 layout (no spurious file).
+        is_collapse = self.config.acceptance_handler != ACCEPTANCE_HANDLER_OVERLAY
+        if is_collapse and self._reverse_map:
+            save_reverse_map(self._reverse_map_path, self._reverse_map)
+
         # Drop the auto-generated 'id' vertex attribute before writing —
         # igraph stashes the structural <node id="..."> as a vertex attr
         # called "id" on Read_GraphML, which then conflicts with the next
@@ -334,6 +355,19 @@ class LinearRAG:
 
         self._graphml_path.parent.mkdir(parents=True, exist_ok=True)
         self.graph.write_graphml(str(self._graphml_path))
+
+        # Cluster shape metrics, computed against the freshly written
+        # graph so the returned dict matches the on-disk state.
+        if is_collapse:
+            cluster_partition = compute_clusters_for_collapse(self.graph, self._reverse_map)
+        else:
+            cluster_partition = compute_clusters(self.graph)
+        cluster_shape = cluster_shape_metrics(
+            self.graph,
+            cluster_partition,
+            entity_store=self.entity_embedding_store,
+            is_collapse=is_collapse,
+        )
 
         logger.info(
             "index() done for file_id=%s: graph=(%d v, %d e), "
@@ -354,6 +388,7 @@ class LinearRAG:
             "sentences": len(new_sentence_hash_set),
             "alias_edges": added_alias_edges,
             "backfill_edges": added_backfill_edges,
+            "cluster_shape": cluster_shape,
         }
 
     # ------------------------------------------------------ disambiguation
@@ -448,7 +483,31 @@ class LinearRAG:
                     threshold=cfg.reranker_threshold,
                     instruction=cfg.reranker_instruction,
                 )
-            total_added += add_alias_edges(self.graph, hash_id, cands)
+            if not cands:
+                continue
+            # Decouple admission (boolean above) from propagation
+            # strength (continuous). One features dict per surviving
+            # candidate; w_prop is the policy's verdict on that dict.
+            features_list: List[dict] = []
+            w_prop_list: List[float] = []
+            for c in cands:
+                feats = {
+                    "cos_sim": float(c.score),
+                    "reranker_score": c.rerank_yes_prob,
+                    "admission_rule_version": ADMISSION_RULE_VERSION,
+                    "accepted_by": "gradient_er",
+                }
+                features_list.append(feats)
+                w_prop_list.append(float(propagation_policy(feats, cfg)))
+            total_added += on_alias_accepted(
+                cfg.acceptance_handler,
+                self.graph,
+                hash_id,
+                cands,
+                features_list,
+                w_prop_list,
+                reverse_map=self._reverse_map,
+            )
         return total_added
 
     def _collect_entity_mentions(self) -> dict:
@@ -682,8 +741,16 @@ class LinearRAG:
         if new_edge_pairs:
             start = self.graph.ecount()
             self.graph.add_edges(new_edge_pairs)
+            # Seed the alias-side attrs even on non-alias edges so the
+            # first add_alias_edges call doesn't promote those attrs to
+            # the whole edge schema and leave pre-existing edges with
+            # GraphML round-tripped ``None``. ``w_prop`` mirrors ``weight``
+            # under policy=cos; ``features_json`` is an empty record.
             for offset, (w, t) in enumerate(zip(new_edge_weights, new_edge_types)):
-                self.graph.es[start + offset]["weight"] = w
-                self.graph.es[start + offset]["edge_type"] = t
+                eidx = start + offset
+                self.graph.es[eidx]["weight"] = w
+                self.graph.es[eidx]["edge_type"] = t
+                self.graph.es[eidx]["w_prop"] = float(w)
+                self.graph.es[eidx]["features_json"] = ""
 
 

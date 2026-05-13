@@ -46,6 +46,12 @@ from ingestion.index.linear_rag.backfill import (
     build_gazetteer_automaton,
     find_literal_matches,
 )
+from ingestion.index.linear_rag.disambig import (
+    aggregate_by_cluster,
+    compute_clusters_for_collapse,
+    get_clusters,
+    load_reverse_map,
+)
 from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import normalize_for_hash
 from model_client import EmbeddingClient, get_cached_embedding_client
@@ -263,7 +269,11 @@ class GraphPPRChannel(BaseChannel):
             node_weights = entity_weights + passage_weights
             self.last_debug["actived_entities"] = len(actived)
 
-            ranked = self._run_ppr(node_weights)
+            ranked, scores_arr = self._run_ppr_full(node_weights)
+            # Cluster_scores is a post-hoc view of the PPR mass — never
+            # used to re-rank passages, only surfaced for debug / agent
+            # tooling. Empty dict when PPR returned zero mass.
+            self.last_debug["cluster_scores"] = self._cluster_scores(scores_arr)
             return self._materialize_hits(ranked, ctx.file_ids)
 
     def retrieve_with_debug(
@@ -280,6 +290,21 @@ class GraphPPRChannel(BaseChannel):
         with self._call_lock:
             hits = self.retrieve(ctx)
             return hits, dict(self.last_debug)
+
+    def _is_hidden(self, vidx: int) -> bool:
+        """Return True if vertex ``vidx`` was absorbed into a canonical.
+
+        Hidden vertices are kept in the graph so the reverse_map and
+        ``follow_reverse_map`` chains remain resolvable, but they must
+        not be seeds for PPR (their incident alias / entity_passage
+        edges have been redirected onto the canonical and the residual
+        edges would route mass back to a logically-gone node).
+        """
+        if self.graph is None:
+            return False
+        if "hidden" not in self.graph.vs.attributes():
+            return False
+        return bool(self.graph.vs[vidx]["hidden"])
 
     # ----------------------------------------------------------- seeding
 
@@ -323,9 +348,9 @@ class GraphPPRChannel(BaseChannel):
         # GLiNER is a hard dependency by project policy ("zero fallback,
         # NER as critical as the embedding API"). If the model fails to
         # load — usually CUDA missing or HF cache corrupt — surface the
-        # error rather than silently downgrading PPR to dense-only mode,
-        # which previously masked the misconfiguration until graph
-        # answer quality degraded enough to trigger a user complaint.
+        # error rather than silently downgrading PPR to dense-only mode:
+        # a silent downgrade hides the misconfiguration while quietly
+        # degrading graph-channel answer quality.
         ner = self._ensure_ner()
 
         canonical_seen: List[str] = []
@@ -352,7 +377,16 @@ class GraphPPRChannel(BaseChannel):
                 if not top1:
                     continue
                 hid, score = top1[0]
-                if hid in self._name_to_vidx and (hid not in best or score > best[hid][1]):
+                if hid not in self._name_to_vidx:
+                    continue
+                # Skip vertices the collapse handler absorbed into a
+                # canonical — seeding a hidden surface would re-introduce
+                # the very provenance ambiguity collapse mode was meant
+                # to eliminate, and PPR mass would flow through edges
+                # that no longer logically exist.
+                if self._is_hidden(self._name_to_vidx[hid]):
+                    continue
+                if hid not in best or score > best[hid][1]:
                     best[hid] = (self._name_to_vidx[hid], float(score))
 
         # Fallback path — only when caller asked AND NER produced nothing.
@@ -589,10 +623,25 @@ class GraphPPRChannel(BaseChannel):
     # ----------------------------------------------------------- PPR
 
     def _run_ppr(self, node_weights: np.ndarray) -> List[Tuple[str, float]]:
+        ranked, _scores_arr = self._run_ppr_full(node_weights)
+        return ranked
+
+    def _run_ppr_full(
+        self, node_weights: np.ndarray
+    ) -> Tuple[List[Tuple[str, float]], Optional[np.ndarray]]:
+        """Run PPR and return both the ranked passage list and the full
+        per-vertex score array.
+
+        The score array enables post-hoc views (cluster_scores, surface
+        attribution) without re-running PPR; it's used internally by
+        :meth:`retrieve_subgraph` and the agent's graph_explore tool.
+        Returns ``([], None)`` when ``reset.sum() <= 0`` (no seed mass
+        to propagate).
+        """
         cfg = self.config
         reset = np.where(np.isnan(node_weights) | (node_weights < 0), 0.0, node_weights)
         if reset.sum() <= 0:
-            return []
+            return [], None
         scores = self.graph.personalized_pagerank(
             vertices=range(self.graph.vcount()),
             damping=cfg.ppr_damping,
@@ -603,7 +652,7 @@ class GraphPPRChannel(BaseChannel):
         )
         scores_arr = np.asarray(scores, dtype=np.float64)
         if not self._passage_vidx:
-            return []
+            return [], scores_arr
         passage_scores = scores_arr[self._passage_vidx]
         order = np.argsort(passage_scores)[::-1]
         out: List[Tuple[str, float]] = []
@@ -611,7 +660,47 @@ class GraphPPRChannel(BaseChannel):
             vidx = self._passage_vidx[int(j)]
             name = self.graph.vs[vidx]["name"]
             out.append((str(name), float(passage_scores[int(j)])))
-        return out
+        return out, scores_arr
+
+    def _cluster_scores(
+        self, scores_arr: Optional[np.ndarray], op: str = "sum"
+    ) -> Dict[str, float]:
+        """Project the full PPR score array onto logical-cluster scores.
+
+        Reads cluster membership from the on-disk ``clusters.json`` (or
+        synthesises it from ``reverse_map.json`` in collapse mode).
+        Returns ``{cluster_id_or_hash: aggregated_score}``; singleton
+        entities pass through under their hash_id as documented in
+        :func:`aggregate_by_cluster`.
+
+        Important caveat: evidence landing — i.e. the passages we
+        surface as answers — uses physical-node scores. The
+        cluster_scores map is a *post-hoc view* for the workbench /
+        agent debug, not a re-ranker.
+        """
+        if scores_arr is None or self.graph is None:
+            return {}
+        # Build hash_id → score map over entity vertices only — passages
+        # are not clusters and would pollute the singleton pass-through.
+        if "vertex_type" not in self.graph.vs.attributes():
+            return {}
+        scores_by_hash: Dict[str, float] = {}
+        for v in self.graph.vs:
+            if v["vertex_type"] != "entity":
+                continue
+            scores_by_hash[v["name"]] = float(scores_arr[v.index])
+        # Cluster source — gated by the configured acceptance handler so
+        # a stale on-disk ``reverse_map.json`` from a previous collapse run
+        # can't silently flip overlay's cluster semantics into a
+        # canonical-collapse projection.
+        handler = getattr(self.linear_config, "acceptance_handler", "overlay")
+        if handler in ("collapse_basic", "collapse_provenance"):
+            reverse_path = faiss_graph_dir() / "reverse_map.json"
+            reverse_map = load_reverse_map(reverse_path)
+            clusters = compute_clusters_for_collapse(self.graph, reverse_map)
+        else:
+            clusters = get_clusters(self.graph, faiss_graph_dir() / "clusters.json")
+        return aggregate_by_cluster(scores_by_hash, clusters, op=op)
 
     # -------------------------------------------------- public — subgraph
 
@@ -646,11 +735,11 @@ class GraphPPRChannel(BaseChannel):
         # surface text from the new entity store.
         with self._call_lock:
             if self.graph is None or len(self.passage_store) == 0:
-                return {"mode": "no_graph", "seeds": [], "actived_entities": {}, "passages": []}
+                return {"mode": "no_graph", "seeds": [], "actived_entities": {}, "passages": [], "cluster_scores": {}}
 
             seeds = self._seed_entities(question, enable_fallback=True)
             if not seeds:
-                return {"mode": "no_seeds", "seeds": [], "actived_entities": {}, "passages": []}
+                return {"mode": "no_seeds", "seeds": [], "actived_entities": {}, "passages": [], "cluster_scores": {}}
 
             question_emb = self.embedding_client.encode(question)
             entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
@@ -658,14 +747,16 @@ class GraphPPRChannel(BaseChannel):
                 question, question_emb, actived
             )
             node_weights = entity_weights + passage_weights
-            ranked = self._run_ppr(node_weights)
+            ranked, scores_arr = self._run_ppr_full(node_weights)
             passages = self._materialize_hits(ranked, file_ids)
+            cluster_scores = self._cluster_scores(scores_arr)
 
             # Final payload assembly stays inside the lock for the
             # consistency reason above.
             ent_text = self.entity_store.hash_id_to_text
             return {
                 "mode": "ppr",
+                "cluster_scores": cluster_scores,
                 "seeds": [
                     {
                         "hash_id": hid,

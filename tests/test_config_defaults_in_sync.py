@@ -95,13 +95,15 @@ def test_tavily_defaults():
     assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
 
 
-def test_entry_count_is_43():
+def test_entry_count_is_50():
     # rag/rerank/agent core (15) + agent.web (2) + tavily (2) + prompt (9) +
     # chat.history_turns (1) + linear_rag.literal_backfill_* (3) +
     # linear_rag.gliner_* (3) + linear_rag.junk_max_han_chars (1) +
     # linear_rag.ner_max_span_chars (1) +
     # linear_rag.reranker_* (3) +
-    # graph_explore.entity_lookup_* (2) + ingest.parallel_workers (1) = 43.
+    # linear_rag.acceptance_handler (1) +
+    # linear_rag.alias_propagation_policy + alias_prop_* (6) +
+    # graph_explore.entity_lookup_* (2) + ingest.parallel_workers (1) = 50.
     # The 9th prompt key is ``prompt.risk_predict`` (proactive
     # pre-issuance risk prediction workbench, GraphAgent-driven).
     # ``ingest.parallel_workers`` (admin-tuned) caps the per-process
@@ -119,4 +121,4 @@ def test_entry_count_is_43():
     # let admins tune the alias-edge veto layer (Qwen3-Reranker-0.6B
     # pairwise score). Instruction is exposed because the hard-negative
     # checklist is what pins the model from retrieval to identity.
-    assert len(CONFIG_ENTRIES_BY_KEY) == 43
+    assert len(CONFIG_ENTRIES_BY_KEY) == 50
