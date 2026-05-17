@@ -265,28 +265,36 @@ def build_page_assets(parse_result, persist: bool = True) -> List[PageAsset]:
     builder = PageAssetBuilder.from_parse_result(parse_result)
     pages = builder.build()
     if persist:
-        out = page_assets_path(parse_result.file_id)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps([_asset_to_dict(p) for p in pages], ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        # Warm the inventory + sibling stores. Construct fresh PageStore
-        # / InventoryStore against the directory we just wrote to so we
-        # don't depend on a global already-loaded instance.
-        from config.settings import page_assets_root
-        from storage import (
-            InventoryStore,
-            PageStore,
-            build_inventory_atoms_for_file,
-        )
-        page_store = PageStore(page_assets_root())
-        inventory = InventoryStore(page_store=page_store)
-        inventory.warm_up()
-        build_inventory_atoms_for_file(
-            parse_result.file_id, page_store, inventory,
-        )
+        persist_and_warm_page_assets(parse_result.file_id, pages)
     return pages
+
+
+def persist_and_warm_page_assets(file_id: str, pages: List[PageAsset]) -> None:
+    """Write the canonical ``page_assets/<file_id>.json`` and warm the
+    inventory + sibling stores (steps 1-3 of :func:`build_page_assets`).
+
+    Factored out so alternative page-asset sources (e.g. an externally
+    supplied OCR corpus) can reuse the exact persistence + store-warming
+    contract without going through ``PageAssetBuilder``/``ParseResult``.
+    Constructs fresh PageStore / InventoryStore against the directory it
+    just wrote so it does not depend on a global already-loaded instance.
+    """
+    out = page_assets_path(file_id)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps([_asset_to_dict(p) for p in pages], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    from config.settings import page_assets_root
+    from storage import (
+        InventoryStore,
+        PageStore,
+        build_inventory_atoms_for_file,
+    )
+    page_store = PageStore(page_assets_root())
+    inventory = InventoryStore(page_store=page_store)
+    inventory.warm_up()
+    build_inventory_atoms_for_file(file_id, page_store, inventory)
 
 
 def _asset_to_dict(p: PageAsset) -> Dict[str, Any]:
