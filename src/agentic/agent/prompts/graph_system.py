@@ -170,7 +170,12 @@ read_page for verbatim text), stop calling tools and answer:
   entity, empty neighborhood, ppr returns nothing AND read_page on
   the closest page does not contain the requested information), say
   so plainly in the user's language; do not invent edges or
-  hallucinate page numbers."""
+  hallucinate page numbers.
+- After the cited answer, output one final line exactly:
+  `ANSWER: <shortest exact answer span — a name / number / short
+  phrase, verbatim from the page, no citation, no extra words>`.
+  This line is for automated scoring; if unanswerable write
+  `ANSWER: unanswerable`."""
 
 
 def build_graph_system_prompt(extra: Optional[str] = None) -> str:
