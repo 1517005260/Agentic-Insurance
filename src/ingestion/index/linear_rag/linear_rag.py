@@ -95,6 +95,7 @@ class LinearRAG:
             threshold=self.config.gliner_threshold,
             batch_size=self.config.gliner_batch_size,
             max_span_chars=self.config.ner_max_span_chars,
+            noise_labels=self.config.gliner_noise_labels,
         )
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"
@@ -123,7 +124,7 @@ class LinearRAG:
     # entities or alias edges the current filters would reject, so
     # merging cached and freshly-extracted entities is unsafe; force
     # a clean rebuild on every schema change.
-    NER_CACHE_VERSION = 4
+    NER_CACHE_VERSION = 5
 
     def load_existing_data(self, passage_hash_ids: Iterable[str]):
         if self._ner_results_path.exists():

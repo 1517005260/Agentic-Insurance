@@ -316,6 +316,7 @@ class GraphPPRChannel(BaseChannel):
                 threshold=self.linear_config.gliner_threshold,
                 batch_size=self.linear_config.gliner_batch_size,
                 max_span_chars=self.linear_config.ner_max_span_chars,
+                noise_labels=self.linear_config.gliner_noise_labels,
             )
         return self._ner
 

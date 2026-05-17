@@ -312,6 +312,7 @@ class GLiNERAdapter:
         threshold: float = 0.3,
         batch_size: int = 16,
         max_span_chars: int = 80,
+        noise_labels: Optional[Sequence[str]] = None,
     ):
         # Pulled from the process-wide cache so ingest workers and the
         # lifespan-pinned PPR channel share a single resident copy of
@@ -321,6 +322,13 @@ class GLiNERAdapter:
         self.threshold = float(threshold)
         self.batch_size = int(batch_size)
         self.max_span_chars = int(max_span_chars)
+        # Decoy / noise-sink labels: members of ``labels`` that GLiNER
+        # is asked to classify INTO (e.g. "pronoun" / "date" / "number")
+        # so junk routes there instead of contaminating real types. The
+        # model does the linguistic classification; we just discard the
+        # spans it tags with a sink label. ``labels`` must still contain
+        # them — they have to be scored to attract their surfaces.
+        self.noise_labels: set = set(noise_labels or [])
 
     # ----------------------------------------------- batch passage NER ----
 
@@ -387,6 +395,8 @@ class GLiNERAdapter:
             if not spans:
                 continue
             for span in spans:
+                if span.get("label") in self.noise_labels:
+                    continue
                 raw = span.get("text") or ""
                 if not raw:
                     continue
@@ -423,6 +433,8 @@ class GLiNERAdapter:
         out: set = set()
         for sent_spans in spans:
             for span in sent_spans:
+                if span.get("label") in self.noise_labels:
+                    continue
                 raw = (span.get("text") or "").strip()
                 if not raw or is_misbound_span(raw, self.max_span_chars):
                     continue

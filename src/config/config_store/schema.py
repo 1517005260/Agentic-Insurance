@@ -331,6 +331,21 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         ),
     ),
     ConfigEntry(
+        key="linear_rag.gliner_noise_labels",
+        type="list_str",
+        default=list(_LINEAR_RAG_DEFAULTS.gliner_noise_labels),
+        min_length=0,
+        max_length=16,
+        group="linear_rag",
+        description=(
+            "Decoy / noise-sink subset of gliner_labels. GLiNER scores "
+            "these (junk like pronouns / bare dates / numbers attaches "
+            "to them) and the pipeline discards spans tagged with them. "
+            "Model-native noise control, not a surface filter. Members "
+            "must also appear in gliner_labels. Empty = inert."
+        ),
+    ),
+    ConfigEntry(
         key="linear_rag.gliner_threshold",
         type="float",
         default=_LINEAR_RAG_DEFAULTS.gliner_threshold,

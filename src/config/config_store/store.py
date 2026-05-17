@@ -263,6 +263,7 @@ class ConfigStore:
             ),
             gliner_model_id=str(self._values["linear_rag.gliner_model_id"]),
             gliner_labels=list(self._values["linear_rag.gliner_labels"]),
+            gliner_noise_labels=list(self._values["linear_rag.gliner_noise_labels"]),
             gliner_threshold=float(self._values["linear_rag.gliner_threshold"]),
             junk_max_han_chars=int(self._values["linear_rag.junk_max_han_chars"]),
             ner_max_span_chars=int(self._values["linear_rag.ner_max_span_chars"]),

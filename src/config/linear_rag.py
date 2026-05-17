@@ -58,6 +58,13 @@ class LinearRAGConfig:
     gliner_labels: List[str] = field(
         default_factory=lambda: list(_DEFAULT_GLINER_LABELS)
     )
+    # Decoy / noise-sink subset of ``gliner_labels``. GLiNER is asked to
+    # score these (so junk surfaces — pronouns, bare dates, numbers —
+    # attach to them) and the pipeline then discards spans tagged with
+    # them. Model-native noise control via the open-set label prompt,
+    # not a hand-rolled surface filter. Empty by default (inert);
+    # listed members MUST also appear in ``gliner_labels``.
+    gliner_noise_labels: List[str] = field(default_factory=list)
     gliner_threshold: float = 0.3
     gliner_batch_size: int = 16
 
