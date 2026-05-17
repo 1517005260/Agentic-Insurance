@@ -41,6 +41,7 @@ from ingestion.page_mode import PageModeSignals, classify_page_mode
 from storage.page_store import PageAsset
 
 _PASSAGE_CHAR_BUDGET = 1200
+_PAGE_IMAGE_LONG_PX = 1600
 _ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}\s+\S")
 _PLACEHOLDER_RE = re.compile(r"^\s*<!--\s*(?:image|formula-not-decoded)\s*-->\s*$")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -164,7 +165,14 @@ def _render_page_image(pdf_path: Path, page_index0: int, dest: Path) -> bool:
             if page_index0 >= len(doc):
                 return False
             page = doc[page_index0]
-            bitmap = page.render(scale=200 / 72.0)  # ~200 DPI
+            # Render scale is pixels-per-point. The assembled image-only
+            # PDFs declare an oversized page box (one giant embedded
+            # raster), so a fixed DPI would explode to tens of MP/page.
+            # Cap the long side instead — pin-sharp enough for the VLM
+            # reader / vision embedder, bounded cost regardless of box.
+            w_pt, h_pt = page.get_size()
+            scale = _PAGE_IMAGE_LONG_PX / max(w_pt, h_pt, 1.0)
+            bitmap = page.render(scale=scale)
             pil = bitmap.to_pil().convert("RGB")
             dest.parent.mkdir(parents=True, exist_ok=True)
             pil.save(dest, "JPEG", quality=90)
