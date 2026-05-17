@@ -39,7 +39,7 @@ import logging
 import threading
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, get_args
+from typing import TYPE_CHECKING, Any, Callable, Literal, get_args
 
 
 # Closed enumeration of session profiles. Adding a new client?
@@ -295,6 +295,127 @@ def shared_qwen_reranker(
         return _qwen_reranker_cached(canonical)
 
 
+# -------------------------------------------------- Qwen3-Embedding ----
+
+# Same offline-before-import + flat-local-snapshot discipline as the
+# reranker: the embedding model is materialised under
+# STORAGE_PATH/models/<basename> and loaded with AutoModel (base
+# transformer, no LM head) for last-token-pooled sentence embeddings.
+
+
+@lru_cache(maxsize=2)
+def _qwen_embedding_cached(
+    model_dir_str: str,
+) -> "tuple[PreTrainedTokenizerBase, PreTrainedModel]":
+    """Inner cached loader. Returns (tokenizer, base model) on cuda fp16.
+
+    Qwen3-Embedding is a decoder; the sentence vector is the last
+    non-pad token's hidden state. Left padding (set here) puts that
+    token at index ``-1`` for every row so pooling is a single slice.
+    """
+    import os
+
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Qwen3-Embedding requires CUDA; CPU inference is unsupported by "
+            "project policy. Use the API embedding backend (EMBEDDING_BACKEND="
+            "api) or run on a GPU host."
+        )
+    if not Path(model_dir_str).is_dir():
+        raise FileNotFoundError(
+            f"Embedding model dir not found: {model_dir_str}. Run "
+            f"`python download_models.py` to fetch Qwen3-Embedding-0.6B."
+        )
+    logger.debug("_qwen_embedding_cached: loading %s on cuda fp16", model_dir_str)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir_str, padding_side="left")
+    model = (
+        AutoModel.from_pretrained(model_dir_str, torch_dtype=torch.float16)
+        .cuda()
+        .eval()
+    )
+    return tokenizer, model
+
+
+def shared_qwen_embedding(
+    model_dir: Path,
+) -> "tuple[PreTrainedTokenizerBase, PreTrainedModel]":
+    """Return the cached Qwen3-Embedding handle for ``model_dir``.
+
+    First call materialises the model on GPU FP16; the handle is shared
+    across threads because the model is in ``eval()`` mode and the
+    forward path is read-only — same contract as
+    :func:`shared_qwen_reranker`.
+    """
+    canonical = str(model_dir.expanduser().resolve(strict=False))
+    with _key_lock(f"qwen_embedding:{canonical}"):
+        return _qwen_embedding_cached(canonical)
+
+
+# ------------------------------------------------ Qwen3-VL-Embedding ----
+
+# Multimodal (image+text, shared 2048-d space) embedder. The model
+# snapshot ships its own ``scripts/qwen3_vl_embedding.py`` defining
+# ``Qwen3VLEmbedder`` (last-token pool + L2-normalize built in); we load
+# that rather than re-implementing pooling. Same flat-local-snapshot +
+# offline discipline as the other local models. Requires
+# ``transformers >= 4.57`` and ``qwen-vl-utils``.
+
+
+@lru_cache(maxsize=1)
+def _qwen_vl_embedding_cached(model_dir_str: str) -> "Any":
+    """Inner cached loader. Returns a ready ``Qwen3VLEmbedder`` on cuda fp16."""
+    import os
+    import sys
+
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Qwen3-VL-Embedding requires CUDA; CPU inference is unsupported "
+            "by project policy. Use VISUAL_EMBEDDING_BACKEND=api or run on a "
+            "GPU host."
+        )
+    model_dir = Path(model_dir_str)
+    if not model_dir.is_dir():
+        raise FileNotFoundError(
+            f"Qwen3-VL-Embedding model dir not found: {model_dir_str}. Run "
+            f"`python download_models.py` to fetch Qwen3-VL-Embedding-2B."
+        )
+    # The embedder class is shipped inside the snapshot; importing it
+    # needs the snapshot's ``scripts/`` on sys.path.
+    scripts_dir = model_dir / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    logger.debug("_qwen_vl_embedding_cached: loading %s on cuda fp16", model_dir_str)
+    from qwen3_vl_embedding import Qwen3VLEmbedder
+
+    return Qwen3VLEmbedder(
+        model_name_or_path=model_dir_str,
+        torch_dtype=torch.float16,
+    )
+
+
+def shared_qwen_vl_embedding(model_dir: Path) -> "Any":
+    """Return the cached ``Qwen3VLEmbedder`` for ``model_dir``.
+
+    First call materialises the 2B model on GPU FP16; shared across
+    threads (``eval()``/read-only forward) — same contract as the other
+    ``shared_qwen_*`` loaders.
+    """
+    canonical = str(model_dir.expanduser().resolve(strict=False))
+    with _key_lock(f"qwen_vl_embedding:{canonical}"):
+        return _qwen_vl_embedding_cached(canonical)
+
+
 # ----------------------------------------------------------- tiktoken ----
 
 
@@ -466,6 +587,8 @@ def clear_caches() -> None:
     """
     _gliner_cached.cache_clear()
     _qwen_reranker_cached.cache_clear()
+    _qwen_embedding_cached.cache_clear()
+    _qwen_vl_embedding_cached.cache_clear()
     # The outer ``get_cached_rerank_client`` wrapper holds a strong
     # reference to the constructed RerankClient (which pins the tokenizer
     # / model handle in its __init__); clear that too so a model-id
@@ -476,6 +599,21 @@ def clear_caches() -> None:
         get_cached_rerank_client.cache_clear()
     except Exception:  # noqa: BLE001
         logger.debug("clear_caches: rerank client clear skipped", exc_info=True)
+    # Same rationale for the embedding factory: under the local backend
+    # its cached client pins the Qwen3-Embedding handle, so a model-id /
+    # backend swap only frees VRAM once this wrapper is dropped too.
+    try:
+        from model_client.text_embedding import get_cached_embedding_client
+
+        get_cached_embedding_client.cache_clear()
+    except Exception:  # noqa: BLE001
+        logger.debug("clear_caches: embedding client clear skipped", exc_info=True)
+    try:
+        from model_client.visual_embedding import get_cached_visual_embedding_client
+
+        get_cached_visual_embedding_client.cache_clear()
+    except Exception:  # noqa: BLE001
+        logger.debug("clear_caches: visual embedding client clear skipped", exc_info=True)
     _tiktoken_cached.cache_clear()
     _embedding_store_cached.cache_clear()
     with _SESSION_LOCK:

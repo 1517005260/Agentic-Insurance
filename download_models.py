@@ -7,10 +7,10 @@ Two destinations:
   GLiNER's tokenizer probes the HF Hub for the base-model repo even on
   a local-path load (see ``config.shared._gliner_cached`` notes), so
   the standard HF cache layout is what its offline mode expects.
-* **STORAGE_PATH/models/** — Qwen3-Reranker. Loaded via plain
-  ``AutoModelForCausalLM.from_pretrained(local_dir)`` so a
+* **STORAGE_PATH/models/** — Qwen3-Reranker and Qwen3-Embedding.
+  Loaded via plain ``AutoModel*.from_pretrained(local_dir)`` so a
   fully-materialised snapshot in the project's storage volume keeps
-  the model with the rest of the data (faiss / bm25 / paddle_ocr
+  the models with the rest of the data (faiss / bm25 / paddle_ocr
   caches) instead of in a per-user directory.
 
 Defaults to the ``hf-mirror.com`` mirror for HuggingFace traffic;
@@ -54,18 +54,29 @@ def _project_storage_models() -> Path:
 # the Hub for the base-model repo even with a local snapshot path.
 HF_CACHE_MODELS: List[str] = [
     "urchade/gliner_multiv2.1",
+    # GLiNER multi-v2.1's backbone. ``GLiNER.from_pretrained`` resolves
+    # the tokenizer/encoder by *base-model repo id* (not the gliner
+    # snapshot path), so under the offline discipline in
+    # ``config.shared._gliner_cached`` this must already sit in the HF
+    # cache or the load raises LocalEntryNotFoundError on a fresh host.
+    "microsoft/mdeberta-v3-base",
 ]
 
-# Models that go under STORAGE_PATH/models/<basename>. The reranker is
-# loaded by ``AutoModelForCausalLM.from_pretrained(local_dir)`` with no
-# upstream tokenizer probe, so a flat local snapshot is sufficient.
+# Models that go under STORAGE_PATH/models/<basename>. Both are loaded
+# by ``AutoModel*.from_pretrained(local_dir)`` with no upstream
+# tokenizer probe, so a flat local snapshot is sufficient.
 #
-# The reranker repo id is read from RERANK_MODEL_ID so that switching
-# the runtime model (e.g. to Qwen3-Reranker-4B) needs only one env var
-# change — the loader (``settings.rerank_model_dir``) and this script
-# stay in lockstep. Default matches ``settings.RERANK_MODEL_ID``.
+# Repo ids are read from the same env vars the loaders use
+# (``settings.rerank_model_dir`` / ``settings.embed_model_dir``) so
+# switching the runtime model needs only one env var change and this
+# script stays in lockstep. Defaults match ``settings``. The embedding
+# model is only consumed at runtime when ``EMBEDDING_BACKEND=local``,
+# but pre-fetching it unconditionally keeps a fresh deploy / server
+# transfer one command away from either backend.
 STORAGE_MODELS: List[str] = [
     os.environ.get("RERANK_MODEL_ID") or "Qwen/Qwen3-Reranker-0.6B",
+    os.environ.get("EMBED_MODEL_ID") or "Qwen/Qwen3-Embedding-0.6B",
+    os.environ.get("VL_EMBED_MODEL_ID") or "Qwen/Qwen3-VL-Embedding-2B",
 ]
 
 
@@ -101,7 +112,8 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         nargs="*",
         help=(
             "HuggingFace repo ids to download. If omitted, downloads "
-            "the project defaults (GLiNER NER + Qwen3-Reranker)."
+            "the project defaults (GLiNER NER + Qwen3-Reranker + "
+            "Qwen3-Embedding + Qwen3-VL-Embedding)."
         ),
     )
     parser.add_argument(

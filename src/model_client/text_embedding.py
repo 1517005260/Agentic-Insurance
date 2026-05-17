@@ -5,7 +5,7 @@ downstream. Batches requests to avoid hitting per-request size limits.
 """
 
 from functools import lru_cache
-from typing import List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -14,8 +14,12 @@ from config.shared import shared_session
 from config.settings import (
     EMBEDDING_API_BASE_URL,
     EMBEDDING_API_KEY,
+    EMBEDDING_BACKEND,
     EMBEDDING_MODEL,
 )
+
+if TYPE_CHECKING:
+    from model_client.qwen_text_embedding import QwenEmbeddingClient
 
 
 class EmbeddingClient:
@@ -79,12 +83,24 @@ class EmbeddingClient:
 
 
 @lru_cache(maxsize=1)
-def get_cached_embedding_client() -> "EmbeddingClient":
-    """Process-wide singleton for the no-arg :class:`EmbeddingClient`.
+def get_cached_embedding_client() -> "Union[EmbeddingClient, QwenEmbeddingClient]":
+    """Process-wide singleton text embedder, backend-selected.
 
-    Most callsites construct ``EmbeddingClient()`` with default args
-    (lifespan, ingest builders, RAG pipeline, agent factory). Each
-    instance is ~30 MB once warmed; sharing avoids the ~6× duplication.
-    Callers needing a custom model / api_key still build directly.
+    Every embedding callsite (lifespan, ingest builders, RAG channels,
+    agent factory/tools) routes through here, so this is the single
+    chokepoint that decides API vs local: ``EMBEDDING_BACKEND=local``
+    hands out the GPU Qwen3-Embedding client, anything else the
+    OpenAI-compatible HTTP client. Both expose the identical
+    ``encode(str | Sequence[str]) -> np.ndarray`` (L2-normalized
+    float32) contract, so the choice is invisible downstream. Each
+    warmed instance is heavy (HTTP session ~30 MB / GPU handle); the
+    singleton avoids the ~6× duplication. Cleared by
+    ``config.shared.clear_caches`` on a backend/model swap.
     """
+    if EMBEDDING_BACKEND == "local":
+        # Lazy: importing the local client pulls torch/transformers,
+        # which API-only deployments must not pay for.
+        from model_client.qwen_text_embedding import QwenEmbeddingClient
+
+        return QwenEmbeddingClient()
     return EmbeddingClient()

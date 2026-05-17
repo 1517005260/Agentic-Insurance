@@ -60,6 +60,19 @@ dependencies = [
     # (CPU inference unsupported); the GLiNER weights live in the standard
     # HuggingFace cache (~/.cache/huggingface/hub/), not in STORAGE_PATH.
     "gliner>=0.2.0",
+    # Pinned floor: Qwen3-VL-Embedding-2B (local visual-embedding backend)
+    # needs transformers>=4.57; capped <5 to stay on the 4.5x line its
+    # model card targets. GLiNER / Qwen3-Reranker / Qwen3-Embedding all
+    # verified working on this range. qwen-vl-utils is the VL embedder's
+    # image/video preprocessing dependency.
+    "transformers>=4.57,<5",
+    "qwen-vl-utils>=0.0.14",
+    # qwen-vl-utils imports torchvision unconditionally. Pinned to the
+    # version paired with torch 2.10 (torchvision 0.25 ⇒ requires
+    # torch==2.10.0, already present) so declaring it here cannot perturb
+    # the CUDA torch stack. Declared (not ad-hoc) so an env reconcile
+    # never silently drops it again.
+    "torchvision==0.25.0",
     # Pure-Python sentence boundary disambiguation, 22 langs incl. zh/en,
     # 320 KB. Replaces spaCy's blank+sentencizer for the lightweight
     # passage→sentence split path used by text_dense / maintenance.

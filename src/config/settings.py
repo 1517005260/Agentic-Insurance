@@ -357,6 +357,53 @@ def rerank_model_dir() -> Path:
     return models_root() / RERANK_MODEL_ID.split("/")[-1]
 
 
+# ----------------------------------------------- local text embedding ----
+
+# Text embeddings have two interchangeable backends behind the same
+# ``encode()`` contract: the OpenAI-compatible HTTP client (the three
+# ``EMBEDDING_API_*`` vars above) and a local Qwen3-Embedding snapshot
+# loaded like the reranker (GPU FP16, weights under
+# ``STORAGE_PATH/models/<basename>``, moves with the storage volume).
+# ``EMBEDDING_BACKEND`` selects which one ``get_cached_embedding_client``
+# hands out; default ``api`` keeps existing deployments unchanged.
+# TODO(admin-config): surface backend + model id in the web config store
+# alongside the other tunables instead of env-only.
+EMBEDDING_BACKEND: str = (_get("EMBEDDING_BACKEND") or "api").lower()
+EMBED_MODEL_ID: str = _get("EMBED_MODEL_ID") or "Qwen/Qwen3-Embedding-0.6B"
+
+
+def embed_model_dir() -> Path:
+    """Local-snapshot directory for the Qwen3-Embedding weights.
+
+    Same basename-only convention as :func:`rerank_model_dir` so both
+    local models sit flat under ``STORAGE_PATH/models/`` and the HF
+    owner prefix lives only in the env var.
+    """
+    return models_root() / EMBED_MODEL_ID.split("/")[-1]
+
+
+# --------------------------------------------- local visual embedding ----
+
+# Page-image embeddings have the same two-backend split: the DashScope
+# multimodal HTTP client (the ``VISUAL_EMBEDDING_API_*`` vars above) and
+# a local Qwen3-VL-Embedding snapshot (image+text share one 2048-d
+# space). ``VISUAL_EMBEDDING_BACKEND`` selects which
+# ``get_cached_visual_embedding_client`` hands out; default ``api``
+# keeps existing deployments unchanged.
+# TODO(admin-config): surface backend + model id in the web config store.
+VISUAL_EMBEDDING_BACKEND: str = (_get("VISUAL_EMBEDDING_BACKEND") or "api").lower()
+VL_EMBED_MODEL_ID: str = _get("VL_EMBED_MODEL_ID") or "Qwen/Qwen3-VL-Embedding-2B"
+
+
+def vl_embed_model_dir() -> Path:
+    """Local-snapshot directory for the Qwen3-VL-Embedding weights.
+
+    Same basename-only convention as :func:`embed_model_dir`; the model
+    snapshot ships its own ``scripts/qwen3_vl_embedding.py`` embedder.
+    """
+    return models_root() / VL_EMBED_MODEL_ID.split("/")[-1]
+
+
 __all__ = [
     "STORAGE_PATH",
     "PADDLE_OCR_SUBDIR",
@@ -416,6 +463,12 @@ __all__ = [
     "VISUAL_EMBEDDING_MODEL",
     "RERANK_MODEL_ID",
     "rerank_model_dir",
+    "EMBEDDING_BACKEND",
+    "EMBED_MODEL_ID",
+    "embed_model_dir",
+    "VISUAL_EMBEDDING_BACKEND",
+    "VL_EMBED_MODEL_ID",
+    "vl_embed_model_dir",
     "TAVILY_API_KEY",
     "TAVILY_API_BASE_URL",
 ]

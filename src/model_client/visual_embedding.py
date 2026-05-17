@@ -23,7 +23,7 @@ import base64
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 
@@ -34,8 +34,12 @@ from config.shared import shared_session
 from config.settings import (
     VISUAL_EMBEDDING_API_BASE_URL,
     VISUAL_EMBEDDING_API_KEY,
+    VISUAL_EMBEDDING_BACKEND,
     VISUAL_EMBEDDING_MODEL,
 )
+
+if TYPE_CHECKING:
+    from model_client.qwen_vl_embedding import QwenVLEmbeddingClient
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +166,22 @@ class VisualEmbeddingClient:
 
 
 @lru_cache(maxsize=1)
-def get_cached_visual_embedding_client() -> "VisualEmbeddingClient":
-    """Process-wide singleton for the no-arg :class:`VisualEmbeddingClient`."""
+def get_cached_visual_embedding_client() -> "Union[VisualEmbeddingClient, QwenVLEmbeddingClient]":
+    """Process-wide singleton page-image embedder, backend-selected.
+
+    Every visual-embedding callsite (vision_dense builder, the image
+    retrieval channel) routes through here, so this is the single
+    chokepoint deciding API vs local: ``VISUAL_EMBEDDING_BACKEND=local``
+    hands out the GPU Qwen3-VL-Embedding client, anything else the
+    DashScope HTTP client. Both expose the identical
+    ``encode_paths`` / ``encode_text`` / ``available`` / ``model``
+    surface, so the choice is invisible downstream. Cleared by
+    ``config.shared.clear_caches`` on a backend/model swap.
+    """
+    if VISUAL_EMBEDDING_BACKEND == "local":
+        # Lazy: importing the local client pulls torch/transformers,
+        # which API-only deployments must not pay for.
+        from model_client.qwen_vl_embedding import QwenVLEmbeddingClient
+
+        return QwenVLEmbeddingClient()
     return VisualEmbeddingClient()
