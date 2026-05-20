@@ -8,12 +8,21 @@ license = { text = "MIT" }
 
 # Dependency policy:
 #   - Generation / reranking / embedding go through OpenAI-compatible HTTP APIs.
-#   - Local models are NOT allowed except for one carve-out: the GLiNER NER
-#     pipeline. GLiNER (multi-v2.1) is an open-set NER that takes natural
-#     language label descriptions at runtime, so domain swap = prompt swap (no
-#     dictionary). Loading it pulls in torch + transformers transitively;
-#     these are accepted ONLY as part of the NER exception. Do not introduce
-#     any other local-model runtime (sentence-transformers, accelerate, vllm, …).
+#   - Local models are NOT allowed in the base env except: (1) the GLiNER NER
+#     pipeline (open-set NER, label-at-runtime), and (2) the local Qwen3
+#     reranker / text embedding / VL embedding (already pulled in transitively
+#     via gliner's torch + transformers). Loading these pulls torch +
+#     transformers transitively; that surface is accepted under (1)/(2).
+#   - vLLM (used to serve a local QA generator behind an OpenAI-compatible
+#     endpoint) is **deliberately NOT in pyproject**. vllm>=0.21 transitively
+#     requires torchvision==0.26 (→ torch 2.11), which collides with the
+#     base env's torchvision==0.25 / torch 2.10 pin needed for qwen-vl-utils.
+#     uv resolves the lockfile to satisfy all extras simultaneously, so even
+#     making vllm an opt-in extra makes ``uv sync --extra dev`` unsolvable.
+#     Install vllm into a SEPARATE venv instead — see ``serve_local_llm.py``
+#     and the Chat-model section of ``.env.example`` for the isolated-venv
+#     install command (one-liner: ``uv pip install 'vllm>=0.21.0,<0.22'``).
+#   - Do not add other local-model runtimes (sentence-transformers, accelerate, …).
 dependencies = [
     # HTTP / API clients used by the model clients and PaddleOCR client.
     "requests>=2.28.0",

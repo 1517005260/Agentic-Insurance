@@ -79,6 +79,16 @@ STORAGE_MODELS: List[str] = [
     os.environ.get("VL_EMBED_MODEL_ID") or "Qwen/Qwen3-VL-Embedding-2B",
 ]
 
+# Local QA-generator weights for the opt-in ``local-llm`` extra (see
+# pyproject.toml). Sit in STORAGE_PATH/models/<basename> like the other
+# storage models. ~16 GB on disk, so they are NOT in the default download
+# set — opt in with ``--local-llm`` (or pass the repo id explicitly).
+# The repo id is read from ``CHAT_LOCAL_MODEL_ID`` so a deployment can swap
+# (e.g. to a future Qwen3 variant) without editing this script.
+LOCAL_LLM_MODELS: List[str] = [
+    os.environ.get("CHAT_LOCAL_MODEL_ID") or "Qwen/Qwen3-8B",
+]
+
 
 def download_to_hf_cache(repo_id: str, endpoint: str, force: bool = False) -> None:
     """Snapshot ``repo_id`` into the standard HF cache."""
@@ -126,6 +136,15 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Re-download files even if they're already cached.",
     )
+    parser.add_argument(
+        "--local-llm",
+        action="store_true",
+        help=(
+            "Also fetch the local QA-generator weights (Qwen3-8B, ~16 GB) "
+            "into STORAGE_PATH/models/. Only useful with the opt-in "
+            "'local-llm' extra; the API CHAT path does not need these."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -136,12 +155,15 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     if args.repos:
         # Manual override — route by **basename** match against
-        # STORAGE_MODELS. Basename comparison (rather than full
-        # ``org/name``) is the right granularity: ``settings.rerank_model_dir``
-        # also routes by basename, so a manual download of a Qwen3-Reranker
-        # variant ends up where the loader will look for it even if the
-        # owner prefix differs (e.g. a private mirror of the same repo).
-        storage_basenames = {m.split("/")[-1] for m in STORAGE_MODELS}
+        # STORAGE_MODELS / LOCAL_LLM_MODELS. Basename comparison (rather
+        # than full ``org/name``) is the right granularity:
+        # ``settings.rerank_model_dir`` also routes by basename, so a
+        # manual download of a Qwen3-Reranker variant ends up where the
+        # loader will look for it even if the owner prefix differs (e.g.
+        # a private mirror of the same repo).
+        storage_basenames = {
+            m.split("/")[-1] for m in (*STORAGE_MODELS, *LOCAL_LLM_MODELS)
+        }
         for repo in args.repos:
             if repo.split("/")[-1] in storage_basenames:
                 download_to_storage(repo, endpoint, args.force)
@@ -153,6 +175,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         download_to_hf_cache(repo_id, endpoint, args.force)
     for repo_id in STORAGE_MODELS:
         download_to_storage(repo_id, endpoint, args.force)
+    if args.local_llm:
+        for repo_id in LOCAL_LLM_MODELS:
+            download_to_storage(repo_id, endpoint, args.force)
     return 0
 
 
