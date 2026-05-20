@@ -17,8 +17,6 @@ Protocol.
 
 Output: one JSON report per handler.
 """
-from __future__ import annotations
-
 import json
 import time
 from pathlib import Path

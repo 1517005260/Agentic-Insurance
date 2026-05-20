@@ -26,8 +26,6 @@ half-formal Neumann-series argument); zero-out / restart with
 ``damping`` are skipped because we restart at the seed every walk —
 the goal is path attribution, not the unique stationary distribution.
 """
-from __future__ import annotations
-
 import json
 import random
 from pathlib import Path

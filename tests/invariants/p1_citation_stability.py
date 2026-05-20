@@ -18,8 +18,6 @@ Protocol.
 
 Output: JSON-shaped report dict.
 """
-from __future__ import annotations
-
 import json
 import random
 from pathlib import Path

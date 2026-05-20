@@ -24,8 +24,6 @@ PPR here is the simplified ``personalized_pagerank`` over the
 in-memory graph — same algorithm as ``GraphPPRChannel._run_ppr``
 but with hand-rolled seeds (we don't have NER in this offline test).
 """
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Dict, List, Set, Tuple

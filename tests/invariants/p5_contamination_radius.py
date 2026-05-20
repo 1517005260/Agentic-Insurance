@@ -19,8 +19,6 @@ The injection is deterministic: pick the two entities with the highest
 existing cos sim that are NOT already aliased, simulate accepting the
 pair as a false-positive merge.
 """
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Dict, List

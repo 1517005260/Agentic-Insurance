@@ -12,8 +12,6 @@ The fixture is intentionally minimal: no NER, no embedding model, no
 RAG channel — pure ingestion-layer artifacts at the shape the downstream
 ``GraphPPRChannel`` and tools expect.
 """
-from __future__ import annotations
-
 import json
 from pathlib import Path
 from typing import Dict, List, Tuple
