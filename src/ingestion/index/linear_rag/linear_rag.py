@@ -26,6 +26,7 @@ content with no metadata pollution.
 
 import json
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, List, Optional, Set
@@ -96,6 +97,9 @@ class LinearRAG:
             batch_size=self.config.gliner_batch_size,
             max_span_chars=self.config.ner_max_span_chars,
             noise_labels=self.config.gliner_noise_labels,
+            calibration_enabled=self.config.gliner_calibration_enabled,
+            temperature=self.config.gliner_temperature,
+            label_thresholds=self.config.gliner_label_thresholds,
         )
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"
@@ -114,6 +118,28 @@ class LinearRAG:
             )
         else:
             self.graph = ig.Graph(directed=False)
+
+        # Per-instance index() call counter for graphml-flush cadence.
+        # Default cadence = 1 (write every call) → bit-identical to the
+        # pre-cadence behaviour, so the per-file production builder is
+        # unchanged. A persistent bulk driver (one instance over many
+        # docs) sets graphml_flush_every > 1 so the O(V+E) graphml
+        # (de)serialisation is amortised instead of paid every doc.
+        self._index_calls = 0
+
+    def flush_graphml(self) -> None:
+        """Atomically persist the graph to graphml (tmp + os.replace).
+
+        Atomic rename also removes the torn-file risk of the old
+        in-place hundreds-of-MB write (a kill mid-write previously
+        corrupted the whole graph with no backup).
+        """
+        if "id" in self.graph.vs.attributes():
+            del self.graph.vs["id"]
+        self._graphml_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._graphml_path.with_suffix(".graphml.tmp")
+        self.graph.write_graphml(str(tmp))
+        os.replace(tmp, self._graphml_path)
 
     # ---------------------------------------------------------- NER caching
 
@@ -347,27 +373,54 @@ class LinearRAG:
         if is_collapse and self._reverse_map:
             save_reverse_map(self._reverse_map_path, self._reverse_map)
 
-        # Drop the auto-generated 'id' vertex attribute before writing —
-        # igraph stashes the structural <node id="..."> as a vertex attr
-        # called "id" on Read_GraphML, which then conflicts with the next
-        # write. Removing it keeps the graphml round-trip warning-free.
-        if "id" in self.graph.vs.attributes():
-            del self.graph.vs["id"]
-
-        self._graphml_path.parent.mkdir(parents=True, exist_ok=True)
-        self.graph.write_graphml(str(self._graphml_path))
+        # Persist graphml on a cadence. Default graphml_flush_every=1 →
+        # write every index() call (bit-identical to before; the
+        # per-file API builder constructs a fresh instance per file so
+        # its counter is always 1). A persistent bulk driver sets it
+        # >1 and force-calls flush_graphml() at checkpoints / end, so
+        # the O(V+E) graphml round-trip is amortised, not O(N²). The
+        # 'id'-attr cleanup + atomic write live in flush_graphml().
+        self._index_calls += 1
+        _every = max(1, int(getattr(self.config, "graphml_flush_every", 1)))
+        if self._index_calls % _every == 0:
+            self.flush_graphml()
 
         # Cluster shape metrics, computed against the freshly written
-        # graph so the returned dict matches the on-disk state.
+        # graph so the returned dict matches the on-disk state. The
+        # configured partitioner (default leiden_cpm) runs Leiden
+        # optimisation, which is O(E_alias) and E_alias grows with the
+        # corpus — paying it every doc makes a persistent bulk build
+        # O(N²) in wall time. cluster_shape_every gates that expensive
+        # recompute on a cadence (default 1 ⇒ every doc, bit-identical
+        # to before; the per-file API builder is a fresh instance per
+        # file so its counter is always 1). On skipped docs we still
+        # emit a well-formed cluster_shape: the alias subgraph's
+        # connected components are a single O(V+E_alias) union-find pass
+        # (not the iterative Leiden optimisation), and that is exactly
+        # the giant-component percolation tripwire largest_cc_ratio was
+        # designed to detect. Clusters are a recomputable derived view,
+        # so the graph itself is unaffected either way.
+        _cl_every = max(1, int(getattr(self.config, "cluster_shape_every", 1)))
+        _cluster_on_cadence = self._index_calls % _cl_every == 0
         if is_collapse:
             cluster_partition = compute_clusters_for_collapse(self.graph, self._reverse_map)
+        elif _cluster_on_cadence:
+            cluster_partition = compute_clusters(
+                self.graph,
+                algorithm=self.config.cluster_algorithm,
+                leiden_resolution=self.config.cluster_leiden_resolution,
+                leiden_weighted=self.config.cluster_leiden_weighted,
+            )
         else:
-            cluster_partition = compute_clusters(self.graph)
+            cluster_partition = compute_clusters(
+                self.graph, algorithm="connected_components"
+            )
         cluster_shape = cluster_shape_metrics(
             self.graph,
             cluster_partition,
             entity_store=self.entity_embedding_store,
             is_collapse=is_collapse,
+            cheap=True,
         )
 
         logger.info(

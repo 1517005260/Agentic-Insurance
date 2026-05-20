@@ -31,6 +31,7 @@ rows" race that would otherwise surface as ``IndexError`` on a
 concurrent query.
 """
 import json
+import logging
 import threading
 from hashlib import md5
 from pathlib import Path
@@ -39,6 +40,42 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import faiss
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+def _index_is_hnsw(index) -> bool:
+    return "HNSW" in type(index).__name__
+
+
+def _hnsw_params(namespace: str):
+    """(use_hnsw, M, efConstruction, efSearch) for ``namespace``.
+
+    Lazy import so this low-level store module never hard-depends on the
+    settings module at import time (avoids any future import cycle).
+    """
+    from config.settings import (
+        EMBEDDING_HNSW_NAMESPACES, EMBEDDING_HNSW_M,
+        EMBEDDING_HNSW_EF_CONSTRUCTION, EMBEDDING_HNSW_EF_SEARCH,
+    )
+    return (
+        namespace in EMBEDDING_HNSW_NAMESPACES,
+        EMBEDDING_HNSW_M,
+        EMBEDDING_HNSW_EF_CONSTRUCTION,
+        EMBEDDING_HNSW_EF_SEARCH,
+    )
+
+
+def _make_index(dim: int, namespace: str):
+    """IndexHNSWFlat (IP) for HNSW namespaces, else exact IndexFlatIP.
+    Both are cosine-correct on the store's L2-normalized vectors."""
+    use, m, efc, efs = _hnsw_params(namespace)
+    if use:
+        ix = faiss.IndexHNSWFlat(dim, m, faiss.METRIC_INNER_PRODUCT)
+        ix.hnsw.efConstruction = efc
+        ix.hnsw.efSearch = efs
+        return ix
+    return faiss.IndexFlatIP(dim)
 
 
 def _hash(text: str, namespace: str) -> str:
@@ -68,6 +105,14 @@ class EmbeddingStore:
         self._index: Optional[faiss.Index] = None
         self._meta: pd.DataFrame = pd.DataFrame({"hash_id": [], "text": []})
         self._hash_id_to_idx: Dict[str, int] = {}
+        # Generation counter bumped on every _meta/_hash_id_to_idx
+        # mutation; the derived-view caches below are keyed by it so any
+        # mutation forces a rebuild on next access (provably zero-semantic
+        # — see _memo). Covers the append/load/reset paths (the only
+        # mutations on the indexing path; a delete path, if added, must
+        # also bump _gen).
+        self._gen = 0
+        self._cache: Dict[str, tuple] = {}
 
         # Re-entrant lock so an ``add()``-from-tests / ``insert_text()``
         # call that internally walks the same store doesn't deadlock.
@@ -101,11 +146,35 @@ class EmbeddingStore:
             self._index = faiss.read_index(str(self._index_path()))
             if self.dim is None:
                 self.dim = self._index.d
+            # ANN migration: an on-disk flat index for an HNSW-configured
+            # namespace is rebuilt to HNSW in memory (one-time per
+            # process; the next persist writes HNSW). reconstruct_n works
+            # on IndexFlat. Shadow-A/B-proven to leave the post-admission
+            # accepted alias set identical, so this is transparent.
+            use, m, efc, efs = _hnsw_params(self.namespace)
+            if use and not _index_is_hnsw(self._index) and self._index.ntotal > 0:
+                vecs = self._index.reconstruct_n(0, self._index.ntotal)
+                ix = faiss.IndexHNSWFlat(
+                    self._index.d, m, faiss.METRIC_INNER_PRODUCT
+                )
+                ix.hnsw.efConstruction = efc
+                ix.hnsw.efSearch = efs
+                ix.add(vecs)
+                self._index = ix
+                logger.info(
+                    "EmbeddingStore[%s]: migrated flat→HNSW in memory "
+                    "(%d vecs, M=%d efSearch=%d)",
+                    self.namespace, ix.ntotal, m, efs,
+                )
+            elif use and _index_is_hnsw(self._index):
+                # honor a possibly-changed configured efSearch on reload
+                self._index.hnsw.efSearch = efs
         if meta_exists:
             self._meta = pd.read_parquet(self._meta_path())
             self._hash_id_to_idx = {
                 h: i for i, h in enumerate(self._meta["hash_id"].tolist())
             }
+            self._gen += 1
 
         # Either nothing exists (cold start, fine), or all three exist and
         # row counts match. ANY other combination is a partial-write
@@ -174,6 +243,7 @@ class EmbeddingStore:
             self._index = None
             self._meta = pd.DataFrame({"hash_id": [], "text": []})
             self._hash_id_to_idx = {}
+            self._gen += 1
             self._load()
 
     # ------------------------------------------------------------------ misc
@@ -264,7 +334,7 @@ class EmbeddingStore:
             if self.dim is None:
                 self.dim = int(embeddings.shape[1])
             if self._index is None:
-                self._index = faiss.IndexFlatIP(self.dim)
+                self._index = _make_index(self.dim, self.namespace)
             if embeddings.shape[1] != self.dim:
                 raise ValueError(
                     f"Embedding dim {embeddings.shape[1]} ≠ store dim {self.dim}"
@@ -298,6 +368,7 @@ class EmbeddingStore:
             self._index.add(kept_e)
             for offset, h in enumerate(kept_h):
                 self._hash_id_to_idx[h] = start + offset
+                self._gen += 1
 
             if self._meta.empty:
                 self._meta = new_df
@@ -401,15 +472,30 @@ class EmbeddingStore:
 
     # ------------------------------------------------------ collection views
 
+    def _memo(self, key, builder):
+        """Generation-keyed memo for the O(N) derived views below.
+
+        Holds the RLock itself, so ``builder`` runs under the same lock
+        the original ``with self._lock:`` body held (RLock is
+        re-entrant) — identical concurrency semantics. A cached value is
+        reused only while ``_gen`` is unchanged, so any mutation
+        (append/load/reset bumps ``_gen``) forces a rebuild.
+        """
+        with self._lock:
+            c = self._cache.get(key)
+            if c is not None and c[0] == self._gen:
+                return c[1]
+            v = builder()
+            self._cache[key] = (self._gen, v)
+            return v
+
     @property
     def hash_ids(self) -> List[str]:
-        with self._lock:
-            return self._meta["hash_id"].tolist()
+        return self._memo("hash_ids", lambda: self._meta["hash_id"].tolist())
 
     @property
     def texts(self) -> List[str]:
-        with self._lock:
-            return self._meta["text"].tolist()
+        return self._memo("texts", lambda: self._meta["text"].tolist())
 
     @property
     def embeddings(self) -> np.ndarray:
@@ -434,6 +520,14 @@ class EmbeddingStore:
                 return np.zeros((0,), dtype=np.float32)
             q = np.ascontiguousarray(query_embedding.reshape(1, -1).astype(np.float32))
             n = self._index.ntotal
+            if _index_is_hnsw(self._index):
+                # HNSW.search(q, ntotal) is a pathological full-graph
+                # walk and not row-aligned. all_similarities means an
+                # exact full scan — reconstruct + BLAS matmul, exact and
+                # row-aligned. (Not hit by HNSW namespaces in practice;
+                # defensive so a misconfig can't silently corrupt PPR.)
+                mat = self._index.reconstruct_n(0, n)
+                return (mat @ q.reshape(-1)).astype(np.float32)
             scores, indices = self._index.search(q, n)
         aligned = np.zeros(n, dtype=np.float32)
         # IndexFlatIP returns one score per stored row — every position is
@@ -443,15 +537,16 @@ class EmbeddingStore:
 
     @property
     def hash_id_to_text(self) -> Dict[str, str]:
-        with self._lock:
-            return dict(zip(self._meta["hash_id"].tolist(), self._meta["text"].tolist()))
+        return self._memo("hash_id_to_text", lambda: dict(
+            zip(self._meta["hash_id"].tolist(), self._meta["text"].tolist())))
 
     @property
     def text_to_hash_id(self) -> Dict[str, str]:
         # Last write wins on duplicate text — same surface across files
         # collapses to one hash via md5(text), so this is well-defined.
-        with self._lock:
-            return {t: h for h, t in zip(self._meta["hash_id"].tolist(), self._meta["text"].tolist())}
+        return self._memo("text_to_hash_id", lambda: {
+            t: h for h, t in zip(
+                self._meta["hash_id"].tolist(), self._meta["text"].tolist())})
 
     @property
     def hash_id_to_idx(self) -> Dict[str, int]:

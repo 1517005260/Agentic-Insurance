@@ -31,9 +31,18 @@ class GraphIndexBuilder(IndexBuilder):
         embedding_client: Optional[EmbeddingClient] = None,
         max_workers: int = 4,
         linear_config: Optional[LinearRAGConfig] = None,
+        reuse_graph: bool = False,
     ):
         self.embedding_client = embedding_client or get_cached_embedding_client()
         self.max_workers = max_workers
+        # Default False = a fresh LinearRAG per _build (per-file API
+        # path: each upload must load+persist its own graphml, unchanged).
+        # True = one persistent LinearRAG reused across _build calls so
+        # a bulk corpus build loads graphml ONCE and writes on the
+        # config's graphml_flush_every cadence instead of a full O(V+E)
+        # read+write per doc (the 650-build O(N²) fix). Opt-in only.
+        self.reuse_graph = reuse_graph
+        self._lr = None
         # Carries the admin-tuned literal-backfill flags + GLiNER knobs.
         # The embedding_client / max_workers fields here will be overwritten
         # in _build() with the per-call values; the backfill / NER knobs
@@ -67,7 +76,12 @@ class GraphIndexBuilder(IndexBuilder):
             max_workers=self.max_workers,
         )
 
-        graph = LinearRAG(config)
+        if self.reuse_graph:
+            if self._lr is None:
+                self._lr = LinearRAG(config)
+            graph = self._lr
+        else:
+            graph = LinearRAG(config)
         added = graph.index(passages, file_id=file_id, page_numbers=page_numbers)
 
         return IndexBuildResult(
@@ -84,3 +98,10 @@ class GraphIndexBuilder(IndexBuilder):
                 "added": added,
             },
         )
+
+    def flush(self) -> None:
+        """Force-persist the reused graph (bulk driver: call at the end
+        and before any checkpoint that reads the on-disk graphml). No-op
+        unless ``reuse_graph`` and a graph has been built."""
+        if self._lr is not None:
+            self._lr.flush_graphml()

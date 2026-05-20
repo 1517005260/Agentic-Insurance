@@ -14,7 +14,7 @@ from typing import Any, Optional
 @dataclass(frozen=True)
 class ConfigEntry:
     key: str
-    type: str            # "int" | "str" | "float" | "bool" | "list_str"
+    type: str            # "int" | "str" | "float" | "bool" | "list_str" | "dict_str_float"
     default: Any         # imported live from the algorithm layer
     description: str = ""
     # Range / length bounds. Inclusive. For ``int`` / ``float`` both
@@ -109,6 +109,25 @@ class ConfigEntry:
                     f"{self.key}: length {len(value)} > max_length {self.max_length}"
                 )
             return list(value)  # defensive copy — the store snapshot is immutable
+        if self.type == "dict_str_float":
+            # JSON objects with string keys and numeric values.
+            # Used for per-label GLiNER thresholds (e.g. {"concept": 0.5}).
+            if not isinstance(value, dict):
+                raise ValueError(
+                    f"{self.key}: expected dict[str, float], got {type(value).__name__}"
+                )
+            result = {}
+            for k, v in value.items():
+                if not isinstance(k, str):
+                    raise ValueError(
+                        f"{self.key}: key {k!r} must be str, got {type(k).__name__}"
+                    )
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise ValueError(
+                        f"{self.key}[{k!r}]: expected float, got {type(v).__name__}"
+                    )
+                result[k] = float(v)
+            return result
         raise ValueError(f"{self.key}: unsupported entry type {self.type!r}")
 
     def to_public_dict(self) -> dict:

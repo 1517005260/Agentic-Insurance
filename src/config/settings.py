@@ -371,6 +371,25 @@ def rerank_model_dir() -> Path:
 EMBEDDING_BACKEND: str = (_get("EMBEDDING_BACKEND") or "api").lower()
 EMBED_MODEL_ID: str = _get("EMBED_MODEL_ID") or "Qwen/Qwen3-Embedding-0.6B"
 
+# faiss ANN (HNSW) for the kNN-only entity store — the disambig
+# dual-query top-k is the O(N²·D) build-time cost. A decision-level
+# shadow A/B (exact IndexFlatIP vs HNSW, on the post-admission accepted
+# alias set) showed *identical* accepted edges at every M/efSearch
+# (cos≥0.85 floor + gradient cut makes ANN effectively exact here) at
+# 98–207× search speedup. Scoped to namespaces that are queried only by
+# top-k; passage/sentence stores keep flat (their ``all_similarities``
+# PPR path needs an exact full scan, which HNSW cannot serve).
+# Comma-separated namespaces; default "entity".
+EMBEDDING_HNSW_NAMESPACES: frozenset = frozenset(
+    s.strip() for s in (_get("EMBEDDING_HNSW_NAMESPACES") or "entity").split(",")
+    if s.strip()
+)
+EMBEDDING_HNSW_M: int = int(_get("EMBEDDING_HNSW_M") or 32)
+EMBEDDING_HNSW_EF_CONSTRUCTION: int = int(
+    _get("EMBEDDING_HNSW_EF_CONSTRUCTION") or 200
+)
+EMBEDDING_HNSW_EF_SEARCH: int = int(_get("EMBEDDING_HNSW_EF_SEARCH") or 128)
+
 
 def embed_model_dir() -> Path:
     """Local-snapshot directory for the Qwen3-Embedding weights.
@@ -465,6 +484,10 @@ __all__ = [
     "rerank_model_dir",
     "EMBEDDING_BACKEND",
     "EMBED_MODEL_ID",
+    "EMBEDDING_HNSW_NAMESPACES",
+    "EMBEDDING_HNSW_M",
+    "EMBEDDING_HNSW_EF_CONSTRUCTION",
+    "EMBEDDING_HNSW_EF_SEARCH",
     "embed_model_dir",
     "VISUAL_EMBEDDING_BACKEND",
     "VL_EMBED_MODEL_ID",

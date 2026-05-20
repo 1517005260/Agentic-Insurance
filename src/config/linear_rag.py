@@ -10,7 +10,7 @@ The ``EmbeddingClient`` import is guarded by ``TYPE_CHECKING`` so importing
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
     from model_client import EmbeddingClient
@@ -78,6 +78,35 @@ class LinearRAGConfig:
     ner_max_span_chars: int = 80
 
     max_workers: int = 4
+
+    # How often LinearRAG.index() persists LinearRAG.graphml, in
+    # index() calls. Default 1 = write every doc (bit-identical to the
+    # pre-cadence behaviour; the per-file API builder makes a fresh
+    # instance per file so its counter is always 1 → unchanged). A
+    # persistent bulk driver (one LinearRAG over a whole corpus, e.g.
+    # GraphIndexBuilder(reuse_graph=True)) sets this >1 so the O(V+E)
+    # graphml (de)serialisation is amortised across docs instead of
+    # paid every doc (the 650-build O(N²) wall-time blow-up). Such a
+    # driver must force a final flush_graphml() at the end and before
+    # any checkpoint that reads the on-disk graphml.
+    graphml_flush_every: int = 1
+
+    # How often LinearRAG.index() recomputes the expensive Leiden
+    # (compute_clusters) partition for the returned ``cluster_shape``,
+    # in index() calls. Default 1 = compute every doc (bit-identical to
+    # the pre-cadence behaviour; the per-file API builder makes a fresh
+    # instance per file so its counter is always 1 → unchanged). Leiden
+    # is O(E_alias) and E_alias grows with the corpus, so paying it
+    # every doc makes a persistent bulk build O(N²) in wall time. A
+    # bulk driver (one LinearRAG over a whole corpus, e.g.
+    # GraphIndexBuilder(reuse_graph=True)) sets this >1 so the
+    # partition is recomputed on a cadence; on skipped docs index()
+    # still returns a well-formed cluster_shape carrying the cheap O(V)
+    # largest_cc_ratio percolation tripwire (the expensive
+    # diameter / pairwise fields are already cadence-only via the P1
+    # cheap=True path). The resulting graph is unaffected — clusters
+    # are a recomputable derived view over the immutable alias edges.
+    cluster_shape_every: int = 1
 
     # Alias-edge thresholds — see disambig.DEFAULT_MIN_SIM.
     # The dual-query recall path (bare-surface + centroid) needs
@@ -150,6 +179,30 @@ class LinearRAGConfig:
     # locality (P2) — only flip in for ablation experiments.
     acceptance_handler: str = "overlay"
 
+    # Logical-entity partitioner over the (immutable) alias subgraph.
+    # ``connected_components`` = raw transitive closure: single-linkage,
+    # percolates to a giant component at open-domain scale (phase
+    # transition in N, not a tunable tail; kept for ablation /
+    # bit-compat). ``leiden_cpm`` = Leiden on the Constant-Potts-Model
+    # objective (igraph, no new dep): the chaining-resistant principled
+    # partition the ER / cross-doc-coref literature converges on.
+    # Clusters are a recomputable derived view over immutable alias
+    # edges, so reversibility / P1 / P4 are unchanged either way.
+    #
+    # Default is ``leiden_cpm`` @ resolution 0.01 (weighted), chosen by
+    # a controlled retrieval A/B on a 154-doc open-domain stock: vs raw
+    # connected_components it cut largest_cc_ratio 0.335→0.0021 (G5 PASS,
+    # 10× margin; giant component 24717→153 entities) with **no
+    # retrieval regression** (ranked Page Recall@10 identical 0.828,
+    # Recall@5 within run noise). 0.01 is the least-aggressive
+    # resolution that clears G5 with margin → minimal risk of
+    # fragmenting genuine multi-surface entities. ``cluster_leiden_
+    # weighted`` uses the alias edge propagation weight so stronger
+    # aliases resist being cut.
+    cluster_algorithm: str = "leiden_cpm"
+    cluster_leiden_resolution: float = 0.01
+    cluster_leiden_weighted: bool = True
+
     # Propagation policy. Decouples per-edge audit features
     # (cos_sim / reranker_score) from the PPR-propagation weight.
     # ``cos`` matches the historical ``weight = cos_sim`` behaviour,
@@ -174,3 +227,39 @@ class LinearRAGConfig:
     alias_prop_calib_cos_std: float = 0.05
     alias_prop_calib_rerank_mean: float = 0.8
     alias_prop_calib_rerank_std: float = 0.1
+
+    # GLiNER confidence calibration.
+    # When ``gliner_calibration_enabled=True`` the raw GLiNER span scores
+    # are temperature-scaled by ``score / gliner_temperature`` before the
+    # threshold gate: effectively tightening the threshold (T>1) or
+    # softening it (T<1). The temperature is fitted offline on a silver
+    # span dev set (see ``experiments/ner_calibration.py``); the default
+    # 1.0 = no-op (identical to current threshold-only behaviour).
+    #
+    # A/B result (2026-05-18, 154-doc stock, 385-span silver dev):
+    # T=1.035≈1.0; ECE 0.052→0.057 (worse); over-gen 50.3%→50.3%;
+    # gates FAIL → default stays OFF. Root cause: miscalibration is
+    # label-stratified, not global; use gliner_label_thresholds instead.
+    #
+    # TODO admin panel: expose once label-threshold A/B is done.
+    # Currently kwarg-injectable only (memory: feedback_admin_panel_all_tunables.md).
+    gliner_calibration_enabled: bool = False
+    gliner_temperature: float = 1.0
+
+    # Label-specific score thresholds (label-conditional calibration).
+    # Overrides ``gliner_threshold`` for the named labels. Empty dict = inert
+    # (all labels use ``gliner_threshold``). Data-driven from 2026-05-18
+    # concept-threshold sweep on 154-doc stock (ranked Page Recall@10 guardrail,
+    # ≤1 pp tolerance vs C2 frozen 0.914 reference):
+    #
+    #   concept@0.3 baseline: R@10=0.8284, overgen=50.3%
+    #   concept@0.5:          R@10=0.8206 (−0.78pp PASS), overgen=32.1% (−18.2pp)
+    #   concept@0.6:          R@10=0.8179 (−1.05pp FAIL)
+    #
+    # concept@0.5 is the best passing threshold: −18pp over-generation-fuel cut,
+    # −0.78pp recall (within tolerance), guardrail PASS.
+    # Data: /root/autodl-tmp/_exp/ner_label_thr_sweep.json (2026-05-18).
+    # Admin panel: exposed via config_store/schema.py (linear_rag.gliner_label_thresholds).
+    gliner_label_thresholds: Dict[str, float] = field(
+        default_factory=lambda: {"concept": 0.5}
+    )

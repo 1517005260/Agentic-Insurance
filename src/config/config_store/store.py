@@ -271,6 +271,15 @@ class ConfigStore:
             reranker_threshold=float(self._values["linear_rag.reranker_threshold"]),
             reranker_instruction=str(self._values["linear_rag.reranker_instruction"]),
             acceptance_handler=str(self._values["linear_rag.acceptance_handler"]),
+            graphml_flush_every=int(self._values["linear_rag.graphml_flush_every"]),
+            cluster_shape_every=int(self._values["linear_rag.cluster_shape_every"]),
+            cluster_algorithm=str(self._values["linear_rag.cluster_algorithm"]),
+            cluster_leiden_resolution=float(
+                self._values["linear_rag.cluster_leiden_resolution"]
+            ),
+            cluster_leiden_weighted=bool(
+                self._values["linear_rag.cluster_leiden_weighted"]
+            ),
             alias_propagation_policy=str(self._values["linear_rag.alias_propagation_policy"]),
             alias_prop_const=float(self._values["linear_rag.alias_prop_const"]),
             alias_prop_lo=float(self._values["linear_rag.alias_prop_lo"]),

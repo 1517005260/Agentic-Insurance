@@ -359,6 +359,21 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         ),
     ),
     ConfigEntry(
+        key="linear_rag.gliner_label_thresholds",
+        type="dict_str_float",
+        default=dict(_LINEAR_RAG_DEFAULTS.gliner_label_thresholds),
+        group="linear_rag",
+        description=(
+            "Per-label GLiNER score thresholds (label-conditional calibration). "
+            "Overrides gliner_threshold for the named labels; unspecified labels "
+            "use gliner_threshold. Default {'concept': 0.5} was chosen by a "
+            "154-doc retrieval A/B (2026-05-18): concept@0.5 drops Recall@10 "
+            "only 0.78 pp (within ≤1 pp guardrail) while cutting concept "
+            "over-generation by 18 pp (50.3%→32.1%). Empty dict = inert "
+            "(all labels use gliner_threshold)."
+        ),
+    ),
+    ConfigEntry(
         key="linear_rag.junk_max_han_chars",
         type="int",
         default=_LINEAR_RAG_DEFAULTS.junk_max_han_chars,
@@ -443,6 +458,86 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "(B7b baseline). Switching away from overlay breaks P4 "
             "native attribution and increases P2 rollback cost — only "
             "set for ablation experiments."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.graphml_flush_every",
+        type="int",
+        default=_LINEAR_RAG_DEFAULTS.graphml_flush_every,
+        min=1,
+        max=1000,
+        group="linear_rag",
+        description=(
+            "How often LinearRAG.index() persists LinearRAG.graphml, in "
+            "index() calls. 1 (default) = every doc — bit-identical to "
+            "the per-file API builder (fresh instance per file). A "
+            "persistent bulk driver (GraphIndexBuilder reuse_graph=True) "
+            "sets this >1 so the O(V+E) graphml round-trip is amortised "
+            "across docs instead of O(N²); such a driver must force a "
+            "final flush_graphml() at end and before checkpoints."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.cluster_shape_every",
+        type="int",
+        default=_LINEAR_RAG_DEFAULTS.cluster_shape_every,
+        min=1,
+        max=1000,
+        group="linear_rag",
+        description=(
+            "How often LinearRAG.index() recomputes the expensive Leiden "
+            "partition for the returned cluster_shape, in index() calls. "
+            "1 (default) = every doc — bit-identical to the per-file API "
+            "builder (fresh instance per file). Leiden is O(E_alias) and "
+            "E_alias grows with the corpus, so a persistent bulk driver "
+            "(GraphIndexBuilder reuse_graph=True) sets this >1 to amortise "
+            "it across docs instead of paying O(N²); skipped docs still "
+            "return the cheap O(V+E_alias) connected-component "
+            "largest_cc_ratio percolation tripwire. Clusters are a "
+            "recomputable derived view so the resulting graph is unchanged."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.cluster_algorithm",
+        type="str",
+        default=_LINEAR_RAG_DEFAULTS.cluster_algorithm,
+        group="linear_rag",
+        description=(
+            "Logical-entity partitioner over the immutable alias "
+            "subgraph. 'leiden_cpm' (default, @resolution 0.01 weighted) "
+            "= Leiden/Constant-Potts communities: chaining-resistant, the "
+            "ER/cross-doc-coref standard; A/B-validated to de-percolate "
+            "(largest_cc_ratio 0.335→0.0021, G5 PASS) with no retrieval "
+            "regression. 'connected_components' = raw transitive closure "
+            "(single-linkage; percolates to a giant component at "
+            "open-domain scale) — kept for ablation / bit-compat. "
+            "Clusters are a recomputable derived view so reversibility / "
+            "P1 / P4 are unchanged either way."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.cluster_leiden_resolution",
+        type="float",
+        default=_LINEAR_RAG_DEFAULTS.cluster_leiden_resolution,
+        min=0.0,
+        max=1.0,
+        group="linear_rag",
+        description=(
+            "CPM resolution for cluster_algorithm='leiden_cpm'. Higher → "
+            "smaller, tighter clusters (more de-percolation, more risk of "
+            "splitting true aliases); tune on the retrieval-quality A/B. "
+            "Ignored when cluster_algorithm='connected_components'."
+        ),
+    ),
+    ConfigEntry(
+        key="linear_rag.cluster_leiden_weighted",
+        type="bool",
+        default=_LINEAR_RAG_DEFAULTS.cluster_leiden_weighted,
+        group="linear_rag",
+        description=(
+            "Whether leiden_cpm uses the alias edge propagation weight "
+            "(cos-derived) so stronger aliases resist being cut. Ignored "
+            "when cluster_algorithm='connected_components'."
         ),
     ),
     ConfigEntry(

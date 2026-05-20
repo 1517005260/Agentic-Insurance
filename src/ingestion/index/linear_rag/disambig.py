@@ -453,22 +453,42 @@ def surface_quality_score(surface: Optional[str]) -> float:
     return score
 
 
-def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
-    """Connected components on the alias subgraph → logical entities.
+CLUSTER_ALGORITHMS = {"connected_components", "leiden_cpm"}
 
-    Returns a list of cluster dicts. ``canonical`` is the cluster
-    member with the highest :func:`surface_quality_score` — the
-    cleanest surface. Empirically this gives canonicals like
-    ``"万通危疾加护保"`` instead of the previous longest-surface rule
-    which would pick the noisiest member (chained product list,
-    sentence fragment, dangling-bracket token).
 
-    Ties (same score) are broken deterministically by the member's
-    insertion order so ``compute_clusters`` is reproducible across
-    runs. Only clusters with ≥2 members are returned (singletons are
-    implicit — every physical entity not appearing in this list is
-    its own logical entity).
+def compute_clusters(
+    graph: ig.Graph,
+    *,
+    algorithm: str = "connected_components",
+    leiden_resolution: float = 0.05,
+    leiden_weighted: bool = True,
+) -> List[Dict[str, object]]:
+    """Partition the alias subgraph into logical entities (derived view).
+
+    The alias subgraph is never mutated — clusters are a *recomputable
+    derived view* over immutable alias edges, so reversibility / P1 / P4
+    hold for any ``algorithm``. Two partitioners:
+
+    * ``connected_components`` — raw transitive closure. Single-linkage;
+      percolates to a giant component at open-domain scale (a phase
+      transition in N, not a tunable tail). Kept for ablation / bit
+      compatibility.
+    * ``leiden_cpm`` — Leiden on the Constant-Potts-Model objective
+      (igraph ``community_leiden``). Chaining-resistant by construction
+      (well-connected, resolution-bounded communities), the principled
+      replacement the ER / cross-doc-coref literature converges on.
+      ``leiden_resolution`` is the granularity knob (higher → smaller,
+      tighter clusters); ``leiden_weighted`` uses the alias edge weight
+      (cos-derived propagation strength) so strong aliases resist being
+      cut.
+
+    ``canonical`` is the cluster member with the highest
+    :func:`surface_quality_score` (cleanest surface). Ties break by
+    insertion order so the output is reproducible. Only clusters with
+    ≥2 members are returned (singletons are implicit).
     """
+    if algorithm not in CLUSTER_ALGORITHMS:
+        raise ValueError(f"compute_clusters: unknown algorithm {algorithm!r}")
     if graph.ecount() == 0:
         return []
     if "edge_type" not in graph.es.attributes():
@@ -477,7 +497,20 @@ def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
     if not alias_edges:
         return []
     sub = graph.subgraph_edges(alias_edges, delete_vertices=True)
-    components = sub.connected_components()
+    if algorithm == "connected_components":
+        components = sub.connected_components()
+    else:  # leiden_cpm
+        weights = (
+            sub.es["weight"]
+            if leiden_weighted and "weight" in sub.es.attributes()
+            else None
+        )
+        components = sub.community_leiden(
+            objective_function="CPM",
+            resolution=leiden_resolution,
+            weights=weights,
+            n_iterations=-1,
+        )
 
     clusters: List[Dict[str, object]] = []
     for cid, members in enumerate(components):
@@ -507,19 +540,29 @@ def compute_clusters(graph: ig.Graph) -> List[Dict[str, object]]:
 # Cluster-cache schema version. Bump when ``compute_clusters`` /
 # ``surface_quality_score`` change so older cache files (which encode
 # the *previous* canonical-picker output) are silently invalidated and
-# recomputed on next read.
-CLUSTERS_CACHE_VERSION = 2
+# recomputed on next read. v3: compute_clusters gained the algorithm
+# dispatch (connected_components | leiden_cpm).
+CLUSTERS_CACHE_VERSION = 3
 
 
 def write_clusters(
     path: Path,
     clusters: List[Dict[str, object]],
     alias_edge_count: int = 0,
+    *,
+    algorithm: str = "connected_components",
+    leiden_resolution: float = 0.05,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": CLUSTERS_CACHE_VERSION,
         "alias_edge_count": int(alias_edge_count),
+        # Recorded for observability / audit — which partitioner produced
+        # this cache. Freshness is still version-keyed (a deliberate
+        # algorithm flip clears the cache, like any schema-version bump),
+        # so multiple readers never thrash-recompute each other.
+        "algorithm": algorithm,
+        "leiden_resolution": float(leiden_resolution),
         "clusters": clusters,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -530,14 +573,25 @@ def invalidate_clusters(path: Path) -> None:
         path.unlink()
 
 
-def get_clusters(graph: ig.Graph, cache_path: Path) -> List[Dict[str, object]]:
+def get_clusters(
+    graph: ig.Graph,
+    cache_path: Path,
+    *,
+    algorithm: str = "connected_components",
+    leiden_resolution: float = 0.05,
+    leiden_weighted: bool = True,
+) -> List[Dict[str, object]]:
     """Lazy-loaded clusters: return cached if fresh, else compute + persist.
 
     "Fresh" = file exists AND ``version`` matches the current
-    ``CLUSTERS_CACHE_VERSION``. Older versions are silently dropped
-    and recomputed — this is the migration path for the canonical-
-    picker change in v2 (otherwise an upgraded binary would keep
-    serving stale longest-surface canonicals from a v1 cache).
+    ``CLUSTERS_CACHE_VERSION``. Older versions are silently dropped and
+    recomputed (migration path for the canonical-picker v2 change and
+    the v3 algorithm dispatch). Freshness is intentionally version-keyed
+    only, NOT keyed on ``algorithm``/``leiden_resolution``: in a
+    deployment the partitioner is fixed by config, and a deliberate flip
+    clears the cache (ingest invalidates on every alias-edge add), so
+    making freshness param-sensitive would only let concurrent readers
+    with momentarily-divergent config thrash-recompute each other.
     """
     if cache_path.exists():
         try:
@@ -548,13 +602,24 @@ def get_clusters(graph: ig.Graph, cache_path: Path) -> List[Dict[str, object]]:
             # Version mismatch (or missing) — fall through to recompute.
         except Exception:
             pass  # parse error — fall through to recompute
-    clusters = compute_clusters(graph)
+    clusters = compute_clusters(
+        graph,
+        algorithm=algorithm,
+        leiden_resolution=leiden_resolution,
+        leiden_weighted=leiden_weighted,
+    )
     alias_edge_count = (
         sum(1 for e in graph.es if e.attributes().get("edge_type") == ALIAS_EDGE_TYPE)
         if "edge_type" in graph.es.attributes()
         else 0
     )
-    write_clusters(cache_path, clusters, alias_edge_count=alias_edge_count)
+    write_clusters(
+        cache_path,
+        clusters,
+        alias_edge_count=alias_edge_count,
+        algorithm=algorithm,
+        leiden_resolution=leiden_resolution,
+    )
     return clusters
 
 
@@ -1019,6 +1084,7 @@ def cluster_shape_metrics(
     entity_store: Optional[EmbeddingStore] = None,
     *,
     is_collapse: bool = False,
+    cheap: bool = False,
 ) -> Dict[str, Any]:
     """Return shape statistics on the alias-cluster partition.
 
@@ -1070,6 +1136,16 @@ def cluster_shape_metrics(
 
     if is_collapse:
         metrics["cluster_diameter_p95"] = 0
+        metrics["intra_cluster_cos_sim_min_median"] = None
+        return metrics
+
+    if cheap:
+        # Per-doc ingest path: skip the O(V·E) giant-CC diameter walk and
+        # the O(Σ|c|²) intra-cluster pairwise probe. The O(V) shape
+        # fields above (counts / sizes / largest_cc_ratio) stay as the
+        # per-doc percolation tripwire; the full metrics are computed on
+        # a checkpoint cadence by the caller.
+        metrics["cluster_diameter_p95"] = None
         metrics["intra_cluster_cos_sim_min_median"] = None
         return metrics
 

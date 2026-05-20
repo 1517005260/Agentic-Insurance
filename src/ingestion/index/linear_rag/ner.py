@@ -313,6 +313,9 @@ class GLiNERAdapter:
         batch_size: int = 16,
         max_span_chars: int = 80,
         noise_labels: Optional[Sequence[str]] = None,
+        calibration_enabled: bool = False,
+        temperature: float = 1.0,
+        label_thresholds: Optional[Dict[str, float]] = None,
     ):
         # Pulled from the process-wide cache so ingest workers and the
         # lifespan-pinned PPR channel share a single resident copy of
@@ -329,6 +332,19 @@ class GLiNERAdapter:
         # spans it tags with a sink label. ``labels`` must still contain
         # them — they have to be scored to attract their surfaces.
         self.noise_labels: set = set(noise_labels or [])
+        # Confidence calibration via temperature scaling. When enabled,
+        # the raw GLiNER score is divided by ``temperature`` before the
+        # threshold gate (T > 1 tightens; T = 1 is a no-op). When
+        # disabled (default), GLiNER's internal threshold is used
+        # directly — matching current behaviour exactly.
+        self.calibration_enabled: bool = bool(calibration_enabled)
+        self.temperature: float = float(temperature) if temperature > 0 else 1.0
+        # Label-conditional thresholds. When non-empty, each label's floor
+        # is overridden independently; unspecified labels use self.threshold.
+        # Data-driven from 2026-05-18 calibration experiment: 'concept'
+        # emits 88% noise at score 0.3 on open-domain ML text, needs ≥0.6
+        # for 79% precision. Empty dict = inert (no change from baseline).
+        self.label_thresholds: Dict[str, float] = dict(label_thresholds) if label_thresholds else {}
 
     # ----------------------------------------------- batch passage NER ----
 
@@ -377,12 +393,50 @@ class GLiNERAdapter:
         # forward per sentence (the deprecated
         # ``batch_predict_entities`` did this implicitly; the new
         # ``inference`` API requires the explicit knob).
-        all_results: List[List[Dict[str, Any]]] = self._model.inference(
-            all_sentences,
-            self.labels,
-            threshold=self.threshold,
-            batch_size=self.batch_size,
+        #
+        # When confidence calibration is enabled, we run at threshold=0
+        # to get all raw scores, then apply the calibrated effective
+        # threshold ``gliner_threshold * temperature`` manually. This
+        # is equivalent to temperature-scaling the score and then
+        # comparing against the original threshold (score/T >= thr
+        # ⟺ score >= thr * T), but avoids re-entering model internals.
+        #
+        # Label-specific thresholds also require running at threshold=0
+        # and filtering manually, since GLiNER's inference applies a
+        # single global floor.
+        needs_raw_run = (
+            (self.calibration_enabled and self.temperature != 1.0)
+            or bool(self.label_thresholds)
         )
+        if needs_raw_run:
+            calib_thr = (
+                self.threshold * self.temperature
+                if self.calibration_enabled and self.temperature != 1.0
+                else self.threshold
+            )
+            all_results_raw: List[List[Dict[str, Any]]] = self._model.inference(
+                all_sentences,
+                self.labels,
+                threshold=0.0,
+                batch_size=self.batch_size,
+            )
+            # Per-span threshold: label_thresholds[label] if present,
+            # else calib_thr (which equals self.threshold when T=1).
+            def _span_threshold(label: str) -> float:
+                return self.label_thresholds.get(label, calib_thr)
+
+            all_results: List[List[Dict[str, Any]]] = [
+                [sp for sp in spans
+                 if sp.get("score", 0.0) >= _span_threshold(sp.get("label", ""))]
+                for spans in all_results_raw
+            ]
+        else:
+            all_results = self._model.inference(
+                all_sentences,
+                self.labels,
+                threshold=self.threshold,
+                batch_size=self.batch_size,
+            )
 
         passage_to_entities: Dict[str, List[str]] = {
             h: [] for h in hash_id_to_passage
@@ -424,12 +478,28 @@ class GLiNERAdapter:
         if not question or not question.strip():
             return set()
         sents = split_sentences(question) or [question]
-        spans = self._model.inference(
-            sents,
-            self.labels,
-            threshold=self.threshold,
-            batch_size=self.batch_size,
+        needs_raw = (
+            (self.calibration_enabled and self.temperature != 1.0)
+            or bool(self.label_thresholds)
         )
+        if needs_raw:
+            calib_thr = (
+                self.threshold * self.temperature
+                if self.calibration_enabled and self.temperature != 1.0
+                else self.threshold
+            )
+            raw_spans = self._model.inference(
+                sents, self.labels, threshold=0.0, batch_size=self.batch_size,
+            )
+            spans = [
+                [sp for sp in ss
+                 if sp.get("score", 0.0) >= self.label_thresholds.get(sp.get("label", ""), calib_thr)]
+                for ss in raw_spans
+            ]
+        else:
+            spans = self._model.inference(
+                sents, self.labels, threshold=self.threshold, batch_size=self.batch_size,
+            )
         out: set = set()
         for sent_spans in spans:
             for span in sent_spans:

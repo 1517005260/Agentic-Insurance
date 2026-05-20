@@ -51,6 +51,30 @@ logger = logging.getLogger(__name__)
 
 _HAS_HAN_RE = regex.compile(r"\p{Han}")
 
+# Per-passage canonical-text cache. ``canonical_form`` (NFKC + OpenCC
+# t2s + lower) is invariant for a given passage hash, but
+# ``literal_backfill_graph`` re-canonicalises every passage in the
+# corpus on every ingest → O(N²) wall time (the data-confirmed
+# literal-backfill cost). Passage hashes are content-addressed, so a
+# process-lifetime memo keyed by (passage_hash, fold_traditional) is
+# safe and collapses the per-doc recompute to one-per-passage-ever.
+_PASSAGE_CANON_CACHE: Dict[Tuple[str, bool], str] = {}
+
+
+def _passage_canon(phash: str, ptext: str, fold_traditional: bool) -> str:
+    """Cached canonical passage text — byte-identical to what
+    :func:`find_literal_matches` computes internally for the same args."""
+    key = (phash, fold_traditional)
+    v = _PASSAGE_CANON_CACHE.get(key)
+    if v is None:
+        v = (
+            canonical_form(ptext, fold_traditional=fold_traditional)
+            if fold_traditional
+            else (ptext or "").lower()
+        )
+        _PASSAGE_CANON_CACHE[key] = v
+    return v
+
 
 def build_gazetteer_automaton(
     entity_surfaces_by_hash: Mapping[str, str],
@@ -97,6 +121,7 @@ def find_literal_matches(
     automaton: ahocorasick.Automaton,
     *,
     fold_traditional: bool = True,
+    precanonicalized: bool = False,
 ) -> Dict[str, int]:
     """Word-boundary substring matches → ``{entity_hash: mention_count}``.
 
@@ -112,8 +137,17 @@ def find_literal_matches(
     surfaces went through at ingest, so a Traditional-Chinese passage
     looks the same to the automaton as the Simplified entity surface
     it should match.
+
+    ``precanonicalized=True`` means ``text`` is already the exact
+    transform this function would otherwise apply — the caller has
+    cached it (passage canonical text is invariant once ingested, so
+    recomputing OpenCC/NFKC for every passage on every ingest is the
+    O(N²) literal-backfill cost). Byte-identical to the default path.
     """
-    text_l = canonical_form(text, fold_traditional=fold_traditional) if fold_traditional else text.lower()
+    if precanonicalized:
+        text_l = text
+    else:
+        text_l = canonical_form(text, fold_traditional=fold_traditional) if fold_traditional else text.lower()
     counts: Dict[str, int] = defaultdict(int)
     for end_idx, (hash_id, surf) in automaton.iter(text_l):
         start = end_idx - len(surf) + 1
@@ -178,8 +212,10 @@ def literal_backfill_graph(
         if phash not in name_to_vidx:
             continue
         pvidx = name_to_vidx[phash]
+        canon = _passage_canon(phash, ptext or "", fold_traditional)
         counts = find_literal_matches(
-            ptext or "", automaton, fold_traditional=fold_traditional
+            canon, automaton, fold_traditional=fold_traditional,
+            precanonicalized=True,
         )
         for ehash, count in counts.items():
             if ehash not in name_to_vidx:
