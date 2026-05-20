@@ -317,6 +317,9 @@ class GraphPPRChannel(BaseChannel):
                 batch_size=self.linear_config.gliner_batch_size,
                 max_span_chars=self.linear_config.ner_max_span_chars,
                 noise_labels=self.linear_config.gliner_noise_labels,
+                calibration_enabled=self.linear_config.gliner_calibration_enabled,
+                temperature=self.linear_config.gliner_temperature,
+                label_thresholds=self.linear_config.gliner_label_thresholds,
             )
         return self._ner
 
@@ -700,7 +703,19 @@ class GraphPPRChannel(BaseChannel):
             reverse_map = load_reverse_map(reverse_path)
             clusters = compute_clusters_for_collapse(self.graph, reverse_map)
         else:
-            clusters = get_clusters(self.graph, faiss_graph_dir() / "clusters.json")
+            clusters = get_clusters(
+                self.graph,
+                faiss_graph_dir() / "clusters.json",
+                algorithm=getattr(
+                    self.linear_config, "cluster_algorithm", "connected_components"
+                ),
+                leiden_resolution=getattr(
+                    self.linear_config, "cluster_leiden_resolution", 0.05
+                ),
+                leiden_weighted=getattr(
+                    self.linear_config, "cluster_leiden_weighted", True
+                ),
+            )
         return aggregate_by_cluster(scores_by_hash, clusters, op=op)
 
     # -------------------------------------------------- public — subgraph

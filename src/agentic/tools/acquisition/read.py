@@ -96,7 +96,12 @@ class ReadTool(BaseTool):
                         "unit_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Precise unit ids to read.",
+                            "description": (
+                                "Precise unit ids to read. Page ids are the "
+                                "canonical global form 'FILE_ID/PAGE_ID' "
+                                "(e.g. 'db_en_0579/p_0011'). The file→page "
+                                "separator is '/' — not '#'."
+                            ),
                         },
                         "file_ids": {
                             "type": "array",
@@ -143,7 +148,19 @@ class ReadTool(BaseTool):
             return _bad_arg(f"mode must be one of {sorted(_VALID_MODES)}")
 
         if unit_ids:
-            target_ids = [str(u).strip() for u in unit_ids if str(u).strip()]
+            target_ids = []
+            for u in unit_ids:
+                s = str(u).strip()
+                if not s:
+                    continue
+                # Defensive: some LLMs emit a markdown-anchor '#' where the
+                # canonical id uses '/' (e.g. 'db_en_0579#p_0011' instead of
+                # 'db_en_0579/p_0011'). Treat the first '#' as the file/page
+                # separator iff no '/' is present, preserving any legitimate
+                # passage/row '#suffix' on already-canonical ids.
+                if "/" not in s and "#" in s:
+                    s = s.replace("#", "/", 1)
+                target_ids.append(s)
         else:
             scope, scope_err = parse_scope(file_ids, page_range, section_ids, inventory=self.inventory)
             if scope_err is not None:

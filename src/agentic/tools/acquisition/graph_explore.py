@@ -988,7 +988,18 @@ class GraphExploreTool(BaseTool):
                     self._channel.graph, reverse_map
                 )
             else:
-                clusters = get_clusters(self._channel.graph, self._clusters_cache_path)
+                _lc = getattr(self._channel, "linear_config", None)
+                clusters = get_clusters(
+                    self._channel.graph,
+                    self._clusters_cache_path,
+                    algorithm=getattr(
+                        _lc, "cluster_algorithm", "connected_components"
+                    ),
+                    leiden_resolution=getattr(
+                        _lc, "cluster_leiden_resolution", 0.05
+                    ),
+                    leiden_weighted=getattr(_lc, "cluster_leiden_weighted", True),
+                )
         except Exception as exc:
             logger.warning("graph_explore: cluster cache load failed: %s", exc)
             clusters = []
