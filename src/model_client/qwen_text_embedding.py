@@ -29,6 +29,17 @@ from config.settings import EMBED_MODEL_ID, embed_model_dir
 from config.shared import shared_qwen_embedding
 
 
+# Qwen3-Embedding instruction-aware query prefix (registered in
+# ``config_sentence_transformers.json`` under prompts["query"]). Documents
+# are encoded with no prefix; queries get this exact string prepended with
+# no separator (model card convention, last-token pooling consumes the
+# trailing colon as part of the prompt).
+_QUERY_PROMPT = (
+    "Instruct: Given a web search query, retrieve relevant passages that "
+    "answer the query\nQuery:"
+)
+
+
 class QwenEmbeddingClient:
     """Last-token-pooled sentence embedder over a local Qwen3-Embedding.
 
@@ -56,8 +67,21 @@ class QwenEmbeddingClient:
         self._tokenizer, self._model = shared_qwen_embedding(resolved_dir)
 
     @torch.no_grad()
-    def encode(self, texts: Union[str, Sequence[str]]) -> np.ndarray:
+    def encode(
+        self,
+        texts: Union[str, Sequence[str]],
+        *,
+        is_query: bool = False,
+    ) -> np.ndarray:
         """Embed a string (1-D) or list of strings (2-D). L2-normalized.
+
+        ``is_query=True`` prepends Qwen3-Embedding's registered query
+        instruction so the resulting vectors live in the model's
+        query-side subspace (entity_store / passage_store vectors are
+        encoded with ``is_query=False`` at ingest time). Caller contract:
+        every natural-language user question goes through with
+        ``is_query=True``; entity-to-entity / doc-to-doc lookups stay
+        ``False``. Mismatch silently degrades top-K — see docs §11.
 
         Mirrors ``EmbeddingClient.encode`` byte-for-byte in shape and
         normalization so the two backends are interchangeable behind
@@ -68,6 +92,8 @@ class QwenEmbeddingClient:
             texts = [texts]
         else:
             texts = list(texts)
+        if is_query:
+            texts = [_QUERY_PROMPT + t for t in texts]
 
         device = self._model.device
         chunks = []

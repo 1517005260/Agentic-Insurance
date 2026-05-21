@@ -69,10 +69,16 @@ class SemanticChannel(BaseChannel):
         cfg = self.config
         topk = cfg.semantic_topk_per_subpath
 
+        # HyDE produces a *hypothetical answer document* (Gao et al. 2022);
+        # match it against real documents in doc-vs-doc mode. When HyDE is
+        # absent we fall back to the bare question, which IS a query and
+        # gets the query prompt.
+        hyde_text = ctx.hyde or ctx.query
+        hyde_is_query = not bool(ctx.hyde)
         with ThreadPoolExecutor(max_workers=3) as pool:
             fut_text_orig = pool.submit(self._text_dense, ctx.query, topk, ctx.file_ids)
             fut_text_hyde = pool.submit(
-                self._text_dense, ctx.hyde or ctx.query, topk, ctx.file_ids
+                self._text_dense, hyde_text, topk, ctx.file_ids, is_query=hyde_is_query
             )
             fut_vision = pool.submit(self._vision_dense, ctx.query, topk, ctx.file_ids)
 
@@ -90,11 +96,13 @@ class SemanticChannel(BaseChannel):
         query_text: str,
         top_k: int,
         file_ids: Optional[List[str]],
+        *,
+        is_query: bool = True,
     ) -> List[RawHit]:
         store = self.text_store
         if len(store) == 0 or not query_text.strip():
             return []
-        emb = self.embedding_client.encode(query_text)
+        emb = self.embedding_client.encode(query_text, is_query=is_query)
         # Pull a deeper top-k when post-filtering by file_ids so we still
         # have ``top_k`` rows after the filter — heuristic: 4×.
         depth = top_k * 4 if file_ids else top_k

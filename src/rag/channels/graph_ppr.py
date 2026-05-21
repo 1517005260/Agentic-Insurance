@@ -261,7 +261,7 @@ class GraphPPRChannel(BaseChannel):
                 return []
 
             self.last_debug["mode"] = "ppr"
-            question_emb = self.embedding_client.encode(question)
+            question_emb = self.embedding_client.encode(question, is_query=True)
             entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
             passage_weights = self._calculate_passage_scores(
                 question, question_emb, actived
@@ -418,7 +418,7 @@ class GraphPPRChannel(BaseChannel):
 
         # 2) Whole-question embedding ➜ entity-store top-K.
         try:
-            q_emb = self.embedding_client.encode(question)
+            q_emb = self.embedding_client.encode(question, is_query=True)
         except Exception as exc:
             logger.warning("graph_ppr: question embedding failed (%s); no fallback seeds", exc)
             return {}
@@ -757,7 +757,7 @@ class GraphPPRChannel(BaseChannel):
             if not seeds:
                 return {"mode": "no_seeds", "seeds": [], "actived_entities": {}, "passages": [], "cluster_scores": {}}
 
-            question_emb = self.embedding_client.encode(question)
+            question_emb = self.embedding_client.encode(question, is_query=True)
             entity_weights, actived = self._calculate_entity_scores(question_emb, seeds)
             passage_weights = self._calculate_passage_scores(
                 question, question_emb, actived

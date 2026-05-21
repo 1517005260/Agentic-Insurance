@@ -50,8 +50,22 @@ class EmbeddingClient:
             "embedding-default", lambda: make_retry_session()
         )
 
-    def encode(self, texts: Union[str, Sequence[str]]) -> np.ndarray:
-        """Embed a string (1-D) or list of strings (2-D). L2-normalized."""
+    def encode(
+        self,
+        texts: Union[str, Sequence[str]],
+        *,
+        is_query: bool = False,
+    ) -> np.ndarray:
+        """Embed a string (1-D) or list of strings (2-D). L2-normalized.
+
+        ``is_query`` is accepted for backend-parity with
+        :class:`QwenEmbeddingClient` but **ignored** by the HTTP path:
+        the OpenAI ``/embeddings`` schema has no instruction field, and
+        the only deployments that expose one (DashScope's ``input_type``
+        family) do so under non-standard keys we don't auto-detect.
+        Switch to ``EMBEDDING_BACKEND=local`` to get query-prefix
+        semantics on Qwen3-Embedding.
+        """
         single = isinstance(texts, str)
         if single:
             texts = [texts]

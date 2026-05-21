@@ -287,7 +287,11 @@ class GraphService:
             return []
         if len(self._channel.entity_store) == 0:
             return []
-        emb = self._channel.embedding_client.encode(q)
+        # `q` is an entity surface string ("Tesla", "Cinderella") for fuzzy
+        # entity lookup — doc-vs-doc similarity against the entity store,
+        # NOT a natural-language query. Encode in document mode so the
+        # vector lives in the same subspace as the stored entity vectors.
+        emb = self._channel.embedding_client.encode(q, is_query=False)
         cands: List[AliasCandidate] = gradient_topk_candidates(
             emb,
             self._channel.entity_store,

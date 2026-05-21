@@ -367,7 +367,7 @@ class SemanticSearchTool(BaseTool):
     ) -> List[Tuple[str, float]]:
         store = self.text_store
         with self._embedding_lock:
-            emb = self.embedding_client.encode(query)
+            emb = self.embedding_client.encode(query, is_query=True)
         # Sentence-level rows cluster heavily on a few pages; pull deeper
         # so per-page max-aggregation still surfaces ``top_k`` distinct
         # pages after filtering. 8x covers the worst page-density we've
