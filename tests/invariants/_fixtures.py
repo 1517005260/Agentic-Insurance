@@ -127,6 +127,14 @@ def build_synthetic_artifacts(tmp_path: Path) -> Dict[str, object]:
         },
     )
 
+    # EmbeddingStore.add() leaves the data in-memory only; the
+    # invariant tests downstream may construct a fresh store from the
+    # same on-disk directory and expect the seeded rows to be visible.
+    # Persist before handing the fixture out so the disk view matches
+    # the in-memory view.
+    entity_store.save()
+    passage_store.save()
+
     sentence_store = EmbeddingStore(faiss_dir / "sentence", namespace="sentence", dim=_EMBEDDING_DIM)
 
     graph = ig.Graph(directed=False)

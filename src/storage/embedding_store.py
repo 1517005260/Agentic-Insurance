@@ -113,6 +113,14 @@ class EmbeddingStore:
         # also bump _gen).
         self._gen = 0
         self._cache: Dict[str, tuple] = {}
+        # Dirty flag: True iff there are in-memory writes not yet persisted
+        # to disk. ``add()`` no longer saves implicitly (bulk-build writes
+        # were the dominant per-doc I/O cost: ~735 MB faiss+parquet rewrite
+        # per append × O(N) docs = O(N²) disk traffic). Caller is now
+        # responsible for calling ``save()`` on a cadence (the ingest
+        # builder's flush hook). Initially False — a freshly-loaded store
+        # is byte-identical to disk.
+        self._dirty: bool = False
 
         # Re-entrant lock so an ``add()``-from-tests / ``insert_text()``
         # call that internally walks the same store doesn't deadlock.
@@ -161,6 +169,11 @@ class EmbeddingStore:
                 ix.hnsw.efSearch = efs
                 ix.add(vecs)
                 self._index = ix
+                # Mark dirty so the next save() persists the HNSW form;
+                # otherwise the dirty-flag early-exit would swallow this
+                # one-time format migration and every process restart
+                # would re-pay the flat→HNSW rebuild.
+                self._dirty = True
                 logger.info(
                     "EmbeddingStore[%s]: migrated flat→HNSW in memory "
                     "(%d vecs, M=%d efSearch=%d)",
@@ -205,6 +218,8 @@ class EmbeddingStore:
         # writing the faiss index and writing meta would emit a
         # config.size that doesn't match.
         with self._lock:
+            if not self._dirty:
+                return
             if self._index is not None:
                 tmp = self._index_path().with_suffix(".faiss.tmp")
                 faiss.write_index(self._index, str(tmp))
@@ -223,6 +238,7 @@ class EmbeddingStore:
                 json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             cfg_tmp.replace(self._config_path())
+            self._dirty = False
 
     def reload_from_disk(self) -> None:
         """Re-read faiss / parquet / config from disk **into the same object**.
@@ -376,10 +392,13 @@ class EmbeddingStore:
                 # Pad missing columns on either side so concat doesn't drop info.
                 self._meta = pd.concat([self._meta, new_df], ignore_index=True, sort=False)
 
-            # ``save()`` re-acquires the same RLock — fine because it's
-            # re-entrant; we keep both inside one critical section so a
-            # concurrent reader can't observe half-written state.
-            self.save()
+            # In-memory only — caller persists via ``save()`` on a flush
+            # cadence. Implicit-save-on-add was the bulk-build I/O bug
+            # (full faiss+parquet rewrite per append = O(N²) disk traffic
+            # across a 650-doc build). Crash before the next flush loses
+            # the unsaved batch, which is acceptable for ingest (caller
+            # tracks doc-level progress separately).
+            self._dirty = True
             return kept_h
 
     def insert_text(
@@ -455,7 +474,11 @@ class EmbeddingStore:
             q = np.ascontiguousarray(q.astype(np.float32))
 
             scores, indices = self._index.search(q, min(k, self._index.ntotal))
-            hash_ids = self._meta["hash_id"].tolist()
+            # Use the generation-keyed memo (rebuilds only when _gen
+            # bumped by add()) instead of re-materializing the full
+            # hash_id list per call — at 174k rows × ~800 topk calls/doc
+            # that was the 8 s/doc fixed cost on a bulk build.
+            hash_ids = self.hash_ids
 
         # faiss search arrays are local; build the result outside the
         # lock so concurrent writers don't wait on Python list construction.

@@ -418,6 +418,10 @@ def _rebuild_store(store: EmbeddingStore, keep_mask) -> None:
         store._index = new_index
         store._meta = survivors_meta
         store._hash_id_to_idx = {h: i for i, h in enumerate(survivors_meta["hash_id"].tolist())}
+        # In-place mutation bypasses add() so we must mark dirty manually
+        # and bump _gen to invalidate the derived-view memo caches.
+        store._dirty = True
+        store._gen += 1
         store.save()
 
 

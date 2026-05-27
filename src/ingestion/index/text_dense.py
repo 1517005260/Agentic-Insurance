@@ -91,6 +91,11 @@ class TextDenseIndexBuilder(IndexBuilder):
             embeddings,
             extra_metadata={"page_id": new_page_ids, "file_id": new_file_ids},
         )
+        # EmbeddingStore.add() does not persist implicitly — saving per
+        # doc would dominate bulk-build I/O. This per-file builder
+        # flushes once at the end so the API contract
+        # "build returns ⇒ disk is up to date" holds for callers.
+        store.save()
 
         return IndexBuildResult(
             index_name=self.name,

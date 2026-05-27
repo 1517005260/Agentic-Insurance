@@ -700,6 +700,10 @@ def _add_probe_embedding_row(store_dir: Path, namespace: str, file_id: str) -> s
         np.asarray([_stable_unit_vector(f"{namespace}:{file_id}", dim)], dtype=np.float32),
         extra_metadata=extra,
     )
+    # add() leaves the store dirty in-memory only; the delete-probe path
+    # below opens a fresh EmbeddingStore that re-reads from disk, so we
+    # must persist before returning.
+    store.save()
     return hash_id
 
 
