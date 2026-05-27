@@ -112,6 +112,15 @@ class Plant:
                 "ScanClaim must be derived from a pattern_search observation.",
                 observation_type=parsed.get("observation_type"),
             )
+        if parsed.get("compact"):
+            return _envelope(
+                "scan_observation_compact",
+                "PatternScanObservation was emitted with compact=True; it omits "
+                "scanned_units / negative_units that the proof kernel needs to "
+                "verify scope coverage. Re-run pattern_search with compact=False "
+                "(the default) for any pattern_search call you intend to ingest "
+                "as a ScanClaim.",
+            )
         unit_type = parsed.get("unit_type")
         if unit_type not in {"page", "passage", "table_row"}:
             return _envelope("invalid_observation", "PatternScanObservation has no recognised unit_type.")
@@ -445,6 +454,15 @@ class Plant:
             return _envelope(
                 "unit_type_mismatch",
                 f"observation unit_type={parsed.get('unit_type')!r} differs from obligation {expected_unit_type!r}.",
+            )
+        if parsed.get("compact"):
+            return _envelope(
+                "scan_observation_compact",
+                "PatternScanObservation was emitted with compact=True; cannot "
+                "derive a WitnessClaim from it (scanned_units / negative_units "
+                "are needed to verify classification). Re-run pattern_search "
+                "with compact=False, or cite a `read` observation for the "
+                "WitnessClaim instead.",
             )
         scan_pattern = parsed.get("pattern", "")
         if predicate.canonical_id != predicate_canonical_id_for_pattern_search(scan_pattern):

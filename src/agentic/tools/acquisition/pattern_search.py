@@ -59,21 +59,18 @@ class PatternSearchTool(BaseTool):
             "function": {
                 "name": "pattern_search",
                 "description": (
-                    "Generic regex scan over a chosen unit type — useful "
-                    "for discovery (does this corpus mention X anywhere?). "
-                    "Exhaustive over the requested scope; every in-scope "
-                    "unit is classified positive (pattern matched ≥1 time) "
-                    "or negative.\n\n"
-                    "For closing set/count/forall/negation obligations, "
-                    "prefer `proof_scan(obligation_id=…)` instead — that "
-                    "guarantees the produced ScanClaim matches the "
-                    "obligation's predicate canonical_id and scope.\n\n"
-                    "Pattern is case-insensitive Unicode. Anchor with "
-                    "literal terms — bare `.+` / `.*` / `\\d+` will match "
-                    "almost every unit and waste budget.\n\n"
-                    "Scope: `file_ids` and `section_ids` (atom-grounded, "
-                    "match closure scope). Section ids come from `toc` "
-                    "and look like '<file_id>:sec_NNN'."
+                    "Exhaustive regex scan over a unit type (page / passage / "
+                    "table_row). Every in-scope unit is classified positive "
+                    "(matched ≥1 time) or negative. Case-insensitive Unicode. "
+                    "Anchor patterns on literal terms — bare `.+` / `\\d+` "
+                    "matches everything and wastes budget. Pass `compact=true` "
+                    "in agent loops to drop `scanned_units` / `negative_units` "
+                    "from the response (keep counts + positives only).\n"
+                    "Scope: `file_ids` and `section_ids` only (no page_range; "
+                    "section ids '<file_id>:sec_NNN' come from `toc`).\n"
+                    "For closing set / count / forall / negation obligations, "
+                    "prefer `proof_scan(obligation_id=…)` — it guarantees the "
+                    "ScanClaim matches the obligation's canonical_id and scope."
                 ),
                 "parameters": {
                     "type": "object",
@@ -101,6 +98,17 @@ class PatternSearchTool(BaseTool):
                                 "(e.g. '<file_id>:sec_003') from `toc`."
                             ),
                         },
+                        "compact": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": (
+                                "Drop scanned_units / negative_units from the "
+                                "response. Required for wide agent-loop scans "
+                                "(payload cut from O(scope) to O(positives)). "
+                                "Compact observations CANNOT be ingested as "
+                                "ScanClaim or scan-derived WitnessClaim."
+                            ),
+                        },
                     },
                     "required": ["pattern"],
                 },
@@ -114,6 +122,7 @@ class PatternSearchTool(BaseTool):
         unit_type: str = "page",
         file_ids: Optional[List[str]] = None,
         section_ids: Optional[List[str]] = None,
+        compact: bool = False,
     ):
         if not pattern or not str(pattern).strip():
             return err(
@@ -185,27 +194,39 @@ class PatternSearchTool(BaseTool):
             max(0, match_counts[u] - _MAX_CITATIONS_PER_UNIT) for u in positive
         )
 
+        compact = bool(compact)
+        payload = {
+            "pattern": pattern,
+            "scope": scope.as_dict(),
+            "exhaustive": True,
+            "index_completeness": "indexed_only",
+            "unit_type": unit_type,
+            "scanned_count": len(scanned),
+            "positive_count": len(positive),
+            "negative_count": len(negative),
+            "positive_units": positive,
+            "match_counts": match_counts,
+            "citations": citations,
+            "total_matches": total_matches,
+            "citations_truncated": truncated,
+            "compact": compact,
+        }
+        # Proof-kernel ingestion (closure.plant.ingest_scan_claim / scan-
+        # derived WitnessClaim) needs the full O(scope) lists to verify
+        # scanned == Inventory.units(scope, unit_type). Discovery /
+        # agent callers can opt out via compact=True to keep the
+        # message stack small.
+        if not compact:
+            payload["scanned_units"] = scanned
+            payload["negative_units"] = negative
+
         return (
-            ok(
-                "PatternScanObservation",
-                pattern=pattern,
-                scope=scope.as_dict(),
-                exhaustive=True,
-                index_completeness="indexed_only",
-                unit_type=unit_type,
-                scanned_count=len(scanned),
-                scanned_units=scanned,
-                positive_units=positive,
-                negative_units=negative,
-                match_counts=match_counts,
-                citations=citations,
-                total_matches=total_matches,
-                citations_truncated=truncated,
-            ),
+            ok("PatternScanObservation", **payload),
             {
                 "retrieved_tokens": 0,
                 f"positive_{unit_type}s": len(positive),
                 f"negative_{unit_type}s": len(negative),
+                "compact": compact,
             },
         )
 

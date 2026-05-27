@@ -1,6 +1,11 @@
 """Agent loop, tool registry, and proof-gate algorithms."""
 from agentic.agent.base import BaseAgent
-from agentic.agent.factory import build_default_agent, build_graph_agent, build_proof_agent
+from agentic.agent.factory import (
+    build_default_agent,
+    build_graph_agent,
+    build_proof_agent,
+    build_regex_agent,
+)
 from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from agentic.core.config import Config
 from agentic.core.context import AgentContext
@@ -14,6 +19,7 @@ __all__ = [
     "build_default_agent",
     "build_proof_agent",
     "build_graph_agent",
+    "build_regex_agent",
     "Config",
     "AgentContext",
     "BaseTool",

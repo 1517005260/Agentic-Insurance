@@ -26,6 +26,7 @@ from agentic.agent.base import BaseAgent
 from agentic.agent.prompts import (
     GRAPH_SYSTEM_PROMPT,
     PROOF_SYSTEM_PROMPT,
+    REGEX_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     WEB_AGENT_SYSTEM_PROMPT,
 )
@@ -256,6 +257,47 @@ def build_graph_agent(
         llm_client=llm_client,
         tools=registry,
         system_prompt=system_prompt or GRAPH_SYSTEM_PROMPT,
+        max_loops=max_loops,
+        max_token_budget=max_token_budget,
+        verbose=verbose,
+    )
+
+
+def build_regex_agent(
+    *,
+    llm_client: Optional[LLMClient] = None,
+    page_store: Optional[PageStore] = None,
+    inventory: Optional[InventoryStore] = None,
+    page_assets_dir: Optional[Path] = None,
+    system_prompt: Optional[str] = None,
+    max_loops: int = 14,
+    max_token_budget: int = 64_000,
+    verbose: bool = False,
+) -> BaseAgent:
+    """Build a BaseAgent that locates evidence by regex alone.
+
+    Tools registered: ``pattern_search`` (exhaustive regex scan over
+    pages / passages / table_rows) and ``read`` (full-text page reader).
+    No embedding retrieval, no graph navigation — the agent's only
+    locator is the regex it writes, so prompt-engineering quality of
+    those regexes is the dominant determinant of recall.
+
+    Defaults mirror :func:`build_graph_agent` (``max_loops=14``,
+    ``max_token_budget=64k``) so the comparison against the graph
+    baseline is at iso-budget.
+    """
+    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
+    inventory = inventory or InventoryStore(page_store=page_store)
+    llm_client = llm_client or LLMClient()
+
+    registry = ToolRegistry()
+    registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
+    registry.register(ReadTool(page_store=page_store, inventory=inventory))
+
+    return BaseAgent(
+        llm_client=llm_client,
+        tools=registry,
+        system_prompt=system_prompt or REGEX_SYSTEM_PROMPT,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,
