@@ -49,7 +49,7 @@ _RAG_DEFAULTS = RAGConfig()
 # Mirror the kwarg defaults from ``agentic.agent.factory``:
 # * ``build_default_agent``: max_loops=12, max_token_budget=128_000
 # * ``build_proof_agent``:   max_loops=16, max_token_budget=128_000
-# * ``build_graph_agent``:   max_loops=8,  max_token_budget=64_000
+# * ``build_graph_agent``:   max_loops=16, max_token_budget=64_000
 #
 # We use the factory defaults rather than the BaseAgent / ProofAgent
 # constructor defaults because the lifespan calls the factory, so the
@@ -58,7 +58,14 @@ _BASE_AGENT_DEFAULT_MAX_LOOPS = 12
 _BASE_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
 _PROOF_AGENT_DEFAULT_MAX_LOOPS = 16
 _PROOF_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
-_GRAPH_AGENT_DEFAULT_MAX_LOOPS = 8
+_GRAPH_AGENT_DEFAULT_MAX_LOOPS = 16
+# 64 k sized for large-context generators (Claude / GPT-5-class /
+# deepseek-v4-flash). When the deployment runs against a smaller-context
+# generator like vLLM-served Qwen3-8B (40960 context − 16384 reserved
+# output ≈ 24576 effective input), lower this to ~20 000 via admin
+# override. The tight prior default (20 000) was hitting a hard cap on
+# 38 % of wrong runs in 300 q × deepseek; bumping to 64 000 dropped that
+# to 3 % and lifted lenient-judge accuracy ~4 pp.
 _GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 64_000
 # The web agent has only two tools (web_search / web_fetch); each
 # search returns ~5 hits and each fetch returns up to 8 KB of cleaned
@@ -166,10 +173,16 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         key="agent.graph.max_token_budget",
         type="int",
         default=_GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET,
-        min=32_000,
+        min=12_000,
         max=128_000,
         group="agent.graph",
-        description="Token-budget force-final threshold for the graph agent.",
+        description=(
+            "Token-budget force-final threshold for the graph agent. "
+            "Default 64 000 sized for large-context generators. Lower "
+            "to ~20 000 when running against vLLM-served Qwen3-8B "
+            "(40960 context − 16384 reserved output ≈ 24576 effective "
+            "input − 4 k headroom)."
+        ),
     ),
     # ---------- prompt.* ----------
     ConfigEntry(
@@ -366,11 +379,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description=(
             "Per-label GLiNER score thresholds (label-conditional calibration). "
             "Overrides gliner_threshold for the named labels; unspecified labels "
-            "use gliner_threshold. Default {'concept': 0.5} was chosen by a "
-            "154-doc retrieval A/B (2026-05-18): concept@0.5 drops Recall@10 "
-            "only 0.78 pp (within ≤1 pp guardrail) while cutting concept "
-            "over-generation by 18 pp (50.3%→32.1%). Empty dict = inert "
-            "(all labels use gliner_threshold)."
+            "use gliner_threshold. The default {'concept': 0.5} tightens the "
+            "noisiest open-set slot — empirically trims ~18 pp of concept "
+            "over-generation with sub-1 pp page-recall loss vs the global "
+            "0.3 floor. Empty dict = inert (all labels use gliner_threshold)."
         ),
     ),
     ConfigEntry(

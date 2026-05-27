@@ -105,36 +105,180 @@ class BaseAgent:
         reason: str,
         session: Optional[TraceSession] = None,
     ) -> tuple:
+        # Force-final must succeed even when the in-loop chat call has
+        # been failing (vLLM input-cap rejections, model context overflow,
+        # etc).  Two safety nets:
+        #
+        # 1. Trim the transcript before the final call. Keep system +
+        #    original user query + the most recent tool round(s); drop
+        #    middle iterations whose evidence has already been
+        #    superseded.  This is the single biggest reliability fix —
+        #    the loop accumulates 25-200k tokens and the final call
+        #    needs to fit in the model context.
+        # 2. Use a tighter ``max_tokens`` for the final response so the
+        #    server has more input room.
+        trim_stats: Dict[str, int] = {}
+        trimmed = self._trim_messages_for_final(messages, trim_stats=trim_stats)
         force_prompt = (
-            "You have reached the limit. "
-            "You MUST now provide a final answer based on the information you have gathered so far. "
-            "Do NOT call any more tools. Synthesize the available information and respond directly."
+            "You have reached the budget limit. Stop calling tools.\n\n"
+            "Based ONLY on the tool results above, give your final answer "
+            "in 1-2 sentences (or a single named entity / number for "
+            "factoid questions). Quote the most specific span verbatim "
+            "where possible.\n\n"
+            "After your answer, output one final line exactly:\n"
+            "ANSWER: <shortest exact answer span verbatim, no extra words>\n\n"
+            "If the gathered evidence does not contain the answer, "
+            "write ANSWER: unanswerable."
         )
-        messages.append({"role": "user", "content": force_prompt})
+        trimmed.append({"role": "user", "content": force_prompt})
 
         try:
-            response = self.llm.chat(messages=messages, tools=None, temperature=0.0)
+            response = self.llm.chat(
+                messages=trimmed, tools=None, temperature=0.0,
+                # Tight cap — final answer is short and we need every
+                # token of input room we can get.
+                max_tokens=1024,
+            )
             total_cost += response["cost"]
             final_answer = response["message"].get("content", "")
             if session is not None:
-                session.event(
-                    "llm_calls",
-                    _llm_call_record(stage="force_final", response=response, reason=reason),
-                )
+                rec = _llm_call_record(stage="force_final", response=response, reason=reason)
+                if trim_stats:
+                    rec.update(trim_stats)
+                session.event("llm_calls", rec)
             if self.verbose:
                 print(f"Forced answer: {final_answer[:200]}...")
                 print(f"Total cost: ${total_cost:.6f}")
+                if trim_stats:
+                    print(f"  trim stats: {trim_stats}")
         except Exception as e:
             if self.verbose:
                 print(f"Error getting forced answer: {e}")
             final_answer = f"Error: {reason} and failed to generate final answer."
             if session is not None:
-                session.event(
-                    "llm_calls",
-                    {"stage": "force_final", "error": f"{type(e).__name__}: {e}", "reason": reason},
-                )
+                rec = {"stage": "force_final", "error": f"{type(e).__name__}: {e}", "reason": reason}
+                if trim_stats:
+                    rec.update(trim_stats)
+                session.event("llm_calls", rec)
 
         return final_answer, total_cost
+
+    def _trim_messages_for_final(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        target_tokens: int = 18_000,
+        per_msg_cap_chars: int = 4_000,
+        trim_stats: Optional[Dict[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Drop middle iterations so the final-call prompt fits in
+        context.  Returns a list that is always a VALID chat history
+        for OpenAI-style tool-calling servers — no orphan tool reply
+        (a ``role=tool`` message whose tool_call_id has no matching
+        assistant tool_calls) and no orphan tool_calls (an assistant
+        message with tool_calls but missing some of the tool replies
+        it referenced).
+
+        Strategy:
+          1. Group ``tail = messages[2:]`` into atomic
+             ``[assistant-with-tool_calls, role=tool, role=tool, ...]``
+             blocks.  Each block is dropped or kept WHOLE.
+          2. Drop oldest blocks first until under ``target_tokens``;
+             always keep the most recent block so the model still
+             sees evidence to answer from.
+          3. If still over budget after dropping all but the last
+             block, truncate that block's tool-message contents to
+             ``per_msg_cap_chars`` so a single huge tool result
+             doesn't blow the model's input limit.
+        """
+        if len(messages) <= 4:
+            return list(messages)
+        head = messages[:2]
+        sys_prompt = head[0].get("content", "") if head else ""
+
+        # Group tail into atomic blocks. A block starts at an assistant
+        # message that has tool_calls (or any assistant/user message
+        # without tool_calls = standalone block).
+        tail = messages[2:]
+        blocks: List[List[Dict[str, Any]]] = []
+        i = 0
+        while i < len(tail):
+            msg = tail[i]
+            role = msg.get("role")
+            tcs = msg.get("tool_calls") or []
+            if role == "assistant" and tcs:
+                # Pull in all tool replies for these tool_calls.
+                expected = {tc.get("id") for tc in tcs if tc.get("id")}
+                block = [msg]
+                j = i + 1
+                while j < len(tail) and tail[j].get("role") == "tool":
+                    block.append(tail[j])
+                    expected.discard(tail[j].get("tool_call_id"))
+                    j += 1
+                blocks.append(block)
+                i = j
+            else:
+                blocks.append([msg])
+                i += 1
+
+        # Drop oldest blocks until budget fits; keep at least one.
+        current = self._calculate_message_tokens(
+            head + [m for blk in blocks for m in blk], system_prompt=sys_prompt
+        )
+        blocks_dropped = 0
+        while current > target_tokens and len(blocks) > 1:
+            blocks.pop(0)
+            blocks_dropped += 1
+            current = self._calculate_message_tokens(
+                head + [m for blk in blocks for m in blk], system_prompt=sys_prompt
+            )
+
+        # Last-resort: still over budget? Cap each tool-message content
+        # in the surviving blocks to ``per_msg_cap_chars``. Assistant
+        # messages stay intact (they carry the reasoning + tool_call
+        # ids the server expects to validate).  Build fresh blocks so
+        # the original ``messages`` is never mutated — an in-place swap
+        # risks overwriting an assistant message with a capped tool
+        # reply when a block has interleaved roles.
+        tool_chars_capped = 0
+        if current > target_tokens:
+            capped_blocks: List[List[Dict[str, Any]]] = []
+            for blk in blocks:
+                new_blk: List[Dict[str, Any]] = []
+                for msg in blk:
+                    if msg.get("role") != "tool":
+                        new_blk.append(msg)
+                        continue
+                    c = msg.get("content") or ""
+                    if isinstance(c, str) and len(c) > per_msg_cap_chars:
+                        new_msg = dict(msg)
+                        new_msg["content"] = (
+                            c[:per_msg_cap_chars]
+                            + "\n…[truncated for final-answer call]"
+                        )
+                        tool_chars_capped += len(c) - per_msg_cap_chars
+                        new_blk.append(new_msg)
+                    else:
+                        new_blk.append(msg)
+                capped_blocks.append(new_blk)
+            blocks = capped_blocks
+
+        # Drop standalone ``role=tool`` blocks (orphan replies whose
+        # parent assistant message was trimmed): they would fail
+        # validation on most OpenAI-compatible servers.
+        orphan_tool_dropped = sum(
+            1 for blk in blocks
+            if len(blk) == 1 and blk[0].get("role") == "tool"
+        )
+        cleaned = [
+            blk for blk in blocks
+            if not (len(blk) == 1 and blk[0].get("role") == "tool")
+        ]
+        if trim_stats is not None:
+            trim_stats["force_final_trim_blocks_dropped"] = blocks_dropped
+            trim_stats["force_final_tool_chars_capped"] = tool_chars_capped
+            trim_stats["force_final_orphan_tool_dropped"] = orphan_tool_dropped
+        return head + [m for blk in cleaned for m in blk]
 
     def run(
         self,
@@ -194,6 +338,12 @@ class BaseAgent:
         input_tokens_total = 0
         output_tokens_total = 0
         loop_count = 0
+        # Tool-validation-error iterations are "free" — they don't count
+        # against the loop budget so the agent can self-correct (e.g.
+        # retry a read tool that rejected bare file_ids). Hard-capped so
+        # a persistent bad-arg pattern can't infinite-loop the agent.
+        MAX_VALIDATION_FREEBIES = 5
+        validation_error_freebies = 0
         tool_schemas = self.tools.get_all_schemas()
 
         if session is not None:
@@ -222,8 +372,18 @@ class BaseAgent:
         early_exit_reason: Optional[str] = None
         final_answer: str = ""
 
-        for loop_idx in range(effective_max_loops):
-            loop_count = loop_idx + 1
+        # While-loop (was for-loop) so tool-validation-error iterations
+        # can be "free" — loop_count only advances when the iteration
+        # actually used the LLM productively. raw_iter is the hard
+        # outer cap (effective_max_loops + MAX_VALIDATION_FREEBIES).
+        for raw_iter in range(effective_max_loops + MAX_VALIDATION_FREEBIES):
+            if loop_count >= effective_max_loops:
+                break  # exhausted the real loop budget
+            loop_count = loop_count + 1
+            # Per-iteration tool-log buffer: filled inside the tool_calls
+            # loop below; used at the end to decide whether to refund
+            # this loop_count (validation-error iterations only).
+            iter_tool_logs: List[Dict[str, Any]] = []
 
             # Cancellation gate. Polled at the loop boundary so the
             # in-flight tool-call / LLM round-trip is allowed to finish
@@ -271,13 +431,31 @@ class BaseAgent:
             try:
                 response = self.llm.chat(messages=messages, tools=tool_schemas)
             except Exception as e:
+                # The vLLM input cap (max_model_len − max_tokens) is the
+                # most common cause: a long tool result pushes the next
+                # request past the cap and the server 400s. Rather than
+                # returning empty (the historical bug — 263/1950 v6
+                # empties were from this path), fall through to
+                # ``_force_final_answer`` which trims the transcript and
+                # asks the model to answer from what's already in
+                # context. The original exception is preserved in the
+                # session log so the runner can still inspect it.
                 if self.verbose:
-                    print(f"LLM error: {e}")
+                    print(f"LLM error: {e}; forcing answer with truncated context...")
                 if session is not None:
                     session.event(
                         "llm_calls",
                         {"stage": "loop", "loop": loop_count, "error": f"{type(e).__name__}: {e}"},
                     )
+                emit(
+                    "status",
+                    {"phase": "force_final", "reason": "llm_error", "error": str(e)[:200]},
+                )
+                final_answer, total_cost = self._force_final_answer(
+                    messages, context, total_cost,
+                    f"LLM error: {type(e).__name__}; answer from context already gathered",
+                    session=session,
+                )
                 early_exit_reason = "llm_error"
                 break
 
@@ -368,6 +546,7 @@ class BaseAgent:
                     **tool_log,
                 }
                 trajectory.append(turn_record)
+                iter_tool_logs.append(tool_log)
                 if session is not None:
                     session.event("trajectory", turn_record)
                 emit(
@@ -388,6 +567,24 @@ class BaseAgent:
                         "_full_result": tool_result,
                     },
                 )
+
+            # End-of-iteration: refund this loop if every tool call
+            # failed input validation (the LLM gets a free retry to
+            # self-correct based on the error message in the tool
+            # result). Capped by MAX_VALIDATION_FREEBIES.
+            if (
+                iter_tool_logs
+                and validation_error_freebies < MAX_VALIDATION_FREEBIES
+                and all(t.get("error") == "invalid_argument" for t in iter_tool_logs)
+            ):
+                validation_error_freebies += 1
+                loop_count -= 1
+                if self.verbose:
+                    print(
+                        f"  [refund] all tools returned invalid_argument; "
+                        f"loop refunded (freebies used: "
+                        f"{validation_error_freebies}/{MAX_VALIDATION_FREEBIES})"
+                    )
 
         # Loop exited without natural break or early exit ⇒ max loops hit.
         if early_exit_reason is None:

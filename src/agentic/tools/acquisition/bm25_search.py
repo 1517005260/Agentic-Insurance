@@ -81,28 +81,17 @@ class Bm25SearchTool(BaseTool):
                 "name": "bm25_search",
                 "description": (
                     "Lexical (BM25) retrieval over page Markdown. Strongest "
-                    "for exact terms, numbers, codes, abbreviations, and "
-                    "proper nouns. Returns up to `top_k` page-level hits, "
-                    "each with `file_id`, `page_id`, `page_number`, "
-                    "`score`, and a short `snippet`.\n\n"
-                    "Snippets are ABBREVIATED. Call read_page on a hit "
-                    "before quoting from it.\n\n"
-                    "Scope (all three filters AND together):\n"
-                    "- `file_ids` absent -> corpus-wide; supplied -> file-scoped.\n"
-                    "- `page_range` absent -> all pages; [start, end] inclusive 1-based.\n"
-                    "- `section_ids` absent -> no section gate; supplied -> "
-                    "page must lie inside at least one of the listed sections "
-                    "(use toc to discover ids of the form '<file_id>:sec_NNN')."
+                    "for exact terms, numbers, codes, abbreviations, proper "
+                    "nouns. Returns up to `top_k` page hits with abbreviated "
+                    "snippets — `read` the page before quoting. Scope filters "
+                    "(`file_ids`, `page_range`, `section_ids`) intersect."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": (
-                                "Free-text query. Punctuation is stripped; "
-                                "feel free to drop quotes."
-                            ),
+                            "description": "Free-text query; punctuation stripped.",
                         },
                         "file_ids": {
                             "type": "array",

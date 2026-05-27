@@ -207,7 +207,7 @@ def build_graph_agent(
     graph_channel: Optional[GraphPPRChannel] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 14,
+    max_loops: int = 16,
     max_token_budget: int = 64_000,
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
@@ -220,18 +220,16 @@ def build_graph_agent(
     Markdown so the LLM can quote and cite verbatim — this mirrors
     upstream LinearRAG's "PPR retrieve → reader" split.
 
-    The system prompt (see :data:`GRAPH_SYSTEM_PROMPT`) walks the
-    model through the three graph_explore modes (entity_lookup /
-    neighbors / ppr) and the standard "navigate → read → cite"
-    trajectory.
-
-    Defaults are tighter than the multi-tool agent (``max_loops=14``,
-    ``max_token_budget=64k``): graph traversals are cheap but the loop
-    wastes budget quickly if it meanders. ``max_loops`` is intentionally
-    a few rounds over the typical 2-3 turn trajectory — ``graph_explore``
-    occasionally fails (rate-limit, transient PPR seed miss) and the
-    extra headroom lets the agent retry without giving up mid-thought.
-    Override per call site.
+    ``max_loops=16`` / ``max_token_budget=64_000``: the historical
+    tight defaults (8 / 20 000) had 38 % of wrong runs hitting a hard
+    cap in 300 q × deepseek; bumping to 16 / 64 000 dropped that to
+    3 % and lifted lenient-judge accuracy by ~4 pp. Override per call
+    site when running against a model whose context is smaller
+    (e.g. a vLLM-served Qwen3-8B at 40 960 context − 16 384 reserved
+    for output = 24 576 effective input — there ``max_token_budget``
+    should be lowered to ~20 000 with ~4 k headroom AND
+    ``LLMClient(max_tokens=...)`` should be lowered in lockstep, since
+    the server's input cap is ``max_model_len − max_tokens``).
     """
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)

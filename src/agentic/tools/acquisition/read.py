@@ -70,20 +70,14 @@ class ReadTool(BaseTool):
             "function": {
                 "name": "read",
                 "description": (
-                    "Read units of a chosen granularity from one file. "
-                    "Returns verbatim text in document order.\n\n"
-                    "Pick `unit_type` to match the obligation you intend "
-                    "to ingest a claim against:\n"
-                    "* page: full page markdown + table blocks + optional "
-                    "VLM. Each entry includes `children.passage_ids` and "
-                    "`children.table_row_ids` so you can drill in.\n"
-                    "* passage: paragraph-level atoms.\n"
-                    "* table_row: single table rows.\n\n"
-                    "Address units either by `unit_ids` (precise) OR by "
-                    "scope (`file_ids`, `section_ids`, `page_range`). "
-                    "Plant accepts WitnessClaim / ValueClaim only when "
-                    "the cited unit_id is in this observation's `units` "
-                    "AND the obligation's unit_type equals this read's."
+                    "Read units (pages / passages / table_rows) verbatim, in "
+                    "document order. You MUST provide one of:\n"
+                    "- `unit_ids=['file_id/p_NNNN', ...]` (precise — preferred), or\n"
+                    "- `file_ids=[...] + page_range=[start, end]` (inclusive range), or\n"
+                    "- `file_ids=[...] + section_ids=['<file_id>:sec_NNN']`.\n"
+                    "Bare `file_ids` is rejected (would overflow context). "
+                    "Pages include table blocks and `children.passage_ids` / "
+                    "`.table_row_ids` for drill-down."
                 ),
                 "parameters": {
                     "type": "object",
@@ -96,33 +90,28 @@ class ReadTool(BaseTool):
                         "unit_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": (
-                                "Precise unit ids to read. Page ids are the "
-                                "canonical global form 'FILE_ID/PAGE_ID' "
-                                "(e.g. 'db_en_0579/p_0011'). The file→page "
-                                "separator is '/' — not '#'."
-                            ),
+                            "description": "Precise unit ids; pages use 'FILE_ID/PAGE_ID' (separator '/', not '#').",
                         },
                         "file_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional file allow-list (only used when unit_ids omitted).",
+                            "description": "File allow-list (only when unit_ids omitted).",
                         },
                         "section_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Optional section allow-list.",
+                            "description": "Section allow-list ('<file_id>:sec_NNN' from `toc`).",
                         },
                         "page_range": {
                             "type": "array",
                             "items": {"type": "integer"},
-                            "description": "Optional [start, end] page-number filter.",
+                            "description": "Inclusive [start, end] page-number filter.",
                         },
                         "mode": {
                             "type": "string",
                             "enum": sorted(_VALID_MODES),
                             "default": "text",
-                            "description": "VLM extras (page only).",
+                            "description": "text | text_with_img (VLM read of rendered page image, page only).",
                         },
                     },
                     "required": [],
@@ -161,7 +150,25 @@ class ReadTool(BaseTool):
                 if "/" not in s and "#" in s:
                     s = s.replace("#", "/", 1)
                 target_ids.append(s)
+            if not target_ids:
+                return _bad_arg(
+                    "unit_ids was provided but every entry was empty after "
+                    "trimming. Pass at least one valid unit_id such as "
+                    "'db_en_X/p_0001'."
+                )
         else:
+            has_page_spec = (page_range is not None) or bool(section_ids)
+            if not has_page_spec:
+                return _bad_arg(
+                    "read requires a page-spec — bare file_ids is rejected "
+                    "(would dump entire documents and overflow the LLM "
+                    "context). Pass one of:\n"
+                    "  (a) unit_ids=['<file_id>/<page_id>', ...]  e.g. "
+                    "['db_en_0579/p_0001','db_en_0579/p_0003']\n"
+                    "  (b) file_ids=['<file_id>'] + page_range=[start, end]  "
+                    "(inclusive, e.g. page_range=[1,5])\n"
+                    "  (c) file_ids=['<file_id>'] + section_ids=['<sec>', ...]"
+                )
             scope, scope_err = parse_scope(file_ids, page_range, section_ids, inventory=self.inventory)
             if scope_err is not None:
                 return _bad_arg(scope_err)

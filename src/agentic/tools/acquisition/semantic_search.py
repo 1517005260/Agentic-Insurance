@@ -119,34 +119,22 @@ class SemanticSearchTool(BaseTool):
             "function": {
                 "name": "semantic_search",
                 "description": (
-                    "Dense retrieval with two parallel channels (text + "
-                    "vision) fused by reciprocal-rank. Use when keyword "
-                    "search misses or the literal phrasing is unknown.\n\n"
-                    "Query may be the original question OR a fact-rich "
-                    "hypothetical answer (HyDE-style). HyDE often beats "
-                    "the bare question because the corpus contains the "
-                    "answer's vocabulary, not the question's.\n\n"
-                    "Returns up to `top_k` page-level hits with `file_id`, "
-                    "`page_id`, `page_number`, `score` (RRF), per-channel "
-                    "scores when available, and a short `snippet`. "
-                    "Snippets are ABBREVIATED — call read_page before "
-                    "quoting.\n\n"
-                    "Scope: `file_ids`, `page_range`, and `section_ids` "
-                    "follow the same convention as bm25_search and "
-                    "compose as an intersection. Section ids come from "
-                    "`toc` and look like '<file_id>:sec_NNN'. Set "
-                    "`channels` to disable one channel (e.g. ['text'] "
-                    "for a text-only corpus)."
+                    "Dense retrieval — text + vision channels fused via "
+                    "reciprocal rank. Use when keyword search misses or "
+                    "the literal phrasing isn't in the corpus. A HyDE-"
+                    "style draft answer often beats the bare question. "
+                    "Returns up to `top_k` page hits with abbreviated "
+                    "snippets — `read` before quoting. Scope filters "
+                    "(`file_ids`, `page_range`, `section_ids`) intersect. "
+                    "`channels` disables one side (e.g. `['text']` for a "
+                    "text-only corpus)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": (
-                                "Natural-language query. A HyDE-style "
-                                "fact-rich draft answer often improves recall."
-                            ),
+                            "description": "Natural-language query; HyDE-style draft answers often improve recall.",
                         },
                         "file_ids": {
                             "type": "array",

@@ -275,16 +275,12 @@ class WebFetchTool(BaseTool):
             "function": {
                 "name": "web_fetch",
                 "description": (
-                    "GET an HTTP(S) URL and return cleaned plaintext.\n\n"
-                    "Use this AFTER `web_search` to read a candidate's "
-                    "full content for verbatim cite — the search "
-                    "snippet (~300 chars) is rarely enough.\n\n"
-                    "Result is HTML-stripped (script/style/head "
-                    f"removed), truncated to `max_chars` (default "
-                    f"{_DEFAULT_MAX_CHARS}, max {_MAX_CHARS_CAP}). "
-                    "Cannot read PDFs or JavaScript-rendered SPAs; if "
-                    "the result looks empty or boilerplate, try a "
-                    "different URL or fall back to the search snippet."
+                    "GET an HTTP(S) URL and return cleaned plaintext "
+                    f"(HTML stripped, truncated to `max_chars` ≤{_MAX_CHARS_CAP}, "
+                    f"default {_DEFAULT_MAX_CHARS}). Use after `web_search` "
+                    "to read a candidate's full content for verbatim cite. "
+                    "Cannot read PDFs or JS-rendered SPAs — fall back to "
+                    "the search snippet or try a different URL when empty."
                 ),
                 "parameters": {
                     "type": "object",
@@ -295,11 +291,7 @@ class WebFetchTool(BaseTool):
                         },
                         "max_chars": {
                             "type": "integer",
-                            "description": (
-                                f"Truncate to this many characters; "
-                                f"capped at {_MAX_CHARS_CAP}. Default "
-                                f"{_DEFAULT_MAX_CHARS}."
-                            ),
+                            "description": f"Truncate to N characters; default {_DEFAULT_MAX_CHARS}, max {_MAX_CHARS_CAP}.",
                         },
                     },
                     "required": ["url"],

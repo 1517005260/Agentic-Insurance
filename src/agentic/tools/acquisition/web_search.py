@@ -57,15 +57,12 @@ class WebSearchTool(BaseTool):
             "function": {
                 "name": "web_search",
                 "description": (
-                    "Search the public web via Tavily. Returns up to "
-                    "`max_results` ranked hits with title, URL, snippet "
-                    "(~300 chars), score, optional published_date.\n\n"
-                    "Workflow: call web_search to discover candidates, "
-                    "then call web_fetch on the URL whose snippet best "
-                    "addresses the query to read the full page before "
-                    "citing.\n\n"
-                    "This is the only way to bring information from "
-                    "outside the local corpus into the answer."
+                    "Public-web search via Tavily. Returns up to "
+                    "`max_results` ranked hits (title, URL, ~300-char "
+                    "snippet, score, optional published_date). Call "
+                    "`web_fetch` next on the most promising URL — the "
+                    "snippet alone is too short to cite. Only way to "
+                    "bring outside-corpus information into the answer."
                 ),
                 "parameters": {
                     "type": "object",
@@ -84,21 +81,12 @@ class WebSearchTool(BaseTool):
                         "search_depth": {
                             "type": "string",
                             "enum": ["basic", "advanced"],
-                            "description": (
-                                "`advanced` triggers a deeper crawl "
-                                "(slower, costs more credits). Default "
-                                "`basic`."
-                            ),
+                            "description": "`advanced` = deeper crawl (slower / more credits); default `basic`.",
                         },
                         "include_domains": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": (
-                                "Whitelist; only return hits from these "
-                                "domains. Use for jurisdiction-scoped "
-                                "compliance queries (e.g. ['ia.org.hk', "
-                                "'hkma.gov.hk'] for HK insurance regulation)."
-                            ),
+                            "description": "Whitelist domains (e.g. for jurisdiction-scoped compliance queries).",
                         },
                         "exclude_domains": {
                             "type": "array",

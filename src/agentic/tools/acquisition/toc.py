@@ -61,19 +61,13 @@ class TocTool(BaseTool):
             "function": {
                 "name": "toc",
                 "description": (
-                    "Return the section outline of one file, derived from "
-                    "the page Markdown's heading structure (`#`, `##`, "
-                    "...). Each section reports `section_id` (a stable id "
-                    "of the form '<file_id>:sec_NNN'), `title`, `depth`, "
-                    "`page_start`, `page_end`, and `parent_section_id`. "
-                    "Sections are listed in document order; nesting is "
-                    "implied by `depth` and confirmed by `parent_section_id`.\n\n"
-                    "Use this before searching inside a long file so you "
-                    "can pass either a tight `page_range` OR the section "
-                    "ids you care about as `section_ids` to retrieval tools.\n\n"
-                    "If the file has no Markdown headings (e.g. scanned-"
-                    "only PDFs) the result is empty — fall back to "
-                    "list_files / read_page in that case."
+                    "Section outline of one file from its Markdown headings. "
+                    "Each section: `section_id` ('<file_id>:sec_NNN'), title, "
+                    "depth, page_start, page_end, parent_section_id. Document "
+                    "order. Use before searching a long file so you can pass "
+                    "a tight `page_range` or `section_ids` to retrieval "
+                    "tools. Empty for scanned-only PDFs — fall back to "
+                    "`read` in that case."
                 ),
                 "parameters": {
                     "type": "object",
@@ -84,10 +78,7 @@ class TocTool(BaseTool):
                         },
                         "max_depth": {
                             "type": "integer",
-                            "description": (
-                                "Drop headings deeper than this. Default 3 "
-                                "(i.e. `#`, `##`, `###` are kept)."
-                            ),
+                            "description": "Drop headings deeper than this; default 3.",
                         },
                     },
                     "required": ["file_id"],

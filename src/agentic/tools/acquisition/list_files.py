@@ -49,17 +49,12 @@ class ListFilesTool(BaseTool):
             "function": {
                 "name": "list_files",
                 "description": (
-                    "List indexed files in the corpus. Returns one entry per "
-                    "file with file_id, original filename, page_count, "
-                    "parse_status, and upload_time (ISO 8601 UTC).\n\n"
-                    "Defaults to the 10 most recently uploaded files, ordered "
-                    "newest first. Use `recent_n` to widen or narrow the "
-                    "window, and `filename_regex` to filter by filename "
-                    "(Python regex, case-insensitive). When `filename_regex` "
-                    "is provided we filter the FULL corpus first and then "
-                    "take the most recent `recent_n` matches.\n\n"
-                    "This tool is read-only and cheap — call it whenever you "
-                    "are unsure which files exist."
+                    "List indexed files (file_id, filename, page_count, "
+                    "parse_status, upload_time). Defaults to the 10 most "
+                    "recent; `recent_n` widens. `filename_regex` (case-"
+                    "insensitive Python regex) filters the full corpus then "
+                    "keeps the most recent `recent_n` matches. Cheap; call "
+                    "whenever unsure which files exist."
                 ),
                 "parameters": {
                     "type": "object",
@@ -70,10 +65,7 @@ class ListFilesTool(BaseTool):
                         },
                         "filename_regex": {
                             "type": "string",
-                            "description": (
-                                "Optional Python regex matched against the "
-                                "original filename (case-insensitive)."
-                            ),
+                            "description": "Optional Python regex on filename (case-insensitive).",
                         },
                     },
                     "required": [],

@@ -124,30 +124,15 @@ class CodeRunTool(BaseTool):
                 "name": "code_run",
                 "description": (
                     "Execute Python in a fresh sandboxed subprocess for "
-                    "exact computation. Use this whenever arithmetic "
-                    "precision matters (multi-step money math, set ops, "
-                    "table aggregation) — do NOT do those in the chat.\n\n"
-                    "Inputs and contract:\n"
-                    "- `code`: a Python snippet. The variable `INPUTS` is "
-                    "pre-populated with the JSON you pass in `inputs`. "
-                    "Assign to a variable named `OUTPUT` to return a "
-                    "structured value: the runner JSON-serializes "
-                    "`OUTPUT` and surfaces it on the result's `output` "
-                    "field. If you do not set `OUTPUT`, `output` will "
-                    "be `null` and you should read `stdout` instead.\n"
-                    "- `inputs`: optional JSON-serializable dict.\n"
-                    "- `purpose`: one short sentence describing intent "
-                    "(logged for diagnostics; does not affect execution).\n\n"
-                    f"Documented imports: {', '.join(_DOCUMENTED_IMPORTS)} "
-                    "(stdlib + numpy + sympy). Other imports may be "
-                    "available but are unsupported.\n"
-                    "Isolation is light — fresh interpreter, stripped "
-                    "env, working directory in a private tempdir, "
-                    f"CPU {_DEFAULT_CPU_SECONDS}s, memory 1 GiB, wall "
-                    f"{_DEFAULT_WALL_SECONDS}s. Network and absolute-"
-                    "path filesystem access are NOT firewalled — do "
-                    "not rely on the tool to refuse them, just don't "
-                    "ask for them."
+                    "exact computation. Use whenever arithmetic precision "
+                    "matters (multi-step money math, set ops, table "
+                    "aggregation) — do NOT do those in chat.\n"
+                    "`code` may read `INPUTS` (your `inputs` dict, JSON-"
+                    "deserialized) and assign `OUTPUT` (JSON-serialized "
+                    "back to the response). Without OUTPUT, read stdout.\n"
+                    f"Available imports: {', '.join(_DOCUMENTED_IMPORTS)}. "
+                    f"Limits: CPU {_DEFAULT_CPU_SECONDS}s, wall "
+                    f"{_DEFAULT_WALL_SECONDS}s, memory ~2 GiB."
                 ),
                 "parameters": {
                     "type": "object",
@@ -158,10 +143,7 @@ class CodeRunTool(BaseTool):
                         },
                         "inputs": {
                             "type": "object",
-                            "description": (
-                                "JSON-serializable mapping; available as "
-                                "the variable `INPUTS` inside the snippet."
-                            ),
+                            "description": "JSON-serializable mapping; available as `INPUTS` inside the snippet.",
                         },
                         "purpose": {
                             "type": "string",
