@@ -100,6 +100,8 @@ class LinearRAG:
             calibration_enabled=self.config.gliner_calibration_enabled,
             temperature=self.config.gliner_temperature,
             label_thresholds=self.config.gliner_label_thresholds,
+            stopword_languages=self.config.gliner_stopword_languages,
+            stopword_confidence_floor=self.config.gliner_stopword_confidence_floor,
         )
 
         self._ner_results_path = faiss_graph_dir() / "ner_results.json"

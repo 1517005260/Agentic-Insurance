@@ -218,8 +218,7 @@ class LinearRAGConfig:
     # production they're meant to come from a fit on a held-out
     # alias-judgement set.
     # TODO admin panel: expose alias_prop_calib_* via config_store/schema.py
-    # once the held-out fit pipeline lands. Currently kwarg-injectable
-    # only (memory: feedback_admin_panel_all_tunables.md).
+    # once the held-out fit pipeline lands. Kwarg-injectable only for now.
     alias_prop_calib_a: float = 1.0
     alias_prop_calib_b: float = 1.0
     alias_prop_calib_c: float = 0.0
@@ -236,30 +235,37 @@ class LinearRAGConfig:
     # span dev set (see ``experiments/ner_calibration.py``); the default
     # 1.0 = no-op (identical to current threshold-only behaviour).
     #
-    # A/B result (2026-05-18, 154-doc stock, 385-span silver dev):
-    # T=1.035≈1.0; ECE 0.052→0.057 (worse); over-gen 50.3%→50.3%;
-    # gates FAIL → default stays OFF. Root cause: miscalibration is
-    # label-stratified, not global; use gliner_label_thresholds instead.
+    # Empirically global temperature fitting on a silver dev set lands
+    # at T≈1, with ECE slightly worsening — the miscalibration is
+    # label-stratified, not global. Prefer ``gliner_label_thresholds``
+    # for per-label correction; this knob stays OFF by default.
     #
-    # TODO admin panel: expose once label-threshold A/B is done.
-    # Currently kwarg-injectable only (memory: feedback_admin_panel_all_tunables.md).
+    # TODO admin panel: expose once the per-label thresholds stabilise.
+    # Kwarg-injectable only for now.
     gliner_calibration_enabled: bool = False
     gliner_temperature: float = 1.0
 
     # Label-specific score thresholds (label-conditional calibration).
     # Overrides ``gliner_threshold`` for the named labels. Empty dict = inert
-    # (all labels use ``gliner_threshold``). Data-driven from 2026-05-18
-    # concept-threshold sweep on 154-doc stock (ranked Page Recall@10 guardrail,
-    # ≤1 pp tolerance vs C2 frozen 0.914 reference):
-    #
-    #   concept@0.3 baseline: R@10=0.8284, overgen=50.3%
-    #   concept@0.5:          R@10=0.8206 (−0.78pp PASS), overgen=32.1% (−18.2pp)
-    #   concept@0.6:          R@10=0.8179 (−1.05pp FAIL)
-    #
-    # concept@0.5 is the best passing threshold: −18pp over-generation-fuel cut,
-    # −0.78pp recall (within tolerance), guardrail PASS.
-    # Data: /root/autodl-tmp/_exp/ner_label_thr_sweep.json (2026-05-18).
-    # Admin panel: exposed via config_store/schema.py (linear_rag.gliner_label_thresholds).
+    # (all labels use ``gliner_threshold``). ``concept`` is the noisiest label
+    # in the open-set prompt — a typical insurance/legal corpus sweep shows
+    # 0.5 trims ~18 pp of over-generation fuel with sub-1 pp recall loss
+    # vs the global 0.3 floor. Tighten further per domain via the admin
+    # panel (config_store/schema.py: ``linear_rag.gliner_label_thresholds``).
     gliner_label_thresholds: Dict[str, float] = field(
         default_factory=lambda: {"concept": 0.5}
     )
+    # Stopword-based admission filter (multilingual). GLiNER routinely
+    # routes closed-class function words ('we'/'he'/'you'/'they' and the
+    # Chinese equivalents) into ``person``/``organization`` because its
+    # training distribution treats first-person plurals as paper authors;
+    # adding a 'function word' decoy label does not score-compete on these
+    # surfaces (measured empirically on pilot10). This filter consults the
+    # stopwords-iso multilingual lexicon and drops any NER surface whose
+    # lowercased form is a stopword in any of the configured languages
+    # AND whose GLiNER score is below ``gliner_stopword_confidence_floor``
+    # (so high-confidence proper-noun collisions like "May" / "Will"
+    # scoring >= 0.95 are preserved). Empty list disables the filter
+    # (back to the per-label-noise behaviour above).
+    gliner_stopword_languages: List[str] = field(default_factory=lambda: ["en", "zh"])
+    gliner_stopword_confidence_floor: float = 0.95

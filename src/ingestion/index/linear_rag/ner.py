@@ -28,6 +28,7 @@ import regex
 
 from config.shared import shared_gliner
 from ingestion.index._sentence import split_sentences
+from ingestion.index.linear_rag.stopword_filter import StopwordFilter
 
 
 # ---------------------------------------------------------- input scrub
@@ -316,6 +317,8 @@ class GLiNERAdapter:
         calibration_enabled: bool = False,
         temperature: float = 1.0,
         label_thresholds: Optional[Dict[str, float]] = None,
+        stopword_languages: Optional[Sequence[str]] = None,
+        stopword_confidence_floor: float = 0.95,
     ):
         # Pulled from the process-wide cache so ingest workers and the
         # lifespan-pinned PPR channel share a single resident copy of
@@ -341,10 +344,20 @@ class GLiNERAdapter:
         self.temperature: float = float(temperature) if temperature > 0 else 1.0
         # Label-conditional thresholds. When non-empty, each label's floor
         # is overridden independently; unspecified labels use self.threshold.
-        # Data-driven from 2026-05-18 calibration experiment: 'concept'
-        # emits 88% noise at score 0.3 on open-domain ML text, needs ≥0.6
-        # for 79% precision. Empty dict = inert (no change from baseline).
+        # Calibration is label-stratified: the open-set ``concept`` slot
+        # in particular fires on a lot of generic noun phrases and needs
+        # a tighter floor than the global default to keep precision up.
+        # Empty dict = inert (no change from the global threshold).
         self.label_thresholds: Dict[str, float] = dict(label_thresholds) if label_thresholds else {}
+        # Multilingual stopword admission filter — drops NER surfaces
+        # whose lowercased form is a closed-class function word in any
+        # configured language and whose GLiNER score is below the
+        # confidence floor. See ``stopword_filter.StopwordFilter`` for
+        # the rule and the rationale.
+        self._stopword_filter = StopwordFilter(
+            languages=stopword_languages,
+            confidence_floor=stopword_confidence_floor,
+        )
 
     # ----------------------------------------------- batch passage NER ----
 
@@ -369,7 +382,7 @@ class GLiNERAdapter:
         # Build a flat list of (passage_hash, sentence_text) pairs so we
         # can run one big batched forward and re-associate at the end.
         # Empty passages are kept as keys so the caller's diff logic
-        # (load_existing_data → new_passage_hash_ids) stays consistent.
+        # (set(passage_hash_ids) - cached) stays consistent.
         # ``preclean_for_ner`` strips HTML / table / LaTeX markup BEFORE
         # sentence splitting so each table row reads as one sentence —
         # the shape GLiNER's mT5 backbone handles best.
@@ -388,11 +401,10 @@ class GLiNERAdapter:
         all_sentences = [s for _, s in sentence_index]
         # GLiNER ``inference`` returns a list-of-lists of
         # ``{text, label, score, start, end}`` dicts, parallel to
-        # inputs. Pass ``batch_size`` so multi-sentence forward
-        # passes get folded into GPU-batched matmuls instead of one
-        # forward per sentence (the deprecated
-        # ``batch_predict_entities`` did this implicitly; the new
-        # ``inference`` API requires the explicit knob).
+        # inputs. Passing ``batch_size`` explicitly folds the
+        # per-sentence forwards into GPU-batched matmuls; the
+        # ``inference`` entrypoint will otherwise default to one
+        # forward per sentence and tank GPU utilisation.
         #
         # When confidence calibration is enabled, we run at threshold=0
         # to get all raw scores, then apply the calibrated effective
@@ -419,6 +431,7 @@ class GLiNERAdapter:
                 self.labels,
                 threshold=0.0,
                 batch_size=self.batch_size,
+                flat_ner=True,
             )
             # Per-span threshold: label_thresholds[label] if present,
             # else calib_thr (which equals self.threshold when T=1).
@@ -436,6 +449,7 @@ class GLiNERAdapter:
                 self.labels,
                 threshold=self.threshold,
                 batch_size=self.batch_size,
+                flat_ner=True,
             )
 
         passage_to_entities: Dict[str, List[str]] = {
@@ -455,6 +469,8 @@ class GLiNERAdapter:
                 if not raw:
                     continue
                 if is_misbound_span(raw, self.max_span_chars):
+                    continue
+                if self._stopword_filter.is_blocked(raw, span.get("score", 0.0)):
                     continue
                 for piece in split_catalog_mentions(raw):
                     if piece not in sentence_seen[sent_text]:
@@ -489,7 +505,7 @@ class GLiNERAdapter:
                 else self.threshold
             )
             raw_spans = self._model.inference(
-                sents, self.labels, threshold=0.0, batch_size=self.batch_size,
+                sents, self.labels, threshold=0.0, batch_size=self.batch_size, flat_ner=True,
             )
             spans = [
                 [sp for sp in ss
@@ -498,7 +514,7 @@ class GLiNERAdapter:
             ]
         else:
             spans = self._model.inference(
-                sents, self.labels, threshold=self.threshold, batch_size=self.batch_size,
+                sents, self.labels, threshold=self.threshold, batch_size=self.batch_size, flat_ner=True,
             )
         out: set = set()
         for sent_spans in spans:
@@ -507,6 +523,8 @@ class GLiNERAdapter:
                     continue
                 raw = (span.get("text") or "").strip()
                 if not raw or is_misbound_span(raw, self.max_span_chars):
+                    continue
+                if self._stopword_filter.is_blocked(raw, span.get("score", 0.0)):
                     continue
                 out.add(raw.lower())
         return out
