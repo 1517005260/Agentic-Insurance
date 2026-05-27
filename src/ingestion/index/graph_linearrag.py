@@ -100,8 +100,14 @@ class GraphIndexBuilder(IndexBuilder):
         )
 
     def flush(self) -> None:
-        """Force-persist the reused graph (bulk driver: call at the end
-        and before any checkpoint that reads the on-disk graphml). No-op
-        unless ``reuse_graph`` and a graph has been built."""
+        """Force-persist the reused graph + all deferred writes.
+
+        Bulk driver: call at the end and before any checkpoint that
+        reads the on-disk graphml / faiss / parquet artifacts. No-op
+        unless ``reuse_graph`` and a graph has been built.
+
+        Drains the cadence-deferred work (3 embedding stores, NER JSON,
+        literal backfill, graphml) via ``LinearRAG.flush_all``.
+        """
         if self._lr is not None:
-            self._lr.flush_graphml()
+            self._lr.flush_all()

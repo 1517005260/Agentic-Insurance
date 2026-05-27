@@ -511,6 +511,19 @@ def parse_and_index_many(
                 ),
             )
 
+    # Drain any builder-side deferred state. Builders with cadence-
+    # based persistence (GraphIndexBuilder + reuse_graph=True) require
+    # a final flush() or the last <cadence docs' graph/store/NER state
+    # never lands on disk. Builders without a flush method (text_dense,
+    # vision_dense, bm25) are no-ops here since they persist per call.
+    for builder in builder_list:
+        flush = getattr(builder, "flush", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                logger.exception("builder.flush() FAILED for %s", type(builder).__name__)
+
     n_ok = sum(1 for r in results.values() if r.ok)
     logger.info(
         "parse_and_index_many done: %d/%d files OK in %.1fs",

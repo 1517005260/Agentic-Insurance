@@ -29,7 +29,7 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, List, Optional, Set
+from typing import List, Optional, Set
 
 import igraph as ig
 
@@ -127,6 +127,41 @@ class LinearRAG:
         # (de)serialisation is amortised instead of paid every doc.
         self._index_calls = 0
 
+        # NER cache held in memory across index() calls. On __init__ we
+        # load any prior on-disk cache once; on every subsequent doc we
+        # only mutate the in-memory dicts (normalize the delta, merge,
+        # update the mention reverse index). save_ner_results runs only
+        # on the flush cadence (alongside graphml). This eliminates the
+        # per-doc 38 MB JSON write and the O(N) re-normalisation /
+        # re-load of already-processed entries that was the dominant
+        # per-doc cost in the bulk-build profile.
+        (
+            self._passage_to_entities,
+            self._sentence_to_entities,
+        ) = self._load_ner_cache_or_empty()
+        self._mentions_cache: dict[str, list[str]] = {}
+        self._mention_seen: dict[str, set[str]] = {}
+        self._rebuild_mention_index(self._sentence_to_entities)
+
+        # Dirty flags for deferred persistence + literal backfill.
+        # _ner_dirty: ner_results.json has unflushed mutations.
+        # _backfill_pending_new_entities / _backfill_pending_new_passages:
+        # entities / passages added since the last backfill run. The
+        # literal-backfill pass at flush time only needs to scan
+        # (new_passages × all_entities ∪ all_passages × new_entities) to
+        # be complete — old × old pairs were processed by a prior flush.
+        self._ner_dirty = False
+        self._backfill_pending_new_entities: Set[str] = set()
+        self._backfill_pending_new_passages: Set[str] = set()
+
+        # Cached cluster_shape returned from the most recent on-cadence
+        # compute. Off-cadence index() calls reuse this snapshot instead
+        # of re-running compute_clusters (which is O(E_alias) even for
+        # the connected_components partitioner, and Leiden is much
+        # heavier). It is a derived, monitoring-only view so being a few
+        # docs stale is acceptable.
+        self._cached_cluster_shape: Optional[dict] = None
+
     def flush_graphml(self) -> None:
         """Atomically persist the graph to graphml (tmp + os.replace).
 
@@ -141,6 +176,119 @@ class LinearRAG:
         self.graph.write_graphml(str(tmp))
         os.replace(tmp, self._graphml_path)
 
+    def flush_all(self) -> int:
+        """Run all deferred persistence + literal backfill, then graphml.
+
+        The single sync point that drains everything index() defers:
+
+        1. Three faiss/parquet stores — save() is a no-op when not
+           dirty so the per-file API path (graphml_flush_every=1, fresh
+           store per call) is unaffected and a bulk path with cadence>1
+           amortises one full ~735 MB rewrite across many docs.
+        2. NER results JSON — same dirty-flag short-circuit.
+        3. Literal-substring backfill over only the pending delta
+           (new_passages × all_entities ∪ all_passages × new_entities).
+           Old × old pairs were covered by a prior flush so this is a
+           complete cover — see backfill.py for the safety argument.
+        4. graphml.
+
+        Returns the number of backfill edges added (callers that want
+        per-flush accounting can log this).
+        """
+        self.passage_embedding_store.save()
+        self.sentence_embedding_store.save()
+        self.entity_embedding_store.save()
+        if self._ner_dirty:
+            self._save_ner_results()
+
+        added_backfill_edges = 0
+        if self.config.literal_backfill_enabled and (
+            self._backfill_pending_new_passages
+            or self._backfill_pending_new_entities
+        ):
+            added_backfill_edges = self._run_pending_backfill()
+
+        # Refresh cluster_shape against the post-backfill graph so the
+        # final-flush monitoring snapshot is current rather than carrying
+        # whatever stale value the cadenced index() loop happened to
+        # leave behind. Cheap path (cheap=True) — same as the per-doc
+        # cluster_shape computation.
+        is_collapse = self.config.acceptance_handler != ACCEPTANCE_HANDLER_OVERLAY
+        if is_collapse:
+            partition = compute_clusters_for_collapse(self.graph, self._reverse_map)
+        else:
+            partition = compute_clusters(
+                self.graph,
+                algorithm=self.config.cluster_algorithm,
+                leiden_resolution=self.config.cluster_leiden_resolution,
+                leiden_weighted=self.config.cluster_leiden_weighted,
+            )
+        self._cached_cluster_shape = cluster_shape_metrics(
+            self.graph,
+            partition,
+            entity_store=self.entity_embedding_store,
+            is_collapse=is_collapse,
+            cheap=True,
+        )
+
+        self.flush_graphml()
+        return added_backfill_edges
+
+    def _run_pending_backfill(self) -> int:
+        """Run literal_backfill restricted to the pending delta.
+
+        Two passes cover every new (entity, passage) pair without
+        re-scanning old × old (which a previous flush handled):
+
+        * pass A: gazetteer = ALL entities, target = pending NEW passages
+        * pass B: gazetteer = pending NEW entities, target = ALL passages
+
+        Pairs in (NEW × NEW) are touched twice but the backfill function
+        dedups against the existing edge set, so the second hit is a
+        cheap skip. Pending sets are cleared on success.
+        """
+        from ingestion.index.linear_rag.backfill import literal_backfill_graph
+
+        all_entities = self.entity_embedding_store.hash_id_to_text
+        all_passages = self.passage_embedding_store.hash_id_to_text
+        cfg = self.config
+
+        added = 0
+
+        if self._backfill_pending_new_passages:
+            new_passage_text = {
+                h: all_passages[h]
+                for h in self._backfill_pending_new_passages
+                if h in all_passages
+            }
+            added += literal_backfill_graph(
+                self.graph,
+                all_entities,
+                new_passage_text,
+                min_surface_chars=cfg.literal_backfill_min_chars,
+                multi_word_only=cfg.literal_backfill_multi_word_only,
+                fold_traditional=cfg.fold_traditional,
+            )
+
+        if self._backfill_pending_new_entities:
+            new_entity_surfaces = {
+                h: all_entities[h]
+                for h in self._backfill_pending_new_entities
+                if h in all_entities
+            }
+            added += literal_backfill_graph(
+                self.graph,
+                new_entity_surfaces,
+                all_passages,
+                min_surface_chars=cfg.literal_backfill_min_chars,
+                multi_word_only=cfg.literal_backfill_multi_word_only,
+                fold_traditional=cfg.fold_traditional,
+            )
+
+        self._backfill_pending_new_passages.clear()
+        self._backfill_pending_new_entities.clear()
+        return added
+
     # ---------------------------------------------------------- NER caching
 
     # Schema version for ``ner_results.json``. Bump when the surface
@@ -152,75 +300,80 @@ class LinearRAG:
     # a clean rebuild on every schema change.
     NER_CACHE_VERSION = 5
 
-    def load_existing_data(self, passage_hash_ids: Iterable[str]):
-        if self._ner_results_path.exists():
-            try:
-                existing = json.loads(
-                    self._ner_results_path.read_text(encoding="utf-8")
-                )
-            except Exception:
-                existing = None
-            cached_version = (
-                existing.get("version") if isinstance(existing, dict) else None
-            )
-            if (
-                isinstance(existing, dict)
-                and cached_version == self.NER_CACHE_VERSION
-                and "passage_hash_id_to_entities" in existing
-            ):
-                existing_passage_hash_id_to_entities = existing[
-                    "passage_hash_id_to_entities"
-                ]
-                existing_sentence_to_entities = existing.get(
-                    "sentence_to_entities", {}
-                )
-                existing_passage_hash_ids = set(
-                    existing_passage_hash_id_to_entities.keys()
-                )
-                new_passage_hash_ids = (
-                    set(passage_hash_ids) - existing_passage_hash_ids
-                )
-                return (
-                    existing_passage_hash_id_to_entities,
-                    existing_sentence_to_entities,
-                    new_passage_hash_ids,
-                )
-            # Cache version mismatch (missing or older) — drop the
-            # cached entities and re-run every passage through the
-            # current NER pipeline. Otherwise stale composite spans
-            # would survive forever.
+    def _load_ner_cache_or_empty(self) -> tuple[dict, dict]:
+        """Load (passage_to_entities, sentence_to_entities) from disk once.
+
+        Returns empty dicts on missing file, parse error, or schema
+        version mismatch. A version mismatch silently drops the cache
+        so every passage re-runs through the current NER pipeline on
+        the first index() call (which sees its hash absent from the
+        in-memory dict and therefore "new"); otherwise stale composite
+        spans would survive forever.
+        """
+        if not self._ner_results_path.exists():
+            return {}, {}
+        try:
+            payload = json.loads(self._ner_results_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}, {}
+        if not isinstance(payload, dict):
+            return {}, {}
+        if payload.get("version") != self.NER_CACHE_VERSION:
             logger.info(
                 "ner_results.json schema mismatch (cached=%s, current=%s); "
-                "re-running NER on all passages",
-                cached_version,
+                "treating cache as empty — every passage will re-run NER",
+                payload.get("version"),
                 self.NER_CACHE_VERSION,
             )
-        return {}, {}, set(passage_hash_ids)
+            return {}, {}
+        return (
+            payload.get("passage_hash_id_to_entities", {}) or {},
+            payload.get("sentence_to_entities", {}) or {},
+        )
 
-    def save_ner_results(self, passage_to_entities, sentence_to_entities):
+    def _save_ner_results(self) -> None:
+        """Persist the in-memory NER cache to disk. Caller must check
+        ``self._ner_dirty`` to avoid no-op writes."""
         self._ner_results_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ner_results_path.write_text(
+        tmp = self._ner_results_path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(
                 {
                     "version": self.NER_CACHE_VERSION,
-                    "passage_hash_id_to_entities": passage_to_entities,
-                    "sentence_to_entities": sentence_to_entities,
+                    "passage_hash_id_to_entities": self._passage_to_entities,
+                    "sentence_to_entities": self._sentence_to_entities,
                 },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
         )
+        os.replace(tmp, self._ner_results_path)
+        self._ner_dirty = False
 
-    @staticmethod
-    def merge_ner_results(
-        existing_passage_to_entities,
-        existing_sentence_to_entities,
-        new_passage_to_entities,
-        new_sentence_to_entities,
-    ):
-        existing_passage_to_entities.update(new_passage_to_entities)
-        existing_sentence_to_entities.update(new_sentence_to_entities)
-        return existing_passage_to_entities, existing_sentence_to_entities
+    def _rebuild_mention_index(self, sentence_to_entities) -> None:
+        """Populate ``_mentions_cache`` (entity → unique mention sentences)
+        from a sentence→entities dict, in O(Σ|entities_per_sentence|).
+
+        Called once on __init__ to warm the cache from disk, then never
+        again — subsequent updates use ``_update_mention_index`` on the
+        per-doc delta only.
+        """
+        for sent, ents in sentence_to_entities.items():
+            for ent in ents:
+                seen = self._mention_seen.setdefault(ent, set())
+                if sent not in seen:
+                    seen.add(sent)
+                    self._mentions_cache.setdefault(ent, []).append(sent)
+
+    def _update_mention_index(self, new_sentence_to_entities) -> None:
+        """Append per-doc new sentence→entity links into the cached
+        mention reverse index, deduping per entity."""
+        for sent, ents in new_sentence_to_entities.items():
+            for ent in ents:
+                seen = self._mention_seen.setdefault(ent, set())
+                if sent not in seen:
+                    seen.add(sent)
+                    self._mentions_cache.setdefault(ent, []).append(sent)
 
     # --------------------------------------------------------------- index
 
@@ -267,50 +420,57 @@ class LinearRAG:
         new_passage_hash_set: Set[str] = set(added_passage_hashes)
         hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
 
-        # 2. NER on the diff against the existing cache.
-        (
-            existing_passage_to_entities,
-            existing_sentence_to_entities,
-            new_passage_hash_ids,
-        ) = self.load_existing_data(hash_id_to_passage.keys())
+        # 2. NER on the diff against the in-memory cache. The cache is
+        #    loaded once in __init__ and persisted on flush cadence; per-
+        #    doc reads are O(1) attribute access.
+        new_passage_hash_ids = (
+            set(hash_id_to_passage.keys()) - set(self._passage_to_entities.keys())
+        )
 
         if new_passage_hash_ids:
             new_hash_id_to_passage = {h: hash_id_to_passage[h] for h in new_passage_hash_ids}
             new_passage_to_entities, new_sentence_to_entities = self.ner.batch_ner(
                 new_hash_id_to_passage, self.config.max_workers
             )
-            self.merge_ner_results(
-                existing_passage_to_entities,
-                existing_sentence_to_entities,
+            # 2b. Post-NER cleanup, applied ONLY to the per-doc delta.
+            #     Each entity surface goes through cleanup → junk filter
+            #     → canonical form (LaTeX wrappers, pure numerics, etc.
+            #     dropped; survivors collapsed to a language-aware
+            #     canonical key). Previously this was run over the full
+            #     accumulated state every doc — pure waste, since cached
+            #     entries were normalised when they were the delta on
+            #     their own ingest call (version-bump forces a full
+            #     rebuild via _load_ner_cache_or_empty when the
+            #     normalisation rules change).
+            new_passage_to_entities_norm = self._normalize_entity_surfaces(
                 new_passage_to_entities,
-                new_sentence_to_entities,
+                fold_traditional=self.config.fold_traditional,
+                han_fragment_max_chars=self.config.junk_max_han_chars,
             )
-
-        # 2b. Post-NER cleanup. Each entity surface goes through
-        #     cleanup → junk filter → canonical form. Junk surfaces (LaTeX
-        #     wrappers, pure numerics, percentages, durations, currency
-        #     amounts, HTML fragments) are dropped; survivors get a
-        #     language-aware canonical key so case / article / 繁体 / NFKC
-        #     variants collapse to one entity.
-        existing_passage_to_entities = self._normalize_entity_surfaces(
-            existing_passage_to_entities,
-            fold_traditional=self.config.fold_traditional,
-            han_fragment_max_chars=self.config.junk_max_han_chars,
-        )
-        existing_sentence_to_entities = self._normalize_entity_surfaces(
-            existing_sentence_to_entities,
-            fold_traditional=self.config.fold_traditional,
-            han_fragment_max_chars=self.config.junk_max_han_chars,
-        )
-
-        self.save_ner_results(existing_passage_to_entities, existing_sentence_to_entities)
+            new_sentence_to_entities = self._normalize_entity_surfaces(
+                new_sentence_to_entities,
+                fold_traditional=self.config.fold_traditional,
+                han_fragment_max_chars=self.config.junk_max_han_chars,
+            )
+            # Record EVERY processed passage hash, including those whose
+            # NER produced no entities (or whose entities were all
+            # dropped by the junk filter / normalization). Without this,
+            # the next index() call's diff
+            # ``set(hash_ids) - self._passage_to_entities.keys()`` would
+            # re-flag empty-result passages as "new" and pay the full
+            # GLiNER cost again every doc.
+            for h in new_passage_hash_ids:
+                self._passage_to_entities[h] = new_passage_to_entities_norm.get(h, [])
+            self._sentence_to_entities.update(new_sentence_to_entities)
+            self._update_mention_index(new_sentence_to_entities)
+            self._ner_dirty = True
 
         # 3. Materialize node sets and per-passage entity lists from full state.
         (
             entity_nodes,
             sentence_nodes,
             passage_hash_id_to_entities,
-        ) = self._extract_nodes(existing_passage_to_entities, existing_sentence_to_entities)
+        ) = self._extract_nodes(self._passage_to_entities, self._sentence_to_entities)
 
         # 4. Embed sentences and entities (hash dedup → only new ones embedded).
         added_sentence_hashes = self._insert_with_dedup(
@@ -339,27 +499,20 @@ class LinearRAG:
         #    Qwen3-Reranker veto. Physical nodes are NOT merged.
         added_alias_edges = self._add_alias_edges_for_new_entities(new_entity_hash_set)
 
-        # 9. Literal mention backfill (KAG-style "domain mount"). NER
-        #    is contextual, so the same surface gets tagged on the page that
-        #    introduces it but missed on later pages that refer back; this
-        #    pass closes that gap by sweeping every passage with the union
-        #    of all entity surfaces and emitting entity_passage edges for
-        #    word-boundary literal hits the NER pass missed. See
-        #    ingestion.index.linear_rag.backfill for the rationale.
-        added_backfill_edges = 0
+        # 9. Literal mention backfill is deferred to flush_all(). NER is
+        #    contextual (same surface tagged on intro page, missed on
+        #    later reference pages) so the pass remains necessary; but
+        #    its cost is O(N_entities × N_passages) per invocation, and
+        #    paying it per doc made a 650-doc build O(N²). At flush
+        #    cadence we run it once over only the pending delta
+        #    (new_passages × all_entities ∪ all_passages × new_entities
+        #    is a complete cover — old × old pairs were handled by a
+        #    prior flush). Per-doc accounting reports 0; the flush
+        #    summary carries the real count.
         if self.config.literal_backfill_enabled:
-            from ingestion.index.linear_rag.backfill import literal_backfill_graph
-
-            entity_surfaces = self.entity_embedding_store.hash_id_to_text
-            passage_text = self.passage_embedding_store.hash_id_to_text
-            added_backfill_edges = literal_backfill_graph(
-                self.graph,
-                entity_surfaces,
-                passage_text,
-                min_surface_chars=self.config.literal_backfill_min_chars,
-                multi_word_only=self.config.literal_backfill_multi_word_only,
-                fold_traditional=self.config.fold_traditional,
-            )
+            self._backfill_pending_new_passages |= new_passage_hash_set
+            self._backfill_pending_new_entities |= new_entity_hash_set
+        added_backfill_edges = 0
 
         # Cluster cache is now stale — invalidate so it recomputes lazily.
         clusters_path = faiss_graph_dir() / "clusters.json"
@@ -373,59 +526,66 @@ class LinearRAG:
         if is_collapse and self._reverse_map:
             save_reverse_map(self._reverse_map_path, self._reverse_map)
 
-        # Persist graphml on a cadence. Default graphml_flush_every=1 →
-        # write every index() call (bit-identical to before; the
-        # per-file API builder constructs a fresh instance per file so
-        # its counter is always 1). A persistent bulk driver sets it
-        # >1 and force-calls flush_graphml() at checkpoints / end, so
-        # the O(V+E) graphml round-trip is amortised, not O(N²). The
-        # 'id'-attr cleanup + atomic write live in flush_graphml().
+        # Cluster shape (a derived, monitoring-only view). On cadence
+        # we recompute against the live graph + cache the result; off
+        # cadence we reuse the cached snapshot. Collapse mode always
+        # recomputes — it walks the reverse_map, not the alias subgraph.
+        # The previous off-cadence "fallback" path still ran
+        # compute_clusters(connected_components), which is O(E) per doc
+        # (alias-edge filter + subgraph extract + union-find) — paying
+        # that per doc was its own O(N²) tail. Cached reuse drops it to
+        # a dict reference.
         self._index_calls += 1
-        _every = max(1, int(getattr(self.config, "graphml_flush_every", 1)))
-        if self._index_calls % _every == 0:
-            self.flush_graphml()
-
-        # Cluster shape metrics, computed against the freshly written
-        # graph so the returned dict matches the on-disk state. The
-        # configured partitioner (default leiden_cpm) runs Leiden
-        # optimisation, which is O(E_alias) and E_alias grows with the
-        # corpus — paying it every doc makes a persistent bulk build
-        # O(N²) in wall time. cluster_shape_every gates that expensive
-        # recompute on a cadence (default 1 ⇒ every doc, bit-identical
-        # to before; the per-file API builder is a fresh instance per
-        # file so its counter is always 1). On skipped docs we still
-        # emit a well-formed cluster_shape: the alias subgraph's
-        # connected components are a single O(V+E_alias) union-find pass
-        # (not the iterative Leiden optimisation), and that is exactly
-        # the giant-component percolation tripwire largest_cc_ratio was
-        # designed to detect. Clusters are a recomputable derived view,
-        # so the graph itself is unaffected either way.
         _cl_every = max(1, int(getattr(self.config, "cluster_shape_every", 1)))
         _cluster_on_cadence = self._index_calls % _cl_every == 0
         if is_collapse:
-            cluster_partition = compute_clusters_for_collapse(self.graph, self._reverse_map)
-        elif _cluster_on_cadence:
+            cluster_partition = compute_clusters_for_collapse(
+                self.graph, self._reverse_map
+            )
+            cluster_shape = cluster_shape_metrics(
+                self.graph,
+                cluster_partition,
+                entity_store=self.entity_embedding_store,
+                is_collapse=is_collapse,
+                cheap=True,
+            )
+            self._cached_cluster_shape = cluster_shape
+        elif _cluster_on_cadence or self._cached_cluster_shape is None:
             cluster_partition = compute_clusters(
                 self.graph,
                 algorithm=self.config.cluster_algorithm,
                 leiden_resolution=self.config.cluster_leiden_resolution,
                 leiden_weighted=self.config.cluster_leiden_weighted,
             )
-        else:
-            cluster_partition = compute_clusters(
-                self.graph, algorithm="connected_components"
+            cluster_shape = cluster_shape_metrics(
+                self.graph,
+                cluster_partition,
+                entity_store=self.entity_embedding_store,
+                is_collapse=is_collapse,
+                cheap=True,
             )
-        cluster_shape = cluster_shape_metrics(
-            self.graph,
-            cluster_partition,
-            entity_store=self.entity_embedding_store,
-            is_collapse=is_collapse,
-            cheap=True,
-        )
+            self._cached_cluster_shape = cluster_shape
+        else:
+            cluster_shape = self._cached_cluster_shape
+
+        # Persist on a cadence. Default graphml_flush_every=1 → flush
+        # every index() call (bit-identical to before; the per-file API
+        # builder constructs a fresh instance per file so its counter is
+        # always 1). A persistent bulk driver sets it >1 and force-
+        # calls flush_all() at checkpoints / end, so the O(V+E) graphml
+        # round-trip, the 3-store faiss+parquet rewrite, the NER JSON
+        # save, and the literal backfill are all amortised together
+        # instead of paid every doc. On cadence hits we capture the
+        # backfill edge count so the per-doc return dict stays accurate
+        # for the API path (graphml_flush_every=1 → every doc gets its
+        # backfill count, matching pre-deferral semantics).
+        _every = max(1, int(getattr(self.config, "graphml_flush_every", 1)))
+        if self._index_calls % _every == 0:
+            added_backfill_edges = self.flush_all()
 
         logger.info(
             "index() done for file_id=%s: graph=(%d v, %d e), "
-            "added passages=%d entities=%d sentences=%d alias_edges=%d backfill_edges=%d",
+            "added passages=%d entities=%d sentences=%d alias_edges=%d",
             file_id,
             self.graph.vcount(),
             self.graph.ecount(),
@@ -433,7 +593,6 @@ class LinearRAG:
             len(new_entity_hash_set),
             len(new_sentence_hash_set),
             added_alias_edges,
-            added_backfill_edges,
         )
 
         return {
@@ -565,27 +724,16 @@ class LinearRAG:
         return total_added
 
     def _collect_entity_mentions(self) -> dict:
-        """Return ``entity_text → list[unique_sentence_text]`` over the cache.
+        """Return ``entity_text → list[unique_sentence_text]`` (cached).
 
-        Built from the persisted ``ner_results.json`` reverse index
-        ``sentence_to_entities``. Sentences are deduped per entity to keep
-        the centroid from collapsing on boilerplate.
+        Maintained incrementally: warmed once in __init__ from any
+        on-disk ner_results.json, then updated by ``_update_mention_index``
+        on every per-doc delta. Reading is now O(1) — the previous
+        implementation re-read the 38 MB JSON file and rebuilt the
+        reverse index from scratch on every ingest call, which was the
+        dominant fixed cost in the bulk-build profile.
         """
-        if not self._ner_results_path.exists():
-            return {}
-        ner = json.loads(self._ner_results_path.read_text(encoding="utf-8"))
-        sentence_to_entities = ner.get("sentence_to_entities", {})
-        out: dict[str, list[str]] = {}
-        seen: dict[str, set[str]] = {}
-        for sent, ents in sentence_to_entities.items():
-            for ent in ents:
-                if ent not in seen:
-                    seen[ent] = set()
-                    out[ent] = []
-                if sent not in seen[ent]:
-                    seen[ent].add(sent)
-                    out[ent].append(sent)
-        return out
+        return self._mentions_cache
 
     def _mention_centroid(
         self, mention_sentences: List[str]
