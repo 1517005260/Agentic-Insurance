@@ -72,9 +72,8 @@ async def create_session(
         title=body.title,
         web=body.web,
     )
-    # get_session dependency commits at request end; the row is visible
-    # to subsequent requests but we still return the full row now (id
-    # was filled by chat_svc via flush()).
+    # get_session commits at request end; chat_svc.flush() already
+    # populated the id so it's safe to serialise the row now.
     return SessionOut.model_validate(session)
 
 

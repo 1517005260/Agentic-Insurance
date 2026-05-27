@@ -180,8 +180,8 @@ class TraceSession:
                     existing_hash = None
                 if existing_hash != content_hash:
                     # Different content under same logical name — keep
-                    # both, address by hash. Canonical stays whatever
-                    # was written first today.
+                    # both, address by hash. The canonical name is
+                    # first-writer-wins within the day.
                     target = day_dir / f"{name}_{content_hash}.json"
             if not target.exists():
                 target.write_text(serialized, encoding="utf-8")
