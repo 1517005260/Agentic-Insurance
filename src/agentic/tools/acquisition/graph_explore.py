@@ -7,10 +7,19 @@ Three modes:
   We delegate to :class:`rag.channels.GraphPPRChannel` so the two paths
   cannot drift apart in subtle ways (NER → seed entities → entity-score
   BFS → passage scoring → PPR).
-* ``neighbors`` — k-hop BFS over the in-memory igraph from a list of
-  seed entities and/or page references. Returns the set of reachable
-  entities, the set of reachable passages, and a small bundle of
-  representative paths. Edge weights determine traversal priority.
+* ``chain`` — query-time typed-edge beam search. From union seeds
+  (NER ∪ gazetteer ∪ question-embedding top-k) the search expands one
+  hop at a time over entity-typed neighbors. Each candidate edge
+  ``(tail, neighbor)`` is scored by the cos-similarity between the
+  question embedding and the embeddings of the sentences where
+  ``tail`` and ``neighbor`` co-occur — the natural-language sentence
+  IS the implicit predicate, so the relation type is materialised
+  per-query without ever invoking an LLM at build time. Paths are
+  scored by mean log-edge-probability + min-link penalty +
+  question-coverage − hub-degree-penalty; the top-K paths are
+  returned together with their via-sentence snippets and a derived
+  candidate-page list (entities → incident passages, weighted by
+  path mass).
 * ``entity_lookup`` — embedding-match a surface form to *physical*
   entity nodes, and surface each hit's *logical* (alias-cluster)
   referent. Same gradient-topk + min-sim machinery used by the
@@ -22,33 +31,34 @@ Physical vs logical entity:
   "安盛"). Alias edges between near-synonyms partition the entity layer
   into logical clusters; the cluster is the LOGICAL entity. Use
   ``entity_lookup`` to map a question term to physical hits + logical
-  cluster, then feed the physical hash into ``neighbors`` for
-  hard-edge traversal.
+  cluster, then feed the question into ``chain`` for multi-hop
+  navigation conditioned on the question.
 
 Pre-warming:
-  spaCy NER and igraph are heavy to load. The agent's ``warm_up()``
-  invokes :meth:`warm_up` on this tool to absorb that one-time cost
-  before the user's first turn.
+  spaCy / GLiNER NER and igraph are heavy to load. The agent's
+  ``warm_up()`` invokes :meth:`warm_up` on this tool to absorb that
+  one-time cost before the user's first turn.
 
 Lifetime assumption:
   The graph and passage stores are treated as immutable for the life
-  of the agent process. ``_passage_meta_lookup`` / ``_passage_hash_by_meta``
-  / ``_cluster_index`` are cached on the tool instance after first use.
-  If the corpus is re-ingested mid-session, construct a fresh tool
-  instance — the caches are not invalidated automatically.
+  of the agent process. ``_passage_meta_lookup`` /
+  ``_passage_hash_by_meta`` / ``_cluster_index`` are cached on the
+  tool instance after first use. If the corpus is re-ingested
+  mid-session, construct a fresh tool instance — the caches are not
+  invalidated automatically.
 """
 
-import json
 import logging
-from collections import deque
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
 from agentic.tools.acquisition._common import err, ok, parse_scope
 from agentic.tools.base import BaseTool
 from config.settings import faiss_graph_dir
+from ingestion.index.linear_rag.backfill import find_literal_matches
 from ingestion.index.linear_rag.disambig import (
     compute_clusters_for_collapse,
     get_clusters,
@@ -56,6 +66,7 @@ from ingestion.index.linear_rag.disambig import (
     load_reverse_map,
 )
 from ingestion.index.linear_rag.normalize import normalize_for_hash
+from rag.channels.base import RawHit, aggregate_per_doc
 from rag.channels.graph_ppr import GraphPPRChannel
 from rag.preprocess import QueryContext
 from storage.inventory_store import InventoryStore
@@ -67,11 +78,45 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_VALID_MODES = {"ppr", "neighbors", "entity_lookup"}
-_DEFAULT_TOP_K = 20
-_DEFAULT_HOPS = 1
-_MAX_HOPS = 3
+_VALID_MODES = {"ppr", "chain", "entity_lookup", "cluster_inspect", "list_clusters"}
+# Agent path default: 5 candidates is enough for the typical
+# "see top hits → read 2-3 of them" workflow. The 20-default historical
+# value was tuned for the workbench UI (which renders all 20 as a
+# ranked list). For agent observations, returning 20 candidate_pages
+# + per-page evidence preview balloons the message-stack token
+# budget. The workbench can still pass top_k=20 explicitly.
+_DEFAULT_TOP_K = 5
 _MAX_TOP_K = 50
+# How many chars of passage text to expose per candidate as a preview.
+# Just enough for the agent to discriminate "yes this is the right
+# page, read it" from "wrong page, skip". The full page comes via
+# the ``read`` tool.
+_PPR_PREVIEW_CHARS = 240
+_DEFAULT_CHAIN_DEPTH = 2
+_MAX_CHAIN_DEPTH = 3
+
+# Beam-search caps for ``chain`` mode. Picked to keep one query under
+# ~100 ms on a 50-doc KG (~20 k entities, 50 k edges) with vectorised
+# sentence-sim lookup; the log-mean-exp_β aggregator below uses these
+# bounds to keep per-hop work near-linear in beam width.
+_CHAIN_TOP_L_NEIGHBORS = 20  # max entity neighbors per node per hop
+_CHAIN_TOP_M_SENTENCES = 8   # max via-sentences considered per edge
+_CHAIN_BEAM_K = 32           # beam width (paths kept between hops)
+_CHAIN_MAX_SEEDS = 8         # cap on union-seed fan-out
+
+# log-mean-exp_β + sigmoid edge-score knobs. β controls how much the
+# aggregator leans toward the strongest sentence; γ down-weights pairs
+# with many supporting sentences (hub-pair noise); α / τ calibrate the
+# sigmoid so the typical-edge score lands in mid-range.
+_CHAIN_BETA = 5.0
+_CHAIN_GAMMA = 0.05
+_CHAIN_ALPHA = 8.0
+_CHAIN_TAU = 0.30
+
+# Path-score weights.
+_CHAIN_W_MIN = 0.5      # weak-link penalty (κ)
+_CHAIN_W_COVER = 1.0    # seed coverage bonus (λ)
+_CHAIN_W_HUB = 0.2      # hub-degree penalty (ρ)
 
 
 class GraphExploreTool(BaseTool):
@@ -101,8 +146,8 @@ class GraphExploreTool(BaseTool):
         self._cluster_index: Optional[Dict[str, Dict[str, Any]]] = None
         self._reverse_map_cache: Optional[Dict[str, str]] = None
         # Passage meta is stable for the life of the agent (graph is
-        # built once at ingest). Cache the hash<->meta maps so neighbors
-        # mode doesn't rebuild them per node render.
+        # built once at ingest). Cache the hash<->meta maps so chain
+        # mode doesn't rebuild them per candidate-page render.
         self._passage_meta_by_hash: Optional[Dict[str, Tuple[str, Optional[int]]]] = None
         self._passage_hash_by_meta: Optional[Dict[Tuple[str, Optional[int]], str]] = None
 
@@ -137,10 +182,10 @@ class GraphExploreTool(BaseTool):
     def warm_up(self) -> None:
         """Pre-load GLiNER NER and force igraph to be in memory.
 
-        The PPR mode needs the NER model on the first call, which is
-        the single biggest source of cold-start latency in the agent
-        loop (~3-10 s for GLiNER multi-v2.1 depending on HF cache
-        warmth). Run this before the agent's first user turn.
+        Both the PPR and chain modes need the NER model on the first
+        call, which is the single biggest source of cold-start latency
+        in the agent loop (~3-10 s for GLiNER multi-v2.1 depending on
+        HF cache warmth). Run this before the agent's first user turn.
         """
         if self._channel.graph is None:
             return  # nothing to warm — graph not built
@@ -157,26 +202,19 @@ class GraphExploreTool(BaseTool):
             "function": {
                 "name": "graph_explore",
                 "description": (
-                    "Entity-graph retrieval. Three modes:\n"
-                    "- mode='ppr': personalized PageRank from a free-text "
-                    "question. Best for fuzzy semantic neighborhoods.\n"
-                    "- mode='neighbors': k-hop BFS from explicit seed "
-                    "entities and/or page references. Best for tracing "
-                    "hard relations once you already have an anchor.\n"
-                    "- mode='entity_lookup': embedding-match a surface "
-                    "form to physical entity nodes and report each hit's "
-                    "logical (alias) cluster.\n\n"
-                    "Physical vs logical entity:\n"
-                    "Each surface form indexes as its own node ('AXA', "
-                    "'AXA Hong Kong', '安盛'). Alias edges fuse near-"
-                    "synonyms into logical clusters — the cluster is the "
-                    "logical entity. Look up first, then traverse.\n\n"
-                    "Required arguments depend on the mode:\n"
-                    "- ppr: question, optional file_ids / page_range / "
-                    "section_ids, top_k.\n"
-                    "- neighbors: seeds (list), optional hops (1-3), "
-                    "optional file_ids, top_k.\n"
-                    "- entity_lookup: surface, optional top_k (max 10)."
+                    "Entity-graph retrieval. Each surface form is its own "
+                    "node; alias edges fuse near-synonyms into LOGICAL "
+                    "CLUSTERS. Modes:\n"
+                    "- ppr: personalized PageRank from a free-text question; "
+                    "returns top pages with preview + clusters touched.\n"
+                    "- chain: typed-edge beam search between entities. Seed "
+                    "via `question`, `from_page=\"file_id/p_NNNN\"`, or "
+                    "`from_entities=[...]`; optionally filter with `to_entities=[...]`.\n"
+                    "- entity_lookup: embedding-match a `surface` to physical "
+                    "entities + their logical cluster.\n"
+                    "- cluster_inspect: audit a `cluster_id` (members, top "
+                    "passages, alias quality).\n"
+                    "- list_clusters: enumerate top clusters by size or mention weight."
                 ),
                 "parameters": {
                     "type": "object",
@@ -184,61 +222,67 @@ class GraphExploreTool(BaseTool):
                         "mode": {
                             "type": "string",
                             "enum": sorted(_VALID_MODES),
-                            "description": "ppr | neighbors | entity_lookup.",
                         },
                         "question": {
                             "type": "string",
-                            "description": "Free-text question (mode=ppr).",
-                        },
-                        "seeds": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": (
-                                "Seed list (mode=neighbors). Each item is "
-                                "either an entity surface form or a page "
-                                "reference 'file_id/page_id'."
-                            ),
+                            "description": "Free-text query (mode=ppr | chain).",
                         },
                         "surface": {
                             "type": "string",
                             "description": "Entity surface form (mode=entity_lookup).",
                         },
-                        "hops": {
+                        "depth": {
                             "type": "integer",
-                            "description": "BFS depth for mode=neighbors; default 1, max 3.",
+                            "description": "Beam depth 1-3 (mode=chain), default 2.",
                         },
                         "file_ids": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": (
-                                "Optional file id allow-list. Honored by "
-                                "ppr (full scope) and neighbors (page-side "
-                                "only)."
-                            ),
+                            "description": "Optional file id allow-list (mode=ppr | chain).",
                         },
                         "page_range": {
                             "type": "array",
                             "items": {"type": "integer"},
-                            "description": (
-                                "Optional [start, end] inclusive page-number "
-                                "filter (mode=ppr only)."
-                            ),
+                            "description": "Optional [start, end] inclusive page filter (mode=ppr).",
                         },
                         "section_ids": {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "Optional hard filter (mode=ppr only). "
-                                "Section ids of the form "
-                                "'<file_id>:sec_NNN' from `toc`. A "
-                                "candidate page must lie inside at "
-                                "least one listed section to qualify; "
-                                "ANDed with file_ids and page_range."
+                                "Optional section ids '<file_id>:sec_NNN' from `toc` "
+                                "(mode=ppr). ANDed with file_ids and page_range."
                             ),
                         },
                         "top_k": {
                             "type": "integer",
-                            "description": "Max items to return; default 20, max 50.",
+                            "description": "Max candidates returned; default 5, max 50.",
+                        },
+                        "cluster_id": {
+                            "type": "string",
+                            "description": "Cluster to deep-dive (mode=cluster_inspect).",
+                        },
+                        "from_page": {
+                            "type": "string",
+                            "description": "Seed chain from a page's entities (mode=chain), format 'file_id/p_NNNN'.",
+                        },
+                        "from_entities": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Explicit seed surfaces (mode=chain).",
+                        },
+                        "to_entities": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Filter paths to those reaching any listed surface (mode=chain).",
+                        },
+                        "sort_by": {
+                            "type": "string",
+                            "enum": ["size", "mention_weight"],
+                            "description": "Ranking metric (mode=list_clusters); default 'size'.",
+                        },
+                        "surface_filter": {
+                            "type": "string",
+                            "description": "Substring filter against cluster surfaces (mode=list_clusters).",
                         },
                     },
                     "required": ["mode"],
@@ -255,8 +299,8 @@ class GraphExploreTool(BaseTool):
                 err(
                     "invalid_argument",
                     f"`mode` must be one of {sorted(_VALID_MODES)}.",
-                    remediation="Set `mode` to 'ppr' (free-text), 'neighbors' (BFS from seeds), or 'entity_lookup' (surface-form to entity).",
-                    valid_example={"mode": "ppr"},
+                    remediation="Set `mode` to 'ppr' (free-text PPR), 'chain' (query-time typed-edge beam), or 'entity_lookup' (surface→entity).",
+                    valid_example={"mode": "chain", "question": "..."},
                 ),
                 {"error": "invalid_argument"},
             )
@@ -272,8 +316,12 @@ class GraphExploreTool(BaseTool):
 
         if mode == "ppr":
             return self._run_ppr(context, **kwargs)
-        if mode == "neighbors":
-            return self._run_neighbors(context, **kwargs)
+        if mode == "chain":
+            return self._run_chain(context, **kwargs)
+        if mode == "cluster_inspect":
+            return self._run_cluster_inspect(context, **kwargs)
+        if mode == "list_clusters":
+            return self._run_list_clusters(context, **kwargs)
         return self._run_entity_lookup(context, **kwargs)
 
     # ----------------------------------------------------------- PPR mode
@@ -350,13 +398,39 @@ class GraphExploreTool(BaseTool):
         # Apply the page_range gate post-hoc (PPR channel honors file_ids
         # but not page_range — the channel was designed for the global RAG
         # path which doesn't expose ranges). Reuse the cached meta map.
+        # IMPORTANT: keep ``kept_hits`` (the ChannelHit slice that
+        # passed scope) in lock-step with ``results``, because
+        # _attach_previews / per-page provenance below ZIP these two
+        # together to look up evidence.passage_hash_id per hit.
+        # If these two drift apart (e.g. zipping unfiltered hits with
+        # the filtered ``results``), scoped queries silently shift
+        # preview/clusters_touched onto the wrong page.
         meta_by_hash = self._passage_meta_lookup()
-        results: List[Dict[str, Any]] = []
 
+        # Pass 1: scope-filter the channel hits without truncating to
+        # ``limit`` yet — the doc-aware rerank below needs the full
+        # eligible slate so that a doc with several lower-ranked pages
+        # can still outrank a doc with one stronger page that would
+        # otherwise be the only one to fit in the top-K.
+        eligible: List[Tuple[Any, Optional[int]]] = []
         for hit in channel_hits:
             page_number = self._first_page_number(hit, meta_by_hash)
-            if not scope.contains(hit.file_id, page_number):
-                continue
+            if scope.contains(hit.file_id, page_number):
+                eligible.append((hit, page_number))
+
+        # Cross-doc duplicate guard: when several pages from the same
+        # doc each score independently, aggregate them via
+        # ``Σ s_i / sqrt(N + 1)`` (rag.channels.base.aggregate_per_doc)
+        # and re-sort pages by (doc_score, original_page_score). Pages
+        # from the highest-aggregated doc rise to the top; pages within
+        # one doc keep their PPR order. Targets the failure mode where
+        # a near-duplicate from a wrong doc outranks the gold doc's
+        # several supporting pages on raw PPR score alone.
+        eligible = self._doc_aware_rerank(eligible, limit)
+
+        results: List[Dict[str, Any]] = []
+        kept_hits: List[Any] = []
+        for hit, page_number in eligible:
             results.append(
                 {
                     "file_id": hit.file_id,
@@ -365,30 +439,69 @@ class GraphExploreTool(BaseTool):
                     "score": round(float(hit.score), 6),
                 }
             )
+            kept_hits.append(hit)
             if len(results) >= limit:
                 break
 
         seeds_dbg = debug_snapshot.get("seeds", [])
+        # Attach previews (240-char text excerpt) for disambiguation.
+        results_with_preview = self._attach_previews(results, kept_hits)
+        # L3 + L6: per-page logical-cluster provenance.  For each
+        # candidate, surface "which logical entities dominate this
+        # page" — lets the agent see at a glance whether the page is
+        # about (cluster_2436=Nagano) or (cluster_0000=political
+        # parties).  Decisive for refining queries when PPR drifts to
+        # high-degree hub clusters.
+        for r, hit in zip(results_with_preview, kept_hits):
+            ph = None
+            for ev in (getattr(hit, "evidence", None) or []):
+                if isinstance(ev, dict) and ev.get("passage_hash_id"):
+                    ph = ev["passage_hash_id"]
+                    break
+            if ph is None:
+                r["clusters_touched"] = []
+                continue
+            try:
+                r["clusters_touched"] = self._channel.passage_top_clusters(
+                    ph, top_n=3
+                )
+            except Exception:
+                r["clusters_touched"] = []
+        # L2: top logical clusters by PPR mass.  Surfaced as DIAGNOSTIC
+        # CONTEXT only — LLMs navigate poorly via opaque cluster IDs
+        # (exposing them as the primary navigation signal regresses
+        # answer quality). The five entries here let the agent notice
+        # when PPR drifts onto a hub cluster off-topic without being
+        # expected to follow `cluster_id` back.
         cluster_scores = debug_snapshot.get("cluster_scores", {}) or {}
-        # Trim cluster_scores to the top-N by mass — agents and the
-        # workbench only need a coarse logical-entity ranking, not the
-        # full physical-singleton dump. Keep `limit` to stay symmetric
-        # with the passage-side cut.
-        if isinstance(cluster_scores, dict) and cluster_scores:
-            top_cluster_scores = dict(
-                sorted(cluster_scores.items(), key=lambda kv: kv[1], reverse=True)[:limit]
-            )
-        else:
-            top_cluster_scores = {}
+        top_logical = []
+        for cid, mass in sorted(
+            cluster_scores.items(), key=lambda kv: kv[1], reverse=True
+        )[:5]:
+            top_surf = self._channel.cluster_top_surfaces(cid, top_n=1)
+            members = self._channel._cluster_cache.get(cid) if self._channel._cluster_cache else None
+            top_logical.append({
+                "cluster_id": cid,
+                "top_surface": top_surf[0]["surface"] if top_surf
+                               else self._channel.entity_store.hash_id_to_text.get(cid, cid),
+                "mass": round(float(mass), 6),
+                "members_n": len(members) if members else 1,
+            })
         log_meta = {
             "mode": "ppr",
             "question": question,
             "scope": scope.as_dict(),
             "seeds": [s["surface"] for s in seeds_dbg] if isinstance(seeds_dbg, list) else [],
-            "hits": len(results),
+            "hits": len(results_with_preview),
         }
         context.add_retrieval_log(tool_name="graph_explore", tokens=0, metadata=log_meta)
 
+        # We now DO surface compact cluster info (L2/L3) — the prior
+        # comment said "cluster_scores workbench-only" but that was
+        # the original design oversight: the agent's whole task IS
+        # logical-entity navigation. ``top_logical_clusters`` is the
+        # decompressed form, ``clusters_touched`` per page localizes
+        # which logical entities live on each candidate.
         return (
             ok(
                 "GraphExploreObservation",
@@ -398,11 +511,111 @@ class GraphExploreTool(BaseTool):
                 seeds=[
                     {"surface": s.get("surface"), "sim": s.get("sim")}
                     for s in (seeds_dbg if isinstance(seeds_dbg, list) else [])
-                ],
-                candidate_pages=results,
-                cluster_scores=top_cluster_scores,
+                ][:8],  # cap seed list — long NER seeds also bloat
+                top_logical_clusters=top_logical,
+                candidate_pages=results_with_preview,
             ),
-            {"retrieved_tokens": 0, "hits": len(results)},
+            {"retrieved_tokens": 0, "hits": len(results_with_preview)},
+        )
+
+    def _attach_previews(
+        self,
+        results: List[Dict[str, Any]],
+        channel_hits: Optional[List[Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Add a short ``preview`` field per candidate page (240 chars
+        of the page's text_markdown, leading lines preferred).  The
+        agent uses it for fine-grained page selection before a
+        ``read`` call.  Falls through silently when the passage_store
+        lookup fails — the agent can still call ``read``.
+
+        Prefers ``channel_hits[i].evidence[0]["passage_hash_id"]`` for
+        an exact passage match.  Falls back to a one-time-built
+        ``(file_id, page_number) → passage_hash`` map when evidence
+        is unavailable (older trace formats / non-PPR modes).
+        """
+        if not results:
+            return results
+        out: List[Dict[str, Any]] = []
+        try:
+            page_store = getattr(self._channel, "passage_store", None)
+        except Exception:
+            page_store = None
+        # Build the reverse meta map lazily — only if we end up needing
+        # the fallback path (i.e. some hit lacks evidence).
+        meta_map: Optional[Dict[Tuple[str, Optional[int]], str]] = None
+        for i, hit_meta in enumerate(results):
+            preview = ""
+            if page_store is None or not hasattr(page_store, "hash_id_to_text"):
+                out.append({**hit_meta, "preview": ""})
+                continue
+            # Path 1: exact passage_hash_id from ChannelHit.evidence.
+            passage_hash: Optional[str] = None
+            if channel_hits and i < len(channel_hits):
+                ev = getattr(channel_hits[i], "evidence", None) or []
+                for e in ev:
+                    h = e.get("passage_hash_id") if isinstance(e, dict) else None
+                    if h:
+                        passage_hash = h
+                        break
+            # Path 2: fallback via (file_id, page_number).  When a
+            # page is split into multiple passages, a plain dict-comp
+            # would keep the LAST passage's hash; use ``setdefault``
+            # so the FIRST passage on each page wins — that's
+            # typically the page heading / lead paragraph, which is
+            # a better disambiguation preview than a mid-page span.
+            if passage_hash is None:
+                if meta_map is None:
+                    meta_map = {}
+                    try:
+                        col_file_id = page_store.meta_column("file_id")
+                        col_page_number = page_store.meta_column("page_number")
+                        for h, fid, pn in zip(
+                            page_store.hash_ids, col_file_id, col_page_number
+                        ):
+                            key_pn = int(pn) if pn is not None else None
+                            meta_map.setdefault((str(fid), key_pn), h)
+                    except Exception:
+                        meta_map = {}
+                key = (str(hit_meta["file_id"]),
+                       int(hit_meta["page_number"]) if hit_meta.get("page_number") is not None else None)
+                passage_hash = meta_map.get(key)
+            if passage_hash is not None:
+                try:
+                    text = page_store.hash_id_to_text.get(passage_hash, "") or ""
+                    preview = " ".join(text.split())[:_PPR_PREVIEW_CHARS]
+                except Exception:
+                    preview = ""
+            out.append({**hit_meta, "preview": preview})
+        return out
+
+    @staticmethod
+    def _doc_aware_rerank(
+        eligible: List[Tuple[Any, Optional[int]]],
+        limit: int,
+    ) -> List[Tuple[Any, Optional[int]]]:
+        """Reorder scope-filtered PPR hits so pages from the strongest
+        document (in the ``Σ s_i / sqrt(N+1)`` sense) come first.
+
+        No-op when at most one doc is present or the eligible slate
+        already fits in ``limit`` from a single doc; the reordering
+        only matters when several pages from one or more docs compete
+        for the top slots. Within a doc, the page order from PPR is
+        preserved (secondary sort by original score).
+        """
+        if not eligible:
+            return eligible
+        distinct_docs = {h.file_id for h, _ in eligible}
+        if len(distinct_docs) <= 1:
+            return eligible
+        raw = [RawHit(file_id=h.file_id, page_id=h.page_id, score=float(h.score))
+               for h, _ in eligible]
+        doc_hits = aggregate_per_doc(raw, top_k=len(distinct_docs))
+        doc_score = {d.file_id: d.score for d in doc_hits}
+        return sorted(
+            eligible,
+            key=lambda hp: (doc_score.get(hp[0].file_id, 0.0), float(hp[0].score)),
+            reverse=True,
         )
 
     @staticmethod
@@ -417,37 +630,88 @@ class GraphExploreTool(BaseTool):
                     return None
         return None
 
-    # ----------------------------------------------------------- neighbors mode
+    # ----------------------------------------------------------- chain mode
 
-    def _run_neighbors(self, context: "AgentContext", **kwargs):
-        seeds = kwargs.get("seeds") or []
-        if not isinstance(seeds, (list, tuple)) or not seeds:
+    def _run_chain(self, context: "AgentContext", **kwargs):
+        """Query-time typed-edge beam search.
+
+        Pipeline (one call):
+
+        1. Seed entities = union(NER(question), gazetteer-literal-scan,
+           question-embedding top-k against entity_store). Each
+           ingredient catches a different miss mode (NER misses domain
+           product names; gazetteer misses paraphrases; embedding
+           misses purely structural anchors) so the union maximises
+           recall before beam expansion narrows the search.
+        2. For each path tail, take up to ``L`` entity-typed neighbors
+           ranked by graph edge weight. For each ``(tail, neighbor)``
+           pair, look up the sentences where both entities co-occur
+           (the via-sentences index built lazily on
+           ``GraphPPRChannel``). The cos-similarity between the
+           question embedding and each via-sentence embedding gives a
+           per-query, per-edge relation score — the sentence IS the
+           predicate, so the typing happens at query time, not build
+           time.
+        3. Aggregate the top-M via-sentence sims into one edge score
+           via log-mean-exp_β + frequency-penalty + sigmoid
+           calibration (see §8.5.2 in the design doc for the math
+           audit). Convert to log-edge-probability.
+        4. Score paths by ``mean log p_e + κ·min log p_e + λ·seed-
+           coverage − ρ·hub-degree-penalty``. Beam-prune to top-K
+           between hops.
+        5. Final output bundle: top paths with via-sentence snippets +
+           candidate pages derived from entity-passage incidence
+           weighted by path mass.
+        """
+        question = (kwargs.get("question") or "").strip()
+        # Tier 3 chain extensions: `from_page` / `from_entities` /
+        # `to_entities` let the agent override the seeding source and
+        # filter the final paths.  Use cases:
+        #   * `from_page="db_en_0937/p_0026"` — page_neighbors:
+        #     expand from entities on that page (cross-doc bridging).
+        #   * `from_entities=["Lincoln"]` + `to_entities=["Bishop"]`
+        #     — sentence-bridge: only return paths that reach a
+        #     `to` surface.  Combine with depth=2-3 to enumerate
+        #     bridges between two known entities.
+        from_page = (kwargs.get("from_page") or "").strip()
+        from_entities = kwargs.get("from_entities") or []
+        to_entities = kwargs.get("to_entities") or []
+        if not question and not from_page and not from_entities:
             return err(
                 "invalid_argument",
-                "mode='neighbors' requires a non-empty `seeds` list.",
-                remediation="Pass `seeds` as a list of entity surface forms (e.g. 'AXA') and/or page references (e.g. 'fileA_xxx/p_0001'). Use mode='entity_lookup' first to discover canonical surface forms.",
-                valid_example={"mode": "neighbors", "seeds": ["AXA", "<file_id>/p_0001"]},
+                "mode='chain' requires one of: `question`, `from_page`, or `from_entities`.",
+                remediation=(
+                    "Provide `question` (free-text seeding via NER + "
+                    "gazetteer + embedding), `from_page=\"file_id/p_NNNN\"` "
+                    "to expand from a known page, or `from_entities=[...]` "
+                    "to seed from explicit surface forms.  `to_entities=[...]` "
+                    "(optional) filters final paths to those reaching any "
+                    "target — useful for sentence-bridge queries between "
+                    "two known entities."
+                ),
+                valid_example={
+                    "mode": "chain",
+                    "question": "Who developed the chipset used in AMD 785G?",
+                },
             ), {"error": "invalid_argument"}
 
         try:
-            hops = int(kwargs.get("hops", _DEFAULT_HOPS))
+            depth = int(kwargs.get("depth", _DEFAULT_CHAIN_DEPTH))
         except (TypeError, ValueError):
             return err(
                 "invalid_argument",
-                "`hops` must be an integer.",
-                remediation="Pass `hops` as an integer in [1, 3] (default 1).",
-                valid_example={"hops": 1},
+                "`depth` must be an integer.",
+                remediation=f"Pass `depth` as an integer in [1, {_MAX_CHAIN_DEPTH}] (default {_DEFAULT_CHAIN_DEPTH}).",
+                valid_example={"depth": 2},
             ), {"error": "invalid_argument"}
-        if not 1 <= hops <= _MAX_HOPS:
-            return (
-                err(
-                    "invalid_argument",
-                    f"`hops` must be 1..{_MAX_HOPS}.",
-                    remediation=f"Set `hops` to an integer in [1, {_MAX_HOPS}] (default 1).",
-                    valid_example={"hops": 1},
-                ),
-                {"error": "invalid_argument"},
-            )
+        if not 1 <= depth <= _MAX_CHAIN_DEPTH:
+            return err(
+                "invalid_argument",
+                f"`depth` must be 1..{_MAX_CHAIN_DEPTH}.",
+                remediation=f"Set `depth` to an integer in [1, {_MAX_CHAIN_DEPTH}].",
+                valid_example={"depth": 2},
+            ), {"error": "invalid_argument"}
+
         try:
             top_k_int = int(kwargs.get("top_k", _DEFAULT_TOP_K))
         except (TypeError, ValueError):
@@ -464,352 +728,690 @@ class GraphExploreTool(BaseTool):
                 remediation="Set `top_k` to a positive integer (default 20, max 50).",
                 valid_example={"top_k": 20},
             ), {"error": "invalid_argument"}
-        limit = min(top_k_int, _MAX_TOP_K)
+        top_paths = min(top_k_int, _MAX_TOP_K)
 
         scope, scope_err = parse_scope(kwargs.get("file_ids"), None)
         if scope_err is not None:
             return err(
                 "invalid_argument",
                 scope_err,
-                remediation="Fix `file_ids`: pass a list of ids returned by list_files, or omit the field for corpus-wide neighbors.",
+                remediation="Fix `file_ids`: pass a list of ids returned by list_files, or omit the field for corpus-wide chain.",
                 valid_example={"file_ids": ["<file_id>"]},
             ), {"error": "invalid_argument"}
 
-        resolved = self._resolve_seeds(seeds)
-        if not resolved["found"]:
-            return (
-                err(
-                    "no_seeds_resolved",
-                    "None of the seeds could be matched to a graph node.",
-                    remediation="Call mode='entity_lookup' with each surface form first to find the canonical entity, then pass its hash_id (or the matched surface) as a seed; for page seeds use 'file_id/p_NNNN' from any retrieval observation.",
-                    seeds=list(seeds),
-                    unresolved=resolved["unresolved"],
-                ),
-                {"error": "no_seeds_resolved"},
+        channel = self._channel
+        if len(channel.entity_store) == 0 or len(channel.sentence_store) == 0:
+            return err(
+                "graph_unavailable",
+                "Entity or sentence store is empty; index the corpus first.",
+                remediation="Fall back to semantic_search / bm25_search / pattern_search — chain mode needs both an entity layer and a sentence layer.",
+            ), {"error": "graph_unavailable"}
+
+        # Question embedding — used for seeding AND for the cached
+        # sentence-similarity vector that drives edge scoring.  When
+        # only `from_page` / `from_entities` are given (no question),
+        # use a synthetic prompt so we still get a vector for
+        # sentence ranking.
+        embed_query = question or (
+            "; ".join(from_entities) if from_entities else from_page
+        )
+        try:
+            q_emb = channel.embedding_client.encode(embed_query, is_query=True)
+        except Exception as exc:
+            logger.exception("graph_explore[chain] embedding failed: %s", exc)
+            return err(
+                "embed_failed",
+                f"Embedding the query failed: {exc}",
+                remediation="Retry once; if it persists, fall back to semantic_search / bm25_search.",
+            ), {"error": "embed_failed"}
+        if q_emb.ndim == 2:
+            q_emb = q_emb[0]
+
+        # Seed selection — three input variants merged in priority order.
+        seeds_info: List[Dict[str, Any]] = []
+        if from_page:
+            # Resolve "file_id/p_NNNN" → passage_hash → top entities.
+            page_seeds = self._chain_seeds_from_page(from_page, top_n=8)
+            seeds_info.extend(page_seeds)
+        if from_entities:
+            ent_seeds = self._chain_seeds_from_surfaces(
+                from_entities, source_tag="explicit"
             )
-
-        graph = self._channel.graph
-        seed_vidx = [item["vertex_idx"] for item in resolved["found"]]
-        bfs, parents = self._bfs(seed_vidx, hops=hops)
-
-        # Materialize: split into entities and passages.
-        passage_meta = self._passage_meta_lookup()
-        candidate_entities: List[Dict[str, Any]] = []
-        candidate_pages: List[Dict[str, Any]] = []
-        for vidx, score, hop in bfs:
-            v = graph.vs[vidx]
-            vtype = v.attributes().get("vertex_type") or self._guess_vertex_type(v["name"])
-            if vtype == "entity":
-                candidate_entities.append(
-                    {
-                        "hash_id": v["name"],
-                        "surface": v.attributes().get("content") or "",
-                        "score": round(float(score), 6),
-                        "hop": hop,
-                    }
-                )
-            elif vtype == "passage":
-                meta = passage_meta.get(v["name"])
-                if meta is None:
-                    continue
-                file_id, page_n = meta
-                if scope.file_ids is not None and file_id not in scope.file_ids:
-                    continue
-                page_id = f"p_{int(page_n):04d}" if page_n is not None else None
-                candidate_pages.append(
-                    {
-                        "file_id": file_id,
-                        "page_id": page_id,
-                        "page_number": int(page_n) if page_n is not None else None,
-                        "score": round(float(score), 6),
-                        "hop": hop,
-                    }
-                )
-
-        candidate_entities.sort(key=lambda r: r["score"], reverse=True)
-        candidate_pages.sort(key=lambda r: r["score"], reverse=True)
-        candidate_entities = candidate_entities[:limit]
-        candidate_pages = candidate_pages[:limit]
-
-        # Build a small "why" trail so the agent can see HOW each top hit
-        # is connected to the seeds. Cap to the union of the top entities
-        # and pages so the path bundle stays bounded.
-        path_targets = [(r["hash_id"], "entity") for r in candidate_entities[:5]] + [
-            ((r["file_id"], r.get("page_number")), "passage")
-            for r in candidate_pages[:5]
+            seeds_info.extend(ent_seeds)
+        if not seeds_info and question:
+            # Default behaviour: question-driven NER + gazetteer + embedding.
+            seeds_info = self._chain_seeds(question, q_emb)
+        # Dedup by hash_id while preserving first-seen order.
+        _seen: set = set()
+        seeds_info = [
+            s for s in seeds_info
+            if not (s["hash_id"] in _seen or _seen.add(s["hash_id"]))
         ]
-        paths = self._materialize_paths(parents, resolved["found"], path_targets)
+        if not seeds_info:
+            return ok(
+                "GraphExploreObservation",
+                mode="chain",
+                question=question,
+                scope=scope.as_dict(),
+                depth=depth,
+                seeds=[],
+                paths=[],
+                candidate_pages=[],
+                note="No seeds resolved from NER, gazetteer, or question embedding.",
+            ), {"retrieved_tokens": 0, "paths": 0}
+
+        # Pre-compute sentence similarities once — vectorised faiss
+        # search, O(N_sent) memory but no per-edge cost during beam.
+        sent_hashes = channel.sentence_store.hash_ids
+        sent_idx: Dict[str, int] = {h: i for i, h in enumerate(sent_hashes)}
+        sent_sims = channel.sentence_store.all_similarities(q_emb)
+
+        pair_via = channel.pair_via_sentences()
+
+        # Beam state: each path is a dict with running log-probability
+        # sums so we can compute the path score in O(1) per extension.
+        initial = [
+            {
+                "nodes": [s["hash_id"]],
+                "edges": [],
+                "log_p_sum": 0.0,
+                "log_p_min": 0.0,
+                "score": 0.0,
+            }
+            for s in seeds_info
+        ]
+        beam = initial
+        seed_hashes = {s["hash_id"] for s in seeds_info}
+        # Collect every path (incl. single-seed) across hops so depth=2
+        # callers still see depth=1 chains when the second hop pinches
+        # out (no via-sentence support).
+        all_paths: List[Dict[str, Any]] = list(initial)
+
+        for _hop in range(depth):
+            next_paths: List[Dict[str, Any]] = []
+            for path in beam:
+                tail = path["nodes"][-1]
+                tail_vidx = channel._name_to_vidx.get(tail)
+                if tail_vidx is None:
+                    continue
+                for nbr_hash, _edge_w in self._top_L_entity_neighbors(
+                    tail_vidx, _CHAIN_TOP_L_NEIGHBORS
+                ):
+                    if nbr_hash in path["nodes"]:
+                        continue  # no revisits — keeps paths simple
+                    key = frozenset((tail, nbr_hash))
+                    via_sents = pair_via.get(key)
+                    if not via_sents:
+                        continue
+                    cand_sims: List[float] = []
+                    cand_sids: List[str] = []
+                    for sid in via_sents:
+                        si = sent_idx.get(sid)
+                        if si is None:
+                            continue
+                        cand_sims.append(float(sent_sims[si]))
+                        cand_sids.append(sid)
+                    if not cand_sims:
+                        continue
+                    cand_arr = np.asarray(cand_sims, dtype=np.float64)
+                    if cand_arr.size > _CHAIN_TOP_M_SENTENCES:
+                        order = np.argsort(cand_arr)[::-1][:_CHAIN_TOP_M_SENTENCES]
+                        sims_top = cand_arr[order]
+                        sids_top = [cand_sids[int(i)] for i in order]
+                    else:
+                        sims_top = cand_arr
+                        sids_top = cand_sids
+                    edge_score = self._edge_score(sims_top, n_support=int(cand_arr.size))
+                    log_p_e = float(np.log(max(edge_score, 1e-9)))
+                    new_edges = path["edges"] + [
+                        {
+                            "tail": tail,
+                            "head": nbr_hash,
+                            "edge_score": float(edge_score),
+                            "via_sentences": sids_top,
+                            "n_support": int(cand_arr.size),
+                        }
+                    ]
+                    new_path = {
+                        "nodes": path["nodes"] + [nbr_hash],
+                        "edges": new_edges,
+                        "log_p_sum": path["log_p_sum"] + log_p_e,
+                        "log_p_min": (
+                            log_p_e
+                            if not path["edges"]
+                            else min(path["log_p_min"], log_p_e)
+                        ),
+                    }
+                    new_path["score"] = self._path_score(new_path, seed_hashes)
+                    next_paths.append(new_path)
+            if not next_paths:
+                break
+            next_paths.sort(key=lambda p: p["score"], reverse=True)
+            beam = next_paths[:_CHAIN_BEAM_K]
+            all_paths.extend(beam)
+
+        # De-dupe by node tuple, keep the highest-scoring instance per
+        # path topology. Paths with no edges (the seed-only initial
+        # state) are dropped here — they convey nothing the caller
+        # didn't already pass in via ``seeds``.
+        by_signature: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        for p in all_paths:
+            if not p["edges"]:
+                continue
+            sig = tuple(p["nodes"])
+            cur = by_signature.get(sig)
+            if cur is None or p["score"] > cur["score"]:
+                by_signature[sig] = p
+        final = sorted(by_signature.values(), key=lambda p: p["score"], reverse=True)[
+            :top_paths
+        ]
+
+        # Tier-3: `to_entities` filter — only keep paths reaching at
+        # least one CLUSTER MEMBER of any resolved target.  Cluster-
+        # aware match (not exact-hash) because the user gives a
+        # natural surface like "Bishop" — the resolved hash is one
+        # representative; any sibling in its alias-cluster counts as
+        # a valid bridge target.  This dramatically widens chain's
+        # sentence-bridge usefulness without inflating false hits
+        # (alias siblings are by design semantically equivalent).
+        if to_entities:
+            target_hashes: set = set()
+            _, m2c = channel._load_clusters_cached()
+            for s in self._chain_seeds_from_surfaces(to_entities, source_tag="target"):
+                target_hashes.add(s["hash_id"])
+                # Expand to cluster siblings.
+                cid = m2c.get(s["hash_id"])
+                if cid is not None:
+                    members = channel._cluster_cache.get(cid) if channel._cluster_cache else None
+                    if members:
+                        target_hashes.update(members)
+            if target_hashes:
+                final = [p for p in final if any(n in target_hashes for n in p["nodes"])]
+                # Also: if from seeds + to_entities directly co-occur
+                # in shared sentences (depth-1 trivially via
+                # pair_via_sentences), return those as "direct bridges"
+                # even though no beam expansion happened.  Allows
+                # sentence-bridge to surface 1-hop evidence the beam
+                # would otherwise drop (paths with no edges are filtered).
+                # Source-set covers all three input modes — from_entities,
+                # from_page (page-derived seeds), or question seeds.
+                if not final:
+                    pair_via = channel.pair_via_sentences()
+                    src_hashes = {s["hash_id"] for s in seeds_info}
+                    bridge_pairs = []
+                    for src_h in src_hashes:
+                        for tgt_h in target_hashes:
+                            key = frozenset((src_h, tgt_h))
+                            sents = pair_via.get(key)
+                            if sents:
+                                bridge_pairs.append((src_h, tgt_h, sents))
+                    if bridge_pairs:
+                        # Synthesize 1-hop "paths" from direct co-occurrence.
+                        bridge_pairs.sort(key=lambda t: len(t[2]), reverse=True)
+                        synthetic = []
+                        for src_h, tgt_h, sents in bridge_pairs[:top_paths]:
+                            synthetic.append({
+                                "nodes": [src_h, tgt_h],
+                                "edges": [{
+                                    "tail": src_h,
+                                    "head": tgt_h,
+                                    "edge_score": 1.0,
+                                    "via_sentences": list(sents)[:_CHAIN_TOP_M_SENTENCES],
+                                    "n_support": len(sents),
+                                }],
+                                "score": float(len(sents)),
+                                "log_p_sum": 0.0,
+                                "log_p_min": 0.0,
+                            })
+                        final = synthetic
+
+        paths_out = self._render_chain_paths(final)
+        candidate_pages = self._chain_candidate_pages(final, scope, limit=_MAX_TOP_K)
 
         log_meta = {
-            "mode": "neighbors",
-            "seeds_count": len(seeds),
-            "seeds_found": len(resolved["found"]),
-            "hops": hops,
-            "entities": len(candidate_entities),
-            "pages": len(candidate_pages),
-            "paths": len(paths),
+            "mode": "chain",
+            "question": question,
+            "scope": scope.as_dict(),
+            "depth": depth,
+            "seeds": [s["surface"] for s in seeds_info],
+            "paths": len(paths_out),
+            "candidate_pages": len(candidate_pages),
         }
         context.add_retrieval_log(tool_name="graph_explore", tokens=0, metadata=log_meta)
 
         return (
             ok(
                 "GraphExploreObservation",
-                mode="neighbors",
-                hops=hops,
-                seeds_resolved=resolved["found"],
-                seeds_unresolved=resolved["unresolved"],
-                candidate_entities=candidate_entities,
+                mode="chain",
+                question=question,
+                scope=scope.as_dict(),
+                depth=depth,
+                seeds=[
+                    {
+                        "hash_id": s["hash_id"],
+                        "surface": s["surface"],
+                        "sim": round(s["sim"], 4),
+                        "source": s["source"],
+                    }
+                    for s in seeds_info
+                ],
+                paths=paths_out,
                 candidate_pages=candidate_pages,
-                paths=paths,
             ),
             {
                 "retrieved_tokens": 0,
-                "entities": len(candidate_entities),
+                "paths": len(paths_out),
                 "pages": len(candidate_pages),
-                "paths": len(paths),
             },
         )
 
-    def _resolve_seeds(self, seeds: Sequence[str]) -> Dict[str, Any]:
-        """Resolve heterogeneous seed strings to graph vertices.
+    # ----------------------------------------------------- chain helpers
 
-        Each seed is one of:
+    def _chain_seeds(
+        self, question: str, q_emb: np.ndarray
+    ) -> List[Dict[str, Any]]:
+        """Union NER ∪ gazetteer ∪ question-embedding top-k.
 
-        * page reference ``"file_id/page_id"`` — looked up via the
-          passage store's meta columns.
-        * entity surface — normalized then matched to entity_store
-          ``text_to_hash_id``; falls back to a normalized text match
-          when the canonical form differs.
+        Returns at most ``_CHAIN_MAX_SEEDS`` ranked by similarity
+        (literal gazetteer hits pinned at sim=1.0). Hidden vertices
+        (collapse-absorbed) are skipped so we don't seed into a
+        logically-gone node.
+
+        Each ingredient is run unconditionally so seeds are a true
+        union — different question shapes use different ingredients
+        ("Who developed X?" → NER+embedding; "FATCA reporting" →
+        gazetteer; "what's connected here?" → embedding only).
         """
-        graph = self._channel.graph
-        name_to_vidx = self._channel._name_to_vidx
-        passage_lookup = self._passage_meta_to_hash()
-        entity_text_to_hash = self._channel.entity_store.text_to_hash_id
+        channel = self._channel
+        best: Dict[str, Tuple[float, str, str]] = {}  # hash → (sim, surface, source)
 
-        found: List[Dict[str, Any]] = []
-        unresolved: List[str] = []
-        for raw in seeds:
-            s = str(raw).strip()
-            if not s:
-                continue
-            # Fast path: the agent often pipes ``entity_lookup`` hashes
-            # straight into ``neighbors`` as seeds. The original resolver
-            # only handled surfaces / page-refs and rejected raw hashes
-            # with ``no_seeds_resolved`` even though the vertex existed.
-            if s in name_to_vidx:
-                hash_id: Optional[str] = s
-            else:
-                hash_id = self._resolve_one(s, passage_lookup, entity_text_to_hash)
-            if hash_id is None or hash_id not in name_to_vidx:
-                unresolved.append(s)
-                continue
-            vidx = name_to_vidx[hash_id]
-            v = graph.vs[vidx]
-            vtype = v.attributes().get("vertex_type") or self._guess_vertex_type(hash_id)
-            found.append(
-                {
-                    "input": s,
-                    "hash_id": hash_id,
-                    "vertex_type": vtype,
-                    "vertex_idx": vidx,
-                    "surface": v.attributes().get("content") or "",
-                }
+        # 1) NER-driven seeds — embedding-match each tagged surface.
+        try:
+            ner = channel._ensure_ner()
+            raw_surfaces = ner.question_ner(question)
+        except Exception as exc:
+            logger.warning("graph_explore[chain] question_ner failed: %s", exc)
+            raw_surfaces = []
+        canonical: List[str] = []
+        seen_canon: set = set()
+        for raw in raw_surfaces:
+            c = normalize_for_hash(
+                raw,
+                fold_traditional=channel.linear_config.fold_traditional,
+                han_fragment_max_chars=channel.linear_config.junk_max_han_chars,
             )
-        return {"found": found, "unresolved": unresolved}
+            if c and c not in seen_canon:
+                seen_canon.add(c)
+                canonical.append(c)
+        if canonical:
+            embs = channel.embedding_client.encode(canonical)
+            if embs.ndim == 1:
+                embs = embs.reshape(1, -1)
+            for vec in embs:
+                top1 = channel.entity_store.topk(vec, 1)
+                if not top1:
+                    continue
+                hid, sc = top1[0]
+                if hid not in channel._name_to_vidx:
+                    continue
+                if channel._is_hidden(channel._name_to_vidx[hid]):
+                    continue
+                surface = channel.entity_store.hash_id_to_text.get(hid, "")
+                cur = best.get(hid)
+                if cur is None or float(sc) > cur[0]:
+                    best[hid] = (float(sc), surface, "ner")
 
-    def _resolve_one(
+        # 2) Gazetteer literal scan — Aho-Corasick over question text.
+        try:
+            gaz = channel._ensure_gazetteer()
+        except Exception as exc:
+            logger.warning("graph_explore[chain] gazetteer build failed: %s", exc)
+            gaz = None
+        if gaz is not None:
+            counts = find_literal_matches(question, gaz)
+            for hid in counts.keys():
+                if hid not in channel._name_to_vidx:
+                    continue
+                if channel._is_hidden(channel._name_to_vidx[hid]):
+                    continue
+                surface = channel.entity_store.hash_id_to_text.get(hid, "")
+                cur = best.get(hid)
+                # Literal matches are unambiguous → pin to 1.0; source
+                # is upgraded to "gazetteer" if it beat the prior score.
+                if cur is None or 1.0 > cur[0]:
+                    best[hid] = (1.0, surface, "gazetteer")
+
+        # 3) Whole-question embedding top-k.
+        top = channel.entity_store.topk(q_emb, 5)
+        floor = 0.50
+        for hid, sc in top:
+            if sc < floor:
+                break
+            if hid not in channel._name_to_vidx:
+                continue
+            if channel._is_hidden(channel._name_to_vidx[hid]):
+                continue
+            surface = channel.entity_store.hash_id_to_text.get(hid, "")
+            cur = best.get(hid)
+            if cur is None or float(sc) > cur[0]:
+                best[hid] = (float(sc), surface, "question_embedding")
+
+        seeds = [
+            {"hash_id": hid, "sim": sim, "surface": surf, "source": src}
+            for hid, (sim, surf, src) in best.items()
+        ]
+        seeds.sort(key=lambda s: s["sim"], reverse=True)
+        return seeds[:_CHAIN_MAX_SEEDS]
+
+    def _chain_seeds_from_page(
         self,
-        s: str,
-        passage_lookup: Dict[Tuple[str, Optional[int]], str],
-        entity_text_to_hash: Dict[str, str],
-    ) -> Optional[str]:
-        # Page reference?
-        if "/" in s:
-            file_id, _, page_id = s.partition("/")
-            if page_id.startswith("p_"):
-                try:
-                    page_n: Optional[int] = int(page_id[2:])
-                except ValueError:
-                    page_n = None
-            else:
-                page_n = None
-            if page_n is not None:
-                hit = passage_lookup.get((file_id, page_n))
-                if hit:
-                    return hit
-        # Entity surface — normalize to canonical hash key. Pull the
-        # active per-domain cutoff from the channel's linear_config so a
-        # resolver running after the admin raised
-        # ``junk_max_han_chars`` to e.g. 25 doesn't keep dropping 18-25
-        # char clauses the ingest layer just accepted.
-        cfg = self._channel.linear_config
-        canon = normalize_for_hash(
-            s,
-            fold_traditional=cfg.fold_traditional,
-            han_fragment_max_chars=cfg.junk_max_han_chars,
-        )
-        if canon and canon in entity_text_to_hash:
-            return entity_text_to_hash[canon]
-        # Last resort: raw text match (already-canonical input).
-        if s in entity_text_to_hash:
-            return entity_text_to_hash[s]
-        return None
+        page_ref: str,
+        top_n: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Page-neighbors seeding: take the top entities mentioned on
+        ``page_ref`` (= ``"file_id/p_NNNN"``) as chain seeds.  Used
+        when the agent already knows the relevant page and wants to
+        bridge OUT (cross-doc entity that also appears in another
+        passage etc).
+        """
+        channel = self._channel
+        if "/" not in page_ref:
+            return []
+        file_id, page_id = page_ref.split("/", 1)
+        # Resolve to passage_hash via the (file_id, page_number) map.
+        try:
+            pn = int(page_id.replace("p_", "").lstrip("0") or "0")
+        except ValueError:
+            return []
+        meta_to_hash = self._passage_meta_to_hash()
+        passage_hash = meta_to_hash.get((file_id, pn))
+        if passage_hash is None:
+            return []
+        channel._build_entity_passage_indexes()
+        ents = (channel._passage_entities or {}).get(passage_hash, [])
+        text = channel.entity_store.hash_id_to_text
+        out: List[Dict[str, Any]] = []
+        for ent_hash, w in ents[:top_n]:
+            if ent_hash not in channel._name_to_vidx:
+                continue
+            out.append({
+                "hash_id": ent_hash,
+                "sim": float(w),
+                "surface": text.get(ent_hash, ""),
+                "source": "page_neighbors",
+            })
+        return out
 
-    def _bfs(
+    def _chain_seeds_from_surfaces(
         self,
-        seed_vidx: List[int],
-        hops: int,
-    ) -> Tuple[List[Tuple[int, float, int]], Dict[int, int]]:
-        """Breadth-first expansion. Returns ``(visited, parents)``.
+        surfaces: List[str],
+        *,
+        source_tag: str,
+    ) -> List[Dict[str, Any]]:
+        """Resolve a list of free-text surfaces to entity hashes via
+        embedding-match (same gradient-topk machinery as
+        entity_lookup).  Used for explicit-entity seeding and for
+        `to_entities` target resolution (sentence-bridge filter).
+        """
+        if not surfaces:
+            return []
+        channel = self._channel
+        text = channel.entity_store.hash_id_to_text
+        out: List[Dict[str, Any]] = []
+        for surf in surfaces:
+            surf = (surf or "").strip()
+            if not surf:
+                continue
+            try:
+                vec = channel.embedding_client.encode(surf)
+                if vec.ndim == 2:
+                    vec = vec[0]
+                top = channel.entity_store.topk(vec, 1)
+            except Exception:
+                continue
+            if not top:
+                continue
+            hid, score = top[0]
+            if hid not in channel._name_to_vidx:
+                continue
+            out.append({
+                "hash_id": hid,
+                "sim": float(score),
+                "surface": text.get(hid, surf),
+                "source": source_tag,
+            })
+        return out
 
-        ``visited`` is ``[(vidx, score, hop), ...]`` with seed vertices
-        excluded so callers see only *neighbors*.
+    def _top_L_entity_neighbors(
+        self, vidx: int, L: int
+    ) -> List[Tuple[str, float]]:
+        """Up to ``L`` entity-typed neighbors of ``vidx``, by edge weight desc.
 
-        ``parents`` maps every visited vertex to the predecessor along
-        a SHORTEST-HOP path (BFS first-discovery — never overwritten on
-        re-visit). Seeds map to themselves. Used by
-        :meth:`_materialize_paths` to render the breadcrumb trail.
-
-        Score is the *maximum* sum-of-edge-weights seen along any
-        explored path (treating absent weights as 1.0). Score and
-        parent are deliberately decoupled: parent always points along
-        the BFS tree (no cycles), score reflects the strongest
-        connection found during exploration.
+        Passage / sentence neighbors are skipped — chain navigates the
+        entity layer; pages are surfaced as a derived view in the
+        final candidate_pages list, not as beam-search nodes.
         """
         graph = self._channel.graph
         has_weight = "weight" in graph.es.attributes()
-        # ``best[v] = (score, hop)`` — score may improve on revisits;
-        # hop never does (BFS guarantees shortest hop on first visit).
-        best: Dict[int, Tuple[float, int]] = {v: (0.0, 0) for v in seed_vidx}
-        # ``parents`` is set ONCE per vertex on first discovery so the
-        # parent graph is acyclic and bounded-depth.
-        parents: Dict[int, int] = {v: v for v in seed_vidx}
-        frontier: deque = deque((v, 0.0, 0) for v in seed_vidx)
-        while frontier:
-            v, score, hop = frontier.popleft()
-            if hop >= hops:
+        out: List[Tuple[str, float]] = []
+        for e in graph.incident(vidx, mode="all"):
+            edge = graph.es[e]
+            w = float(edge["weight"]) if has_weight else 1.0
+            tgt = edge.target if edge.source == vidx else edge.source
+            v = graph.vs[tgt]
+            vtype = v.attributes().get("vertex_type") or self._guess_vertex_type(v["name"])
+            if vtype != "entity":
                 continue
-            for e in graph.incident(v, mode="all"):
-                edge = graph.es[e]
-                w = float(edge["weight"]) if has_weight else 1.0
-                target = edge.target if edge.source == v else edge.source
-                new_score = score + w
-                if target not in best:
-                    best[target] = (new_score, hop + 1)
-                    parents[target] = v
-                    frontier.append((target, new_score, hop + 1))
-                else:
-                    # Already discovered — only update score, keep the
-                    # original BFS-tree parent intact.
-                    cur_score, cur_hop = best[target]
-                    if new_score > cur_score:
-                        best[target] = (new_score, cur_hop)
-        visited = [
-            (vidx, sc, hp)
-            for vidx, (sc, hp) in best.items()
-            if hp > 0
-        ]
-        return visited, parents
+            if self._channel._is_hidden(tgt):
+                continue
+            out.append((v["name"], w))
+        out.sort(key=lambda item: item[1], reverse=True)
+        return out[:L]
 
-    def _materialize_paths(
-        self,
-        parents: Dict[int, int],
-        seeds: List[Dict[str, Any]],
-        targets: List[Tuple[Any, str]],
-    ) -> List[Dict[str, Any]]:
-        """Walk parent pointers from a target back to its seed.
+    @staticmethod
+    def _edge_score(sims: np.ndarray, n_support: int) -> float:
+        """log-mean-exp_β aggregate + frequency penalty + sigmoid.
 
-        Returns a list of ``{seed, target, hops, intermediates}`` where
-        ``intermediates`` lists ``{hash_id, surface, vertex_type}`` for
-        each hop strictly between seed and target. Targets that resolve
-        to no vertex (e.g. a passage we filtered out by file_ids) are
-        silently skipped.
+        ``log-mean-exp_β`` interpolates between mean (β→0) and max
+        (β→∞) so a single strong sentence can carry the edge but the
+        score still tracks aggregate evidence — sidesteps the "max
+        picks the noisiest hit" failure mode of naive top-1 pooling.
+
+        The frequency penalty ``γ·log(1 + n_support)`` down-weights
+        edges whose endpoints co-occur in many sentences — these are
+        almost always hub-pair noise (e.g. an entity that mentions
+        "figure" on every page) rather than a strong relation.
+
+        Sigmoid calibration maps the raw aggregate into [0, 1] so the
+        downstream log-probability path-scoring is well-conditioned.
         """
+        # Compute log_mean_exp_β in float64 with the standard max-shift
+        # trick so overflow can't bite when β·sim is large.
+        z = _CHAIN_BETA * sims
+        z_max = float(z.max())
+        lme = z_max + float(np.log(np.mean(np.exp(z - z_max))))
+        A = (lme / _CHAIN_BETA) - _CHAIN_GAMMA * float(np.log1p(n_support))
+        # Sigmoid keeps the answer in (0, 1) so log() downstream is safe.
+        return float(1.0 / (1.0 + np.exp(-_CHAIN_ALPHA * (A - _CHAIN_TAU))))
+
+    def _path_score(
+        self, path: Dict[str, Any], seed_hashes: set
+    ) -> float:
+        """``mean log p_e + κ·min log p_e + λ·coverage − ρ·hub-penalty``.
+
+        - mean log p_e: average edge confidence (length-normalised).
+        - min log p_e: weak-link penalty — a path with one near-zero
+          edge is worse than two mediocre ones, even if the sum is
+          similar.
+        - coverage: fraction of distinct seeds the path touches; an
+          ungrounded path (seed → random walk into a different topic)
+          scores lower than one that stays in the question's
+          referenced entities.
+        - hub_penalty: mean log-degree of nodes in path; routes
+          through high-degree hubs (which dilute mass everywhere)
+          score lower than routes through specific entities.
+        """
+        n_edges = len(path["edges"])
+        if n_edges == 0:
+            return 0.0
+        mean_log = path["log_p_sum"] / n_edges
+        min_log = path["log_p_min"]
+        seed_count = sum(1 for n in path["nodes"] if n in seed_hashes)
+        coverage = seed_count / max(len(seed_hashes), 1)
+        hub_pen = self._hub_penalty(path["nodes"])
+        return (
+            mean_log
+            + _CHAIN_W_MIN * min_log
+            + _CHAIN_W_COVER * coverage
+            - _CHAIN_W_HUB * hub_pen
+        )
+
+    def _hub_penalty(self, node_hashes: List[str]) -> float:
         graph = self._channel.graph
-        passage_meta = self._passage_meta_to_hash()
-        seed_idx_set = {s["vertex_idx"] for s in seeds}
+        name_to_vidx = self._channel._name_to_vidx
+        pen = 0.0
+        n = 0
+        for h in node_hashes:
+            vidx = name_to_vidx.get(h)
+            if vidx is None:
+                continue
+            pen += float(np.log1p(graph.degree(vidx)))
+            n += 1
+        return pen / max(n, 1)
+
+    def _render_chain_paths(
+        self, paths: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Serialise paths for the agent: nodes, edges, via-sentence snippets.
+
+        Each via-sentence is truncated to 220 chars (single-line
+        snippet) — the agent uses these as candidate answer spans, so
+        a useful snippet is enough; verbatim full-text is the
+        read_page tool's job.
+        """
+        channel = self._channel
+        ent_text = channel.entity_store.hash_id_to_text
+        sent_text = channel.sentence_store.hash_id_to_text
+        # L4: annotate each chain node with its logical cluster so the
+        # agent can see "this hop stays inside Nagano cluster, the
+        # next hop bridges to Olympics cluster".  Singleton entities
+        # surface their own hash as cluster_id (per the
+        # member_to_cluster `.get(name, name)` fallback).
+        _, m2c = channel._load_clusters_cached()
         out: List[Dict[str, Any]] = []
-        seen_targets: set = set()
-        for target_key, kind in targets:
-            target_vidx = self._target_vidx(target_key, kind, passage_meta)
-            if target_vidx is None or target_vidx in seen_targets:
-                continue
-            # Skip targets that ARE seeds — a hops=0 path is degenerate
-            # (we already ship seed info in ``seeds_resolved``).
-            if target_vidx in seed_idx_set:
-                continue
-            seen_targets.add(target_vidx)
-            chain = self._walk_to_seed(parents, target_vidx, seed_idx_set)
-            if chain is None or len(chain) < 2:
-                continue
-            seed_v = chain[0]
-            target_v = chain[-1]
-            intermediates = [
-                self._render_node(graph.vs[v]) for v in chain[1:-1]
-            ]
+        for p in paths:
+            nodes_out = []
+            for h in p["nodes"]:
+                cid = m2c.get(h, h)
+                # Try to get a canonical/representative surface
+                # (sometimes ≠ the literal node's surface).
+                rep_surfs = channel.cluster_top_surfaces(cid, top_n=1)
+                nodes_out.append({
+                    "hash_id": h,
+                    "surface": ent_text.get(h, ""),
+                    "cluster_id": cid,
+                    "cluster_top_surface": (rep_surfs[0]["surface"]
+                                            if rep_surfs else ent_text.get(h, "")),
+                })
+            edges_out: List[Dict[str, Any]] = []
+            for e in p["edges"]:
+                via_snippets: List[Dict[str, Any]] = []
+                for sid in e["via_sentences"]:
+                    txt = sent_text.get(sid, "")
+                    if not txt:
+                        continue
+                    snippet = txt if len(txt) <= 220 else txt[:217] + "..."
+                    via_snippets.append({"sentence_id": sid, "text": snippet})
+                edges_out.append(
+                    {
+                        "from": e["tail"],
+                        "to": e["head"],
+                        "edge_score": round(float(e["edge_score"]), 4),
+                        "n_support": int(e["n_support"]),
+                        "via_sentences": via_snippets,
+                    }
+                )
             out.append(
                 {
-                    "seed": self._render_node(graph.vs[seed_v]),
-                    "target": self._render_node(graph.vs[target_v]),
-                    "hops": len(chain) - 1,
-                    "intermediates": intermediates,
+                    "nodes": nodes_out,
+                    "edges": edges_out,
+                    "score": round(float(p["score"]), 4),
+                    "hops": len(p["edges"]),
                 }
             )
         return out
 
-    def _target_vidx(
+    def _chain_candidate_pages(
         self,
-        target_key: Any,
-        kind: str,
-        passage_meta: Dict[Tuple[str, Optional[int]], str],
-    ) -> Optional[int]:
-        if kind == "entity":
-            return self._channel._name_to_vidx.get(str(target_key))
-        if kind == "passage":
-            file_id, page_n = target_key
-            hash_id = passage_meta.get((file_id, _coerce_int(page_n)))
-            return self._channel._name_to_vidx.get(hash_id) if hash_id else None
-        return None
+        paths: List[Dict[str, Any]],
+        scope,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Aggregate passage mass from entities visited in top paths.
 
-    @staticmethod
-    def _walk_to_seed(
-        parents: Dict[int, int], start: int, seed_idx_set: set
-    ) -> Optional[List[int]]:
-        chain: List[int] = [start]
-        cur = start
-        # Bound the walk by the number of vertices to avoid pathological
-        # cycles in the parent map (shouldn't happen, but cheap to guard).
-        for _ in range(len(parents) + 1):
-            if cur in seed_idx_set:
-                chain.reverse()
-                return chain
-            nxt = parents.get(cur)
-            if nxt is None or nxt == cur:
-                return None
-            chain.append(nxt)
-            cur = nxt
-        return None
+        Path weight is ``1 / (1 + rank)`` so the score-sign issue (path
+        scores are mean-log-prob and therefore negative) doesn't
+        collapse all candidates to zero; rank is well-defined for any
+        comparable score. For each entity in each path, walk the
+        entity-passage edges and accumulate ``rank_weight · edge_weight
+        ÷ (1 + position·0.5)`` into the incident passages. Position
+        decay biases attribution toward passages anchored by the path's
+        endpoints (where the answer span typically lives) rather than
+        the seed entity (already known to the agent).
 
-    def _render_node(self, vertex) -> Dict[str, Any]:
-        attrs = vertex.attributes()
-        vtype = attrs.get("vertex_type") or self._guess_vertex_type(vertex["name"])
-        node: Dict[str, Any] = {
-            "hash_id": vertex["name"],
-            "vertex_type": vtype,
-        }
-        surface = attrs.get("content")
-        if surface:
-            node["surface"] = surface
-        if vtype == "passage":
-            meta = self._passage_meta_lookup().get(vertex["name"])
-            if meta:
-                file_id, page_n = meta
-                pn_int = _coerce_int(page_n)
-                node["file_id"] = file_id
-                if pn_int is not None:
-                    node["page_id"] = f"p_{pn_int:04d}"
-                    node["page_number"] = pn_int
-        return node
+        Returns passages in score-desc order, filtered by ``scope``.
+        """
+        graph = self._channel.graph
+        name_to_vidx = self._channel._name_to_vidx
+        passage_meta = self._passage_meta_lookup()
+        has_weight = "weight" in graph.es.attributes()
+        page_score: Dict[str, float] = defaultdict(float)
+        for rank, p in enumerate(paths):
+            base = 1.0 / (1.0 + rank)
+            for pos, node in enumerate(p["nodes"]):
+                vidx = name_to_vidx.get(node)
+                if vidx is None:
+                    continue
+                v = graph.vs[vidx]
+                vtype = v.attributes().get("vertex_type") or self._guess_vertex_type(
+                    v["name"]
+                )
+                if vtype != "entity":
+                    continue
+                decay = 1.0 + 0.5 * pos
+                for e in graph.incident(vidx, mode="all"):
+                    edge = graph.es[e]
+                    w = float(edge["weight"]) if has_weight else 1.0
+                    tgt = edge.target if edge.source == vidx else edge.source
+                    tv = graph.vs[tgt]
+                    tvtype = tv.attributes().get("vertex_type") or self._guess_vertex_type(
+                        tv["name"]
+                    )
+                    if tvtype != "passage":
+                        continue
+                    page_score[tv["name"]] += base * w / decay
+        out: List[Dict[str, Any]] = []
+        for passage_hash, score in sorted(
+            page_score.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            meta = passage_meta.get(passage_hash)
+            if meta is None:
+                continue
+            file_id, page_n = meta
+            pn_int = _coerce_int(page_n)
+            if not scope.contains(file_id, pn_int):
+                continue
+            out.append(
+                {
+                    "file_id": file_id,
+                    "page_id": f"p_{pn_int:04d}" if pn_int is not None else None,
+                    "page_number": pn_int,
+                    "score": round(float(score), 6),
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
 
     # ----------------------------------------------------------- entity_lookup
 
@@ -897,6 +1499,7 @@ class GraphExploreTool(BaseTool):
         cluster_idx = self._cluster_index_lookup()
         reverse_map = self._reverse_map_lookup()
         physical: List[Dict[str, Any]] = []
+        seen_cluster_ids: set = set()
         for cand in cands:
             row = store.get_meta_row(cand.hash_id)
             phys_text = (row.get("text") or "").strip()
@@ -907,7 +1510,26 @@ class GraphExploreTool(BaseTool):
                 "similarity": round(float(cand.score), 4),
             }
             if cluster_info is not None:
-                entry["logical_cluster"] = cluster_info
+                cid = cluster_info.get("cluster_id")
+                # L1: replace hash-id members with readable
+                # surfaces ranked by mention weight (top-8).  Add
+                # cluster_size so the agent knows whether a tiny
+                # cluster (likely correct) or a giant percolation
+                # blob (likely over-merged).
+                top_surfs = self._channel.cluster_top_surfaces(cid, top_n=8)
+                full_size = len(cluster_info.get("members") or [])
+                entry["logical_cluster"] = {
+                    "cluster_id": cid,
+                    "canonical": cluster_info.get("canonical"),
+                    "cluster_size": full_size,
+                    "top_members": top_surfs,
+                    # Heuristic flag: clusters > 50 members likely
+                    # include over-merges; agent should treat them
+                    # with caution.  Concrete audit available via
+                    # ``mode=cluster_inspect``.
+                    "audit_recommended": full_size > 50,
+                }
+                seen_cluster_ids.add(cid)
             # Collapse-mode citation bridge: walk the reverse_map chain
             # to the live canonical so a hidden intermediate hop is
             # never surfaced. Overlay mode never populates reverse_map
@@ -962,6 +1584,126 @@ class GraphExploreTool(BaseTool):
         if hash_id.startswith("sentence-"):
             return "sentence"
         return "unknown"
+
+    # ----------------------------------------------------------- new modes
+
+    def _run_cluster_inspect(self, context: "AgentContext", **kwargs):
+        """``mode='cluster_inspect'`` — audit a logical cluster.
+
+        Returns:
+          - all member surfaces (ranked by mention weight)
+          - top-K passages where the cluster appears (cross-doc)
+          - co-occurring clusters (via pair_via_sentences)
+          - alias edge quality audit (cos/reranker/accepted_by)
+
+        Decisive use case: the agent suspects an over-merged cluster
+        (e.g. Lincoln ↔ John Ashby) and wants to check trustworthiness
+        before answering.  Also lets the agent enumerate cross-doc
+        evidence pages for a single logical entity in one call.
+        """
+        cluster_id = (kwargs.get("cluster_id") or "").strip()
+        if not cluster_id:
+            return err(
+                "invalid_argument",
+                "`cluster_id` is required for mode='cluster_inspect'.",
+                valid_example={"mode": "cluster_inspect", "cluster_id": "c_2436"},
+            ), {"error": "invalid_argument"}
+        top_passages = int(kwargs.get("top_passages") or 10)
+        top_members = int(kwargs.get("top_members") or 20)
+        top_cooccur = int(kwargs.get("top_cooccur") or 8)
+        ch = self._channel
+        # Validate the id exists (singleton fallback: treat unknown id
+        # as the entity hash itself).
+        clusters, _ = ch._load_clusters_cached()
+        if cluster_id not in clusters:
+            return err(
+                "unknown_cluster",
+                f"cluster_id {cluster_id!r} not found in clusters.json.",
+                remediation=(
+                    "Use entity_lookup(surface=…) to find a cluster_id, "
+                    "then re-call cluster_inspect on it."
+                ),
+            ), {"error": "unknown_cluster"}
+        members = clusters[cluster_id]
+        canonical = ch.entity_store.hash_id_to_text.get(members[0], "") if members else ""
+        try:
+            member_surfs = ch.cluster_top_surfaces(cluster_id, top_n=top_members)
+            top_pgs = ch.cluster_top_passages(cluster_id, top_n=top_passages)
+            cooccur = ch.cluster_cooccurrences(cluster_id, top_n=top_cooccur)
+            audit = ch.cluster_alias_audit(cluster_id)
+        except Exception as exc:
+            logger.exception("cluster_inspect failed: %s", exc)
+            return err(
+                "internal_error", f"cluster_inspect raised: {exc}",
+            ), {"error": "internal_error"}
+
+        log_meta = {
+            "mode": "cluster_inspect",
+            "cluster_id": cluster_id,
+            "cluster_size": len(members),
+        }
+        context.add_retrieval_log(tool_name="graph_explore", tokens=0, metadata=log_meta)
+
+        return (
+            ok(
+                "GraphExploreObservation",
+                mode="cluster_inspect",
+                cluster_id=cluster_id,
+                canonical=canonical,
+                cluster_size=len(members),
+                member_surfaces=member_surfs,
+                top_passages=top_pgs,
+                cooccur_clusters=cooccur,
+                alias_audit=audit,
+            ),
+            {"retrieved_tokens": 0, "members": len(member_surfs)},
+        )
+
+    def _run_list_clusters(self, context: "AgentContext", **kwargs):
+        """``mode='list_clusters'`` — enumerate clusters by size /
+        mention_weight, with optional surface filter.  Use cases:
+          - audit which clusters dominate the corpus
+          - find a cluster by partial surface match (when
+            entity_lookup's embedding match misses)
+        """
+        top_k = int(kwargs.get("top_k") or 20)
+        sort_by = (kwargs.get("sort_by") or "size").strip()
+        min_size = int(kwargs.get("min_size") or 2)
+        surface_filter = kwargs.get("surface_filter") or None
+        if sort_by not in {"size", "mention_weight"}:
+            return err(
+                "invalid_argument",
+                f"`sort_by` must be one of ['size', 'mention_weight'].",
+                valid_example={"mode": "list_clusters", "sort_by": "size"},
+            ), {"error": "invalid_argument"}
+        try:
+            rows = self._channel.list_top_clusters(
+                top_n=top_k, sort_by=sort_by,
+                min_size=min_size, surface_filter=surface_filter,
+            )
+        except Exception as exc:
+            logger.exception("list_clusters failed: %s", exc)
+            return err(
+                "internal_error", f"list_clusters raised: {exc}",
+            ), {"error": "internal_error"}
+
+        log_meta = {
+            "mode": "list_clusters", "sort_by": sort_by,
+            "n_returned": len(rows),
+        }
+        context.add_retrieval_log(tool_name="graph_explore", tokens=0, metadata=log_meta)
+        return (
+            ok(
+                "GraphExploreObservation",
+                mode="list_clusters",
+                sort_by=sort_by,
+                surface_filter=surface_filter,
+                clusters=rows,
+            ),
+            {"retrieved_tokens": 0, "clusters": len(rows)},
+        )
+
+    # ----------------------------------------------------------- helpers
 
     def _reverse_map_lookup(self) -> Dict[str, str]:
         """Lazy-load the on-disk reverse_map (collapse mode); empty in overlay."""

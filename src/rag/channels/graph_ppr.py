@@ -114,12 +114,47 @@ class GraphPPRChannel(BaseChannel):
         self._ner: Optional[GLiNERAdapter] = None
         self._entity_to_sents: Optional[Dict[str, List[str]]] = None
         self._sent_to_entities: Optional[Dict[str, List[str]]] = None
+        # Reverse index ``frozenset({entity_hash_a, entity_hash_b}) →
+        # [sentence_hash_id, ...]`` materialised on first call to
+        # :meth:`pair_via_sentences`. Powers query-time typed-edge scoring
+        # in graph_explore's ``chain`` mode: the sentence(s) where two
+        # entities co-occur ARE the implicit predicate, so cos(q_emb,
+        # sent_emb) gives a per-query, per-edge dynamic relation score
+        # without ever invoking an LLM at build time.
+        self._pair_via_sentences: Optional[Dict[frozenset, List[str]]] = None
 
         # Lazy gazetteer Aho-Corasick automaton over entity surfaces, used
         # as a query-side seed fallback when NER misses domain product
         # names (e.g. "Heritage Protector Option"). Mirrors the
         # HippoRAG-2 query-to-node seeding idea.
         self._gazetteer_automaton = None
+
+        # Lazy quotient graph for ``ppr_on_logical=True`` — alias CCs
+        # contracted into super-nodes. Built once on first query that
+        # needs it, then cached. Refreshed by :meth:`reload`.
+        self._quotient_graph: Optional[ig.Graph] = None
+        self._quotient_member_to_super: Dict[str, int] = {}
+        self._quotient_super_passage_vidx: List[int] = []
+        self._quotient_name_to_super: Optional[Dict[str, int]] = None
+
+        # Shared cluster cache for ``ppr_seed_cluster_spread`` and
+        # ``ppr_on_logical``. Loading clusters.json once per channel
+        # saves ~tens of ms per query × 1950q.
+        self._cluster_cache: Optional[Dict[str, List[str]]] = None
+        self._member_to_cluster_cache: Optional[Dict[str, str]] = None
+
+        # Pre-built indexes for agent-facing helpers (lazy on first use):
+        #   - ``_entity_passage_degree[entity_hash]`` → cumulative
+        #     entity_passage edge weight from that entity. Surrogate
+        #     for "how often does this entity appear in the corpus".
+        #   - ``_passage_entities[passage_hash]`` → list of
+        #     (entity_hash, edge_weight), sorted desc. Used to surface
+        #     "which entities/clusters dominate this page" per
+        #     candidate page returned by PPR (provenance).
+        # Building both once costs O(E_entity_passage) ≈ 560 k iterations
+        # on v6; in-memory dicts then serve agent helpers in O(1).
+        self._entity_passage_degree: Optional[Dict[str, float]] = None
+        self._passage_entities: Optional[Dict[str, List[Tuple[str, float]]]] = None
 
         # Debug snapshot — populated each retrieve() call. Inspect with
         # ``channel.last_debug`` after a query for tracing.
@@ -216,7 +251,16 @@ class GraphPPRChannel(BaseChannel):
 
             self._entity_to_sents = None
             self._sent_to_entities = None
+            self._pair_via_sentences = None
             self._gazetteer_automaton = None
+            self._quotient_graph = None
+            self._quotient_member_to_super = {}
+            self._quotient_super_passage_vidx = []
+            self._quotient_name_to_super = None
+            self._cluster_cache = None
+            self._member_to_cluster_cache = None
+            self._entity_passage_degree = None
+            self._passage_entities = None
             # Drop the cached NER adapter too. The shared GLiNER model
             # itself stays pinned by ``shared_gliner``'s lru_cache, but
             # this adapter holds a frozen reference to the old
@@ -393,11 +437,491 @@ class GraphPPRChannel(BaseChannel):
                 if hid not in best or score > best[hid][1]:
                     best[hid] = (self._name_to_vidx[hid], float(score))
 
-        # Fallback path — only when caller asked AND NER produced nothing.
-        if enable_fallback and not best and len(self.entity_store) > 0:
-            best = self._fallback_seeds(question)
+        # Fallback path — fires when caller asked AND the NER signal
+        # is weak. "Weak" was historically ``not best`` (zero seeds),
+        # but the agent's failure analysis (Q-B-7 "2nd Cavalry
+        # Division", partial-NER cases) shows that **one or two
+        # low-confidence seeds also benefit from the gazetteer +
+        # question-embedding rescue**. The new gate ``< 2 seeds OR
+        # max(sim) < 0.7`` catches those without over-triggering on
+        # questions with strong full-NER coverage.
+        if enable_fallback and len(self.entity_store) > 0:
+            max_sim = max((s for _, s in best.values()), default=0.0)
+            if len(best) < 2 or max_sim < 0.7:
+                supplement = self._fallback_seeds(question)
+                for hid, (vidx, sim) in supplement.items():
+                    if hid not in best or sim > best[hid][1]:
+                        best[hid] = (vidx, sim)
 
-        return [(hid, vidx, sim) for hid, (vidx, sim) in best.items()]
+        seeds = [(hid, vidx, sim) for hid, (vidx, sim) in best.items()]
+
+        # Option A: spread reset mass to alias-cluster members. The
+        # logical entity (alias-connected component) is what the
+        # paper §3.1.3 calls a "cluster". Seeding only the matched
+        # physical surface gives PPR a sparse start; spreading to
+        # all cluster members better approximates "I want to walk
+        # from THIS LOGICAL ENTITY" without changing the underlying
+        # physical graph (which keeps full provenance + repair
+        # properties — alias edges remain deletable).
+        # Controlled by ``RAGConfig.ppr_seed_cluster_spread``;
+        # default True since this is the design intent of the
+        # three-layer (physical / cluster / logical) abstraction.
+        #
+        # **Skip when ``ppr_on_logical=True``**: in logical PPR each
+        # cluster is already a single super-node, so projecting
+        # already-spread seeds would inflate reset mass by cluster
+        # size. Only the direct NER seeds are projected onto
+        # super-nodes in the logical path.
+        if getattr(self.config, "ppr_seed_cluster_spread", True) and not getattr(
+            self.config, "ppr_on_logical", False
+        ):
+            seeds = self._spread_seeds_to_clusters(seeds)
+
+        return seeds
+
+    # Cap on cluster members spread as additional seeds, per cluster.
+    # A handful of giant connected components (a single hub cluster can
+    # absorb >50% of all entities on real corpora) would otherwise dump
+    # tens of thousands of low-info seeds into PPR personalization and
+    # explode _calculate_passage_scores (which substring-counts every
+    # active entity against every passage). 50 covers the
+    # alias-precision-validated cases; bigger clusters mostly carry
+    # noise from over-merging and should not propagate full mass.
+    _CLUSTER_SPREAD_MAX_MEMBERS = 50
+
+    # ----------------------------------------------------------- agent helpers
+
+    def _build_entity_passage_indexes(self) -> None:
+        """Build ``_entity_passage_degree`` + ``_passage_entities`` in one
+        graph-edge scan.  Used by agent-facing helpers (cluster top
+        surface ranking, page-level provenance, cluster_inspect).
+
+        Cost: single O(E) walk over the entity_passage edges (~560 k
+        on v6). Dictionaries then serve agent calls in O(1).
+        """
+        if self._entity_passage_degree is not None:
+            return
+        if self.graph is None:
+            self._entity_passage_degree = {}
+            self._passage_entities = {}
+            return
+        if "edge_type" not in self.graph.es.attributes():
+            self._entity_passage_degree = {}
+            self._passage_entities = {}
+            return
+        deg: Dict[str, float] = {}
+        pe: Dict[str, List[Tuple[str, float]]] = {}
+        is_entity = "vertex_type" in self.graph.vs.attributes()
+        for e in self.graph.es:
+            if e["edge_type"] != "entity_passage":
+                continue
+            u_name = self.graph.vs[e.source]["name"]
+            v_name = self.graph.vs[e.target]["name"]
+            # Identify which endpoint is entity vs passage.
+            if is_entity:
+                u_type = self.graph.vs[e.source]["vertex_type"]
+                v_type = self.graph.vs[e.target]["vertex_type"]
+                if u_type == "entity" and v_type == "passage":
+                    ent_name, pass_name = u_name, v_name
+                elif u_type == "passage" and v_type == "entity":
+                    ent_name, pass_name = v_name, u_name
+                else:
+                    continue  # malformed; skip
+            else:
+                # Fallback for graphs built without ``vertex_type``:
+                # infer from the ``entity-`` / ``passage-`` name prefix.
+                if u_name.startswith("entity-") and v_name.startswith("passage-"):
+                    ent_name, pass_name = u_name, v_name
+                elif v_name.startswith("entity-") and u_name.startswith("passage-"):
+                    ent_name, pass_name = v_name, u_name
+                else:
+                    continue
+            w = float(e.attributes().get("weight") or 0.0)
+            deg[ent_name] = deg.get(ent_name, 0.0) + w
+            pe.setdefault(pass_name, []).append((ent_name, w))
+        # Sort each passage's entity list desc by weight.
+        for k in pe:
+            pe[k].sort(key=lambda t: t[1], reverse=True)
+        self._entity_passage_degree = deg
+        self._passage_entities = pe
+
+    def cluster_top_surfaces(
+        self, cluster_id: str, top_n: int = 8
+    ) -> List[Dict[str, Any]]:
+        """Return ``[{surface, hash_id, mention_weight}, ...]`` for a
+        cluster's members, ranked by aggregate entity_passage weight.
+        Used by entity_lookup / PPR / cluster_inspect to make the
+        logical entity human-readable for the agent.
+        """
+        self._build_entity_passage_indexes()
+        clusters, _ = self._load_clusters_cached()
+        members = clusters.get(cluster_id)
+        if members is None:
+            # Singleton: cluster_id IS the hash. Wrap as a one-element list.
+            members = [cluster_id]
+        text = self.entity_store.hash_id_to_text
+        deg = self._entity_passage_degree or {}
+        scored = []
+        for hid in members:
+            if hid not in self._name_to_vidx:
+                continue
+            scored.append({
+                "surface": text.get(hid, ""),
+                "hash_id": hid,
+                "mention_weight": round(float(deg.get(hid, 0.0)), 4),
+            })
+        scored.sort(key=lambda d: d["mention_weight"], reverse=True)
+        return scored[:top_n]
+
+    def passage_top_clusters(
+        self, passage_hash: str, top_n: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Return the top-N logical clusters touching this passage,
+        ranked by entity_passage edge weight.  Each entry:
+        ``{cluster_id, top_surface, weight}`` (cluster_id = entity_hash
+        for singletons).  Drives PPR per-page provenance.
+        """
+        self._build_entity_passage_indexes()
+        _, m2c = self._load_clusters_cached()
+        text = self.entity_store.hash_id_to_text
+        ents = (self._passage_entities or {}).get(passage_hash, [])
+        # Aggregate weight per cluster.
+        per_cluster: Dict[str, float] = {}
+        top_surface_per_cluster: Dict[str, Tuple[str, float]] = {}
+        for ent_hash, w in ents:
+            cid = m2c.get(ent_hash, ent_hash)
+            per_cluster[cid] = per_cluster.get(cid, 0.0) + w
+            # Track the entity with the highest single-edge weight per cluster
+            # — its surface is most representative of the cluster's
+            # appearance on this page.
+            prev = top_surface_per_cluster.get(cid)
+            if prev is None or w > prev[1]:
+                top_surface_per_cluster[cid] = (text.get(ent_hash, ""), w)
+        ranked = sorted(per_cluster.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        return [
+            {
+                "cluster_id": cid,
+                "top_surface": top_surface_per_cluster[cid][0],
+                "weight": round(float(w), 4),
+            }
+            for cid, w in ranked
+        ]
+
+    def cluster_top_passages(
+        self, cluster_id: str, top_n: int = 10
+    ) -> List[Dict[str, Any]]:
+        """Return the top passages whose entity_passage edges sum
+        highest from any member of the cluster.  Each entry:
+        ``{passage_hash, file_id, page_id, page_number, weight,
+        member_surfaces}``.
+        """
+        self._build_entity_passage_indexes()
+        clusters, _ = self._load_clusters_cached()
+        members = set(clusters.get(cluster_id) or [cluster_id])
+        deg_per_passage: Dict[str, float] = {}
+        members_per_passage: Dict[str, set] = {}
+        text = self.entity_store.hash_id_to_text
+        pe = self._passage_entities or {}
+        # Reverse-iterate: for each passage in pe, check overlap with members.
+        for pass_hash, ent_list in pe.items():
+            page_total = 0.0
+            seen_members: set = set()
+            for ent_hash, w in ent_list:
+                if ent_hash in members:
+                    page_total += w
+                    seen_members.add(ent_hash)
+            if page_total > 0:
+                deg_per_passage[pass_hash] = page_total
+                members_per_passage[pass_hash] = seen_members
+        ranked = sorted(deg_per_passage.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        # Pull (file_id, page_number) via passage_store meta.
+        col_fid = self.passage_store.meta_column("file_id")
+        col_pn = self.passage_store.meta_column("page_number")
+        meta_map = {
+            h: (str(fid), int(pn) if pn is not None else None)
+            for h, fid, pn in zip(self.passage_store.hash_ids, col_fid, col_pn)
+        }
+        out: List[Dict[str, Any]] = []
+        for pass_hash, w in ranked:
+            fid, pn = meta_map.get(pass_hash, ("", None))
+            out.append({
+                "passage_hash": pass_hash,
+                "file_id": fid,
+                "page_id": f"p_{int(pn):04d}" if pn is not None else "",
+                "page_number": pn,
+                "weight": round(float(w), 4),
+                "member_surfaces": [text.get(m, "")
+                                    for m in list(members_per_passage[pass_hash])[:3]],
+            })
+        return out
+
+    def cluster_cooccurrences(
+        self, cluster_id: str, top_n: int = 8
+    ) -> List[Dict[str, Any]]:
+        """For ``cluster_id``, find the top-N OTHER clusters whose
+        members co-occur in shared sentences (via the pair_via_sentences
+        index).  Each entry:
+        ``{cluster_id, top_surface, shared_sentences_n}``.
+
+        Captures "what else is this entity usually talked about with"
+        — a structural neighbor that bridges multi-hop questions.
+        """
+        clusters, m2c = self._load_clusters_cached()
+        members = set(clusters.get(cluster_id) or [cluster_id])
+        if not members:
+            return []
+        pair_via = self.pair_via_sentences()
+        # For each member, look at its pair_via_sentences entries.
+        cooccur: Dict[str, int] = {}
+        for pair, sents in pair_via.items():
+            a, b = list(pair)
+            if a in members and b not in members:
+                other = m2c.get(b, b)
+                if other == cluster_id:
+                    continue
+                cooccur[other] = cooccur.get(other, 0) + len(sents)
+            elif b in members and a not in members:
+                other = m2c.get(a, a)
+                if other == cluster_id:
+                    continue
+                cooccur[other] = cooccur.get(other, 0) + len(sents)
+        ranked = sorted(cooccur.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+        text = self.entity_store.hash_id_to_text
+        out: List[Dict[str, Any]] = []
+        for cid, sn in ranked:
+            top_surf_list = self.cluster_top_surfaces(cid, top_n=1)
+            top_surf = top_surf_list[0]["surface"] if top_surf_list else text.get(cid, "")
+            out.append({
+                "cluster_id": cid,
+                "top_surface": top_surf,
+                "shared_sentences_n": int(sn),
+            })
+        return out
+
+    def cluster_alias_audit(self, cluster_id: str) -> Dict[str, Any]:
+        """Return aggregate alias-edge quality for a cluster:
+        ``{n_alias_edges, cos_min, cos_avg, reranker_avg, accepted_by}``.
+        Lets the agent decide whether to TRUST a cluster's
+        cross-surface aggregation (e.g. avoid a low-cos / sketchy
+        merge for the final answer).
+        """
+        clusters, _ = self._load_clusters_cached()
+        members = set(clusters.get(cluster_id) or [cluster_id])
+        if self.graph is None or len(members) <= 1:
+            return {"n_alias_edges": 0}
+        cos_list: List[float] = []
+        rerank_list: List[float] = []
+        accepted_by: Dict[str, int] = {}
+        # Walk alias edges; keep those with both endpoints inside the cluster.
+        member_vidx = {self._name_to_vidx[m] for m in members
+                       if m in self._name_to_vidx}
+        if not member_vidx:
+            return {"n_alias_edges": 0}
+        for e in self.graph.es.select(edge_type="alias"):
+            if e.source not in member_vidx or e.target not in member_vidx:
+                continue
+            attrs = e.attributes()
+            fj = attrs.get("features_json")
+            if fj:
+                try:
+                    import json as _json
+                    feats = _json.loads(fj)
+                    cs = feats.get("cos_sim")
+                    rs = feats.get("reranker_score")
+                    ab = feats.get("accepted_by")
+                    if cs is not None: cos_list.append(float(cs))
+                    if rs is not None: rerank_list.append(float(rs))
+                    if ab: accepted_by[ab] = accepted_by.get(ab, 0) + 1
+                except Exception:
+                    pass
+        result: Dict[str, Any] = {"n_alias_edges": len(cos_list)}
+        if cos_list:
+            result["cos_min"] = round(min(cos_list), 4)
+            result["cos_avg"] = round(sum(cos_list) / len(cos_list), 4)
+        if rerank_list:
+            result["reranker_avg"] = round(sum(rerank_list) / len(rerank_list), 4)
+        if accepted_by:
+            result["accepted_by"] = accepted_by
+        return result
+
+    def list_top_clusters(
+        self,
+        top_n: int = 20,
+        sort_by: str = "size",
+        min_size: int = 2,
+        surface_filter: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """List top clusters by ``size`` / ``mention_weight`` /
+        ``alias_cos_avg``. Used by the new list_clusters mode for
+        agent + workbench audit.
+        """
+        self._build_entity_passage_indexes()
+        clusters, _ = self._load_clusters_cached()
+        text = self.entity_store.hash_id_to_text
+        deg = self._entity_passage_degree or {}
+        rows: List[Dict[str, Any]] = []
+        sf = surface_filter.lower() if surface_filter else None
+        for cid, members in clusters.items():
+            if len(members) < min_size:
+                continue
+            top_surfs = self.cluster_top_surfaces(cid, top_n=3)
+            if sf and not any(sf in s.get("surface", "").lower() for s in top_surfs):
+                continue
+            mention_weight = sum(float(deg.get(m, 0.0)) for m in members)
+            rows.append({
+                "cluster_id": cid,
+                "size": len(members),
+                "top_surfaces": [s["surface"] for s in top_surfs],
+                "mention_weight": round(mention_weight, 2),
+            })
+        key_map = {
+            "size": lambda r: r["size"],
+            "mention_weight": lambda r: r["mention_weight"],
+        }
+        sort_key = key_map.get(sort_by, key_map["size"])
+        rows.sort(key=sort_key, reverse=True)
+        return rows[:top_n]
+
+    def _load_clusters_cached(self) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
+        """Load + invert clusters once per channel; cache for subsequent
+        queries.  Returns ``(clusters, member_to_cluster)`` as
+        ``{cluster_id: [member_hash, ...]}`` and
+        ``{member_hash: cluster_id}``.  Empty dicts on any failure
+        (logged, not raised).
+
+        Normalizes ``get_clusters`` / ``compute_clusters_for_collapse``
+        output (``List[{"id":, "members":, ...}]``) to a plain
+        ``Dict[cluster_id, members]`` for callers.
+        """
+        if self._cluster_cache is not None and self._member_to_cluster_cache is not None:
+            return self._cluster_cache, self._member_to_cluster_cache
+        if self.graph is None:
+            self._cluster_cache = {}
+            self._member_to_cluster_cache = {}
+            return self._cluster_cache, self._member_to_cluster_cache
+        try:
+            handler = getattr(self.linear_config, "acceptance_handler", "overlay")
+            if handler in ("collapse_basic", "collapse_provenance"):
+                reverse_path = faiss_graph_dir() / "reverse_map.json"
+                reverse_map = load_reverse_map(reverse_path)
+                raw_rows = compute_clusters_for_collapse(self.graph, reverse_map)
+            else:
+                raw_rows = get_clusters(
+                    self.graph,
+                    faiss_graph_dir() / "clusters.json",
+                    algorithm=getattr(self.linear_config,
+                                      "cluster_algorithm",
+                                      "connected_components"),
+                    leiden_resolution=getattr(self.linear_config,
+                                              "cluster_leiden_resolution", 0.05),
+                    leiden_weighted=getattr(self.linear_config,
+                                            "cluster_leiden_weighted", True),
+                )
+        except Exception as exc:
+            logger.warning("graph_ppr: cluster load failed (%s)", exc)
+            raw_rows = []
+        # Normalize: source format is ``List[Dict]`` with ``id`` and
+        # ``members`` keys (also ``canonical``).  Singletons missing
+        # from the rows are implicitly under their own hash via the
+        # ``aggregate_by_cluster`` contract; we'll handle "no row =
+        # singleton" at the caller side via ``.get(name, name)``.
+        clusters: Dict[str, List[str]] = {}
+        if isinstance(raw_rows, list):
+            for i, row in enumerate(raw_rows):
+                if not isinstance(row, dict):
+                    continue
+                members = list(row.get("members") or [])
+                if not members:
+                    continue
+                cid = str(row.get("id") or row.get("canonical") or f"c_{i:06d}")
+                clusters[cid] = members
+        elif isinstance(raw_rows, dict):
+            # Accept ``{cluster_id: members}`` as an alternative shape.
+            for cid, members in raw_rows.items():
+                clusters[str(cid)] = list(members)
+        member_to_cluster: Dict[str, str] = {}
+        for cluster_id, members in clusters.items():
+            for m in members:
+                member_to_cluster[m] = cluster_id
+        self._cluster_cache = clusters
+        self._member_to_cluster_cache = member_to_cluster
+        return clusters, member_to_cluster
+
+    def _spread_seeds_to_clusters(
+        self,
+        seeds: List[Tuple[str, int, float]],
+    ) -> List[Tuple[str, int, float]]:
+        """Augment ``seeds`` with their alias-cluster siblings.
+
+        For each seed entity, find the cluster it belongs to and add
+        up to ``_CLUSTER_SPREAD_MAX_MEMBERS`` other physical members
+        (that are actual graph vertices) as additional seeds with the
+        same sim score scaled by ``1 / sqrt(|cluster|)`` so a huge
+        cluster doesn't dominate the PPR personalization vector. Hub
+        clusters formed by alias-percolation can absorb a large fraction
+        of all entities; ``_CLUSTER_SPREAD_MAX_MEMBERS`` caps the spread
+        from any single cluster.
+
+        Returns the union (original seeds preferred when a hash_id
+        appears in both, since the original score came from direct
+        NER-match and is more reliable than cluster-spread).
+        """
+        if not seeds or self.graph is None:
+            return seeds
+        clusters, member_to_cluster = self._load_clusters_cached()
+        if not clusters:
+            return seeds
+
+        import math as _m
+        existing = {hid for hid, _, _ in seeds}
+        augmented: List[Tuple[str, int, float]] = list(seeds)
+        # Per-call trace counters — surfaced on ``last_debug`` for the
+        # agent / workbench / postmortem to inspect spread behavior.
+        total_added = 0
+        total_truncated = 0  # cluster members skipped due to cap
+        max_cluster_seen = 0
+        for hid, _vidx, sim in seeds:
+            cluster_id = member_to_cluster.get(hid)
+            if cluster_id is None:
+                continue
+            members = clusters.get(cluster_id, [hid])
+            if len(members) <= 1:
+                continue
+            max_cluster_seen = max(max_cluster_seen, len(members))
+            damp = 1.0 / _m.sqrt(float(len(members)))
+            shared_sim = float(sim) * damp
+            added = 0
+            considered = 0
+            for member_hid in members:
+                considered += 1
+                if added >= self._CLUSTER_SPREAD_MAX_MEMBERS:
+                    total_truncated += max(
+                        0, len(members) - considered + 1
+                    )
+                    break
+                if member_hid == hid or member_hid in existing:
+                    continue
+                if member_hid not in self._name_to_vidx:
+                    continue
+                m_vidx = self._name_to_vidx[member_hid]
+                if self._is_hidden(m_vidx):
+                    continue
+                augmented.append((member_hid, m_vidx, shared_sim))
+                existing.add(member_hid)
+                added += 1
+                total_added += 1
+        self.last_debug["seed_spread_added"] = total_added
+        self.last_debug["seed_spread_truncated"] = total_truncated
+        self.last_debug["seed_spread_max_cluster"] = max_cluster_seen
+        return augmented
+
+    # Cap on literal-gazetteer-fallback seeds. The fallback fires when
+    # the question has weak NER signal (< 2 seeds OR max_sim < 0.7) and
+    # a long question can otherwise inject dozens of common-noun matches
+    # as PPR seeds, drowning out the few entities that actually matter.
+    # 8 covers the typical multi-hop "X of Y that Z" + supporting noun
+    # phrase set without flooding.
+    _FALLBACK_LITERAL_MAX_SEEDS = 8
 
     def _fallback_seeds(self, question: str) -> Dict[str, Tuple[int, float]]:
         """Two-stage no-NER seed recovery; see :meth:`_seed_entities`."""
@@ -405,12 +929,15 @@ class GraphPPRChannel(BaseChannel):
         gaz = self._ensure_gazetteer()
         if gaz is not None:
             counts = find_literal_matches(question, gaz)
+            # Cap to top-N hits ranked by match count so a long question
+            # cannot inject dozens of common-noun gazetteer hits as PPR
+            # seeds. Distinct hits in the same question are themselves
+            # equally weighted (score 1.0) — the cap is a guard against
+            # gazetteer flood, not a within-question relevance signal.
+            ranked = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
             literal_hits: Dict[str, Tuple[int, float]] = {}
-            for hid, count in counts.items():
+            for hid, _count in ranked[: self._FALLBACK_LITERAL_MAX_SEEDS]:
                 if hid in self._name_to_vidx:
-                    # Score = 1.0 (literal match is unambiguous); count
-                    # not used for ranking since each hit is a distinct
-                    # entity in the question.
                     literal_hits[hid] = (self._name_to_vidx[hid], 1.0)
             if literal_hits:
                 self.last_debug["fallback"] = "gazetteer_literal"
@@ -565,6 +1092,45 @@ class GraphPPRChannel(BaseChannel):
         self._sent_to_entities = sent_to_ents
         return ent_to_sents, sent_to_ents
 
+    def pair_via_sentences(self) -> Dict[frozenset, List[str]]:
+        """Reverse index ``{entity_a_hash, entity_b_hash} → [sent_hash, ...]``.
+
+        Drives query-time typed-edge scoring in graph_explore's
+        ``chain`` mode (no LLM at build time — the natural-language
+        sentence in which two entities co-occur IS the implicit
+        predicate, scored per-query by cos(q_emb, sent_emb)). Built
+        lazily from :meth:`_mention_maps` on first access; takes ~O(Σ
+        |entities_per_sentence|²) which for typical NER (≤5 entities /
+        sentence) is dominated by Σ |entities_per_sentence|.
+
+        Storage: ``frozenset({a, b})`` for the key so direction-free
+        lookup is O(1) and the index is symmetric (the underlying graph
+        is undirected). Singleton sentences (one or zero entities) are
+        skipped — they contribute no edges. Duplicate hashes within a
+        single sentence are de-duped before pairing so reflexive
+        ``(a, a)`` entries never appear.
+        """
+        if self._pair_via_sentences is not None:
+            return self._pair_via_sentences
+        _, sent_to_ents = self._mention_maps()
+        pair_idx: Dict[frozenset, List[str]] = {}
+        for sent_hash, ent_list in sent_to_ents.items():
+            uniq = list(dict.fromkeys(ent_list))  # preserve order, dedup
+            if len(uniq) < 2:
+                continue
+            for i in range(len(uniq)):
+                a = uniq[i]
+                for j in range(i + 1, len(uniq)):
+                    b = uniq[j]
+                    key = frozenset((a, b))
+                    bucket = pair_idx.get(key)
+                    if bucket is None:
+                        pair_idx[key] = [sent_hash]
+                    elif sent_hash not in bucket:
+                        bucket.append(sent_hash)
+        self._pair_via_sentences = pair_idx
+        return pair_idx
+
     # ----------------------------------------------------------- passage scoring
 
     def _calculate_passage_scores(
@@ -636,6 +1202,14 @@ class GraphPPRChannel(BaseChannel):
         """Run PPR and return both the ranked passage list and the full
         per-vertex score array.
 
+        Dispatches between physical and logical PPR per
+        ``RAGConfig.ppr_on_logical``. The two paths take the same
+        physical ``node_weights`` vector (already populated by
+        ``_calculate_entity_scores`` + ``_calculate_passage_scores``);
+        the logical path projects the seed mass through the cluster
+        contraction before running PPR on the quotient graph and
+        then back-projects scores to physical passages.
+
         The score array enables post-hoc views (cluster_scores, surface
         attribution) without re-running PPR; it's used internally by
         :meth:`retrieve_subgraph` and the agent's graph_explore tool.
@@ -643,6 +1217,8 @@ class GraphPPRChannel(BaseChannel):
         to propagate).
         """
         cfg = self.config
+        if getattr(cfg, "ppr_on_logical", False):
+            return self._run_ppr_full_logical(node_weights)
         reset = np.where(np.isnan(node_weights) | (node_weights < 0), 0.0, node_weights)
         if reset.sum() <= 0:
             return [], None
@@ -665,6 +1241,220 @@ class GraphPPRChannel(BaseChannel):
             name = self.graph.vs[vidx]["name"]
             out.append((str(name), float(passage_scores[int(j)])))
         return out, scores_arr
+
+    # ----------------------------------------------------------- logical PPR
+
+    def _ensure_quotient_graph(self) -> Optional[ig.Graph]:
+        """Build the alias-cluster-contracted quotient graph once.
+
+        Construction:
+          * For each entity vertex, look up its alias-cluster id.
+            Members of a cluster collapse to one super-node.
+            Singletons become super-nodes named after their own hash.
+          * Passage vertices are preserved 1:1 (they don't collapse).
+          * Edges:
+            - alias edges: dropped (they're WITHIN super-nodes now).
+            - entity-passage: source maps to its super-node;
+              multi-edges merged by sum of weights.
+            - adjacent-passage / sentence-passage: preserved as-is.
+          * The quotient is constructed in O(V + E) once; subsequent
+            retrieves use the cached graph.
+
+        Used only when ``RAGConfig.ppr_on_logical=True``. The physical
+        graph is the source of truth; this is a retrieval-time
+        projection that the user can toggle without touching storage.
+        """
+        if self._quotient_graph is not None:
+            return self._quotient_graph
+        if self.graph is None:
+            return None
+        import time as _time
+        _t0 = _time.time()
+        clusters, member_to_cluster = self._load_clusters_cached()
+        if not clusters:
+            logger.warning("graph_ppr: quotient cluster load returned empty")
+            return None
+
+        # Each super-node has a synthetic name distinct from any
+        # physical id. We use the cluster_id directly (callers know
+        # they're looking at logical ids).
+        is_entity = ("vertex_type" in self.graph.vs.attributes())
+        super_names: List[str] = []
+        super_name_to_idx: Dict[str, int] = {}
+
+        # First pass: entity super-nodes. For each entity, find its
+        # cluster_id and ensure we have a super-name for it.
+        for v in self.graph.vs:
+            if is_entity and v["vertex_type"] != "entity":
+                continue
+            name = v["name"]
+            cluster_id = member_to_cluster.get(name, name)
+            if cluster_id not in super_name_to_idx:
+                super_name_to_idx[cluster_id] = len(super_names)
+                super_names.append(cluster_id)
+
+        n_entity_super = len(super_names)
+        # Second pass: passage / sentence vertices kept 1:1.
+        passage_super_vidx: List[int] = []
+        for v in self.graph.vs:
+            if is_entity and v["vertex_type"] == "entity":
+                continue
+            name = v["name"]
+            if name not in super_name_to_idx:
+                super_name_to_idx[name] = len(super_names)
+                super_names.append(name)
+            if (not is_entity) or v["vertex_type"] == "passage":
+                passage_super_vidx.append(super_name_to_idx[name])
+
+        # Build the quotient graph.
+        q = ig.Graph(directed=False)
+        q.add_vertices(len(super_names))
+        q.vs["name"] = super_names
+        # vertex_type flag — useful for downstream debugging.
+        if is_entity:
+            types = ["entity"] * n_entity_super + ["passage"] * (len(super_names) - n_entity_super)
+            q.vs["vertex_type"] = types
+
+        # Edge aggregation: (super_u, super_v) → summed weight. We drop
+        # alias edges (they're within-cluster by definition) and
+        # ignore reflexive after-collapse edges. **Critical**: map each
+        # physical endpoint through ``member_to_cluster`` before the
+        # super-name lookup — entity vertices were registered in
+        # ``super_name_to_idx`` UNDER THEIR CLUSTER_ID (e.g. ``c_0000``),
+        # not their physical hash, so a direct ``super_name_to_idx[
+        # physical_hash]`` would silently miss every clustered member's
+        # incident edges.
+        edge_weight: Dict[Tuple[int, int], float] = {}
+        # The builder writes the edge kind under ``edge_type``; check
+        # that attribute (not the generic ``type``) so alias edges are
+        # actually filtered out of the quotient.
+        has_edge_type = "edge_type" in self.graph.es.attributes()
+        has_weight = "weight" in self.graph.es.attributes()
+        for e in self.graph.es:
+            if has_edge_type and e["edge_type"] == "alias":
+                continue
+            u_name = self.graph.vs[e.source]["name"]
+            v_name = self.graph.vs[e.target]["name"]
+            u_key = member_to_cluster.get(u_name, u_name)
+            v_key = member_to_cluster.get(v_name, v_name)
+            su = super_name_to_idx.get(u_key)
+            sv = super_name_to_idx.get(v_key)
+            if su is None or sv is None or su == sv:
+                continue
+            key = (su, sv) if su < sv else (sv, su)
+            w = float(e["weight"]) if has_weight else 1.0
+            edge_weight[key] = edge_weight.get(key, 0.0) + w
+
+        if edge_weight:
+            edges = list(edge_weight.keys())
+            weights = list(edge_weight.values())
+            q.add_edges(edges)
+            q.es["weight"] = weights
+
+        self._quotient_graph = q
+        self._quotient_member_to_super = {
+            m: super_name_to_idx[member_to_cluster.get(m, m)]
+            for m in self._name_to_vidx
+            if member_to_cluster.get(m, m) in super_name_to_idx
+        }
+        self._quotient_super_passage_vidx = passage_super_vidx
+        build_ms = int((_time.time() - _t0) * 1000)
+        self.last_debug["quotient_build_ms"] = build_ms
+        self.last_debug["quotient_vcount"] = q.vcount()
+        self.last_debug["quotient_ecount"] = q.ecount()
+        logger.info(
+            "graph_ppr: built quotient graph V=%d E=%d (physical V=%d E=%d) in %d ms",
+            q.vcount(), q.ecount(), self.graph.vcount(), self.graph.ecount(), build_ms,
+        )
+        return self._quotient_graph
+
+    def _run_ppr_full_logical(
+        self, node_weights: np.ndarray
+    ) -> Tuple[List[Tuple[str, float]], Optional[np.ndarray]]:
+        """Run PPR on the alias-cluster-contracted quotient graph.
+
+        Project physical seeds → super-nodes (summing reset mass per
+        super-node), run igraph PPR on the quotient, then materialize
+        passages by reading the super-passage scores. Returns
+        ``(ranked_physical_hashes, physical_scores_arr)`` so the
+        caller's downstream code (workbench, cluster_scores debug)
+        sees the same shape it always did.
+
+        Back-projection of mass to physical passages is direct
+        because passages are not collapsed (they keep their physical
+        identity in the quotient).
+        """
+        cfg = self.config
+        q = self._ensure_quotient_graph()
+        if q is None or q.vcount() == 0:
+            logger.warning("graph_ppr: quotient graph unavailable; fallback to physical PPR")
+            # Strip the flag temporarily to avoid infinite recursion.
+            saved = getattr(cfg, "ppr_on_logical", False)
+            try:
+                cfg.ppr_on_logical = False
+                return self._run_ppr_full(node_weights)
+            finally:
+                cfg.ppr_on_logical = saved
+
+        # Project physical reset mass → super-node reset mass. Use the
+        # pre-built ``_quotient_member_to_super`` for entities; for
+        # passage / sentence vertices (preserved 1:1 in the quotient)
+        # we kept their original names so a name → super lookup also
+        # works there.
+        q_reset = np.zeros(q.vcount(), dtype=np.float64)
+        is_entity = ("vertex_type" in self.graph.vs.attributes())
+        # Build a quick name→super index that covers BOTH entities
+        # (via cluster mapping) and passage/sentence (1:1). The
+        # quotient graph's ``name`` attribute is the source of truth.
+        if not hasattr(self, "_quotient_name_to_super") or self._quotient_name_to_super is None:
+            self._quotient_name_to_super = {q.vs[i]["name"]: i for i in range(q.vcount())}
+        for vidx in range(self.graph.vcount()):
+            w = float(node_weights[vidx])
+            if w <= 0 or (np.isnan(w) if isinstance(w, float) else False):
+                continue
+            name = self.graph.vs[vidx]["name"]
+            super_idx = self._quotient_member_to_super.get(name)
+            if super_idx is None:
+                # Passage / sentence vertex (preserved 1:1).
+                super_idx = self._quotient_name_to_super.get(name)
+                if super_idx is None:
+                    continue
+            q_reset[super_idx] += w
+
+        if q_reset.sum() <= 0:
+            return [], None
+        scores = q.personalized_pagerank(
+            vertices=range(q.vcount()),
+            damping=cfg.ppr_damping,
+            directed=False,
+            weights="weight" if "weight" in q.es.attributes() else None,
+            reset=q_reset.tolist(),
+            implementation="prpack",
+        )
+        scores_arr_q = np.asarray(scores, dtype=np.float64)
+
+        # Back-project to a physical-shape score array so downstream
+        # code (cluster_scores debug, retrieve_subgraph) doesn't need
+        # to know we ran on the quotient.
+        physical_scores = np.zeros(self.graph.vcount(), dtype=np.float64)
+        for vidx in range(self.graph.vcount()):
+            name = self.graph.vs[vidx]["name"]
+            super_idx = self._quotient_member_to_super.get(name)
+            if super_idx is None:
+                continue
+            physical_scores[vidx] = scores_arr_q[super_idx]
+
+        if not self._passage_vidx:
+            return [], physical_scores
+        passage_scores = physical_scores[self._passage_vidx]
+        order = np.argsort(passage_scores)[::-1]
+        out: List[Tuple[str, float]] = []
+        for j in order[: max(self.config.ppr_topk * 4, self.config.ppr_topk)]:
+            vidx = self._passage_vidx[int(j)]
+            name = self.graph.vs[vidx]["name"]
+            out.append((str(name), float(passage_scores[int(j)])))
+        self.last_debug["ppr_on_logical"] = True
+        return out, physical_scores
 
     def _cluster_scores(
         self, scores_arr: Optional[np.ndarray], op: str = "sum"

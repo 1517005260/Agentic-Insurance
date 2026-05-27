@@ -47,6 +47,32 @@ class RAGConfig:
     ppr_passage_node_weight: float = 0.05
     ppr_iteration_threshold: float = 0.5
 
+    # ---------- PPR — three-layer abstraction ----------
+    # The B-paper §3.1 design has physical entities + alias edges +
+    # logical clusters. The retrieval-time projection knob picks which
+    # graph PPR walks on:
+    #
+    # * ``ppr_seed_cluster_spread`` (default True): keep PPR on the
+    #   physical graph but, when seeding from query entity X, also
+    #   activate every alias-cluster sibling of X with a sqrt-damped
+    #   share of the reset mass. Cheap (~1 ms), preserves the physical
+    #   walk identity (P4 surface attribution intact), recovers the
+    #   most common alias miss.
+    #
+    # * ``ppr_on_logical`` (default False): collapse alias-connected
+    #   components into super-nodes and run PPR on the quotient
+    #   graph. Closer to HippoRAG's canonical-entity PPR.  Loses
+    #   per-physical-surface state identity (P4 needs back-projection
+    #   through cluster membership), but storage layer (the physical
+    #   graph + alias edges) remains untouched so P1 / P2 repair
+    #   properties hold.
+    #
+    # The two are not mutually exclusive: with ``ppr_on_logical=True``
+    # the spread knob is irrelevant (seeds already collapse onto
+    # the same supernode).
+    ppr_seed_cluster_spread: bool = True
+    ppr_on_logical: bool = False
+
     # ---------- concurrency ----------
     # Cap concurrent HTTP / CPU work across the whole query. The 4 channels
     # plus their internal sub-paths run inside this pool.
