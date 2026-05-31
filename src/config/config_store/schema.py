@@ -60,12 +60,11 @@ _PROOF_AGENT_DEFAULT_MAX_LOOPS = 16
 _PROOF_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
 _GRAPH_AGENT_DEFAULT_MAX_LOOPS = 16
 # 64 k sized for large-context generators (Claude / GPT-5-class /
-# deepseek-v4-flash). When the deployment runs against a smaller-context
-# generator like vLLM-served Qwen3-8B (40960 context − 16384 reserved
-# output ≈ 24576 effective input), lower this to ~20 000 via admin
-# override. The tight prior default (20 000) was hitting a hard cap on
-# 38 % of wrong runs in 300 q × deepseek; bumping to 64 000 dropped that
-# to 3 % and lifted lenient-judge accuracy ~4 pp.
+# deepseek-v4-flash) so navigation rarely terminates against the token
+# cap rather than on a real stop condition. When the deployment runs
+# against a smaller-context generator like vLLM-served Qwen3-8B (40960
+# context − 16384 reserved output ≈ 24576 effective input), lower this
+# to ~20 000 via admin override.
 _GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 64_000
 # The web agent has only two tools (web_search / web_fetch); each
 # search returns ~5 hits and each fetch returns up to 8 KB of cleaned
@@ -243,10 +242,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Number of files whose parse stage may run concurrently. "
             "Index-write stage is always serial (faiss / graph stores "
             "are not safe under concurrent writes). **Default 1** for "
-            "memory safety: paddle response cache (~50 MB/file) + spaCy "
-            "zh-trf NER (~2 GB resident) + LinearRAG igraph snapshots "
-            "push an 8 GB host past OOM at parallel_workers=2 on real "
-            "60-page PDFs (verified: backend SIGKILL at swap exhaustion). "
+            "memory safety: paddle response cache (~50 MB/file) + the "
+            "GLiNER NER model / torch runtime + LinearRAG igraph "
+            "snapshots can push an 8 GB host past OOM at "
+            "parallel_workers=2 on real 60-page PDFs. "
             "Bump to 2 only on hosts with ≥12 GB RAM, 4 only on ≥24 GB. "
             "Process restart required after change (semaphore caps at "
             "boot — see _get_parse_sem)."
@@ -282,10 +281,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         group="linear_rag",
         description=(
             "Enable literal-substring backfill at ingest time. When True, "
-            "after spaCy NER, sweep every passage against the union of "
+            "after NER, sweep every passage against the union of "
             "discovered entity surfaces and add missing entity↔passage "
             "edges (KAG-style 'domain mount'; covers the contextual-NER "
-            "miss rate, ~48% on insurance corpus)."
+            "miss rate)."
         ),
     ),
     ConfigEntry(
@@ -366,9 +365,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max=1.0,
         group="linear_rag",
         description=(
-            "Score floor for emitted GLiNER spans. 0.3 was empirically "
-            "the best recall/noise trade-off on the 4-document insurance "
-            "benchmark; lower values surface long sentence-fragment spans."
+            "Score floor for emitted GLiNER spans. 0.3 trades off recall "
+            "against noise; lower values surface long sentence-fragment spans."
         ),
     ),
     ConfigEntry(
@@ -380,9 +378,9 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Per-label GLiNER score thresholds (label-conditional calibration). "
             "Overrides gliner_threshold for the named labels; unspecified labels "
             "use gliner_threshold. The default {'concept': 0.5} tightens the "
-            "noisiest open-set slot — empirically trims ~18 pp of concept "
-            "over-generation with sub-1 pp page-recall loss vs the global "
-            "0.3 floor. Empty dict = inert (all labels use gliner_threshold)."
+            "noisiest open-set slot, trimming concept over-generation with "
+            "little page-recall loss vs the global 0.3 floor. "
+            "Empty dict = inert (all labels use gliner_threshold)."
         ),
     ),
     ConfigEntry(
@@ -395,8 +393,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description=(
             "Max Han-character length for an unbraced entity surface. "
             "Surfaces above this are rejected as sentence-fragment leakage. "
-            "Insurance product names top out at ~10 (default 12 from a "
-            "56-sample benchmark); legal / patent corpora typically need 20-25."
+            "Insurance product names top out at ~10 (default 12); legal / "
+            "patent corpora typically need 20-25."
         ),
     ),
     ConfigEntry(
@@ -437,9 +435,9 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         group="linear_rag",
         description=(
             "Pairwise yes-probability floor for the reranker veto. "
-            "Below this score the alias edge is not created. 0.7 was "
-            "the F1-optimal threshold on the 60-pair insurance benchmark; "
-            "raise toward 0.9 to be stricter (recall drops fast)."
+            "Below this score the alias edge is not created. 0.7 is a "
+            "balanced default; raise toward 0.9 to be stricter (recall "
+            "drops fast)."
         ),
     ),
     ConfigEntry(
@@ -465,11 +463,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "How accepted alias pairs land in the graph. 'overlay' (default) "
             "adds an alias edge; physical nodes are preserved for "
             "surface-path attribution and 1-edge rollback. 'collapse_basic' "
-            "absorbs the other into the canonical (B7a baseline). "
-            "'collapse_provenance' adds per-edge source_member sidecar "
-            "(B7b baseline). Switching away from overlay breaks P4 "
-            "native attribution and increases P2 rollback cost — only "
-            "set for ablation experiments."
+            "absorbs the other into the canonical. 'collapse_provenance' "
+            "adds a per-edge source_member sidecar. Switching away from "
+            "overlay breaks P4 native attribution and increases P2 "
+            "rollback cost."
         ),
     ),
     ConfigEntry(
@@ -518,11 +515,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Logical-entity partitioner over the immutable alias "
             "subgraph. 'leiden_cpm' (default, @resolution 0.01 weighted) "
             "= Leiden/Constant-Potts communities: chaining-resistant, the "
-            "ER/cross-doc-coref standard; A/B-validated to de-percolate "
-            "(largest_cc_ratio 0.335→0.0021, G5 PASS) with no retrieval "
-            "regression. 'connected_components' = raw transitive closure "
-            "(single-linkage; percolates to a giant component at "
-            "open-domain scale) — kept for ablation / bit-compat. "
+            "ER/cross-doc-coref standard; de-percolates the giant component "
+            "without retrieval regression. 'connected_components' = raw "
+            "transitive closure (single-linkage; percolates to a giant "
+            "component at open-domain scale) — available as an alternative. "
             "Clusters are a recomputable derived view so reversibility / "
             "P1 / P4 are unchanged either way."
         ),
@@ -623,7 +619,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Cosine similarity floor for the graph_explore entity_lookup "
             "tool. The disambiguator's 0.85 (precision-tuned for adding "
             "alias edges) is too strict at query time; 0.4 surfaces too "
-            "much noise; 0.6 is the empirical sweet spot."
+            "much noise; 0.6 trades these off."
         ),
     ),
     ConfigEntry(
@@ -757,9 +753,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description=(
             "System prompt for the Policy-Review hidden-risk tab "
             "(single LLM call over a precomputed PPR subgraph). Key "
-            "name retained for backward compat with persisted overrides; "
-            "current default surfaces semantically adjacent clauses, "
-            "not fraud judgments."
+            "name matches persisted overrides; current default surfaces "
+            "semantically adjacent clauses, not fraud judgments."
         ),
     ),
     ConfigEntry(

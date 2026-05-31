@@ -24,12 +24,11 @@ def _get(key: str, default: str | None = None) -> str | None:
 
 # Project root: ``src/config/settings.py`` → ``../../../`` = repo root.
 # Used to anchor a *relative* ``STORAGE_PATH`` so it resolves to the
-# same directory regardless of the process CWD. Past bug: starting
-# uvicorn from inside ``frontend/`` made ``./local_storage`` resolve to
-# ``frontend/local_storage/``, silently creating a parallel storage
-# tree (empty DB, no faiss / graph), with the original tree under
-# ``agentic/local_storage/`` left behind. Anchoring relative paths to
-# the repo root makes the storage location process-CWD-independent.
+# same directory regardless of the process CWD. A CWD-relative path is
+# dangerous: launching from a subdirectory (e.g. ``frontend/``) would
+# make ``./local_storage`` resolve there, silently creating a parallel
+# storage tree (empty DB, no faiss / graph) detached from the real one.
+# Anchoring to the repo root keeps the storage location CWD-independent.
 _PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent.parent
 
 
@@ -53,7 +52,7 @@ def paddle_ocr_root() -> Path:
 
 
 # Subdirectory under STORAGE_PATH that holds downloaded model weights
-# (e.g. the spaCy NER model used by the entity layer).
+# (e.g. the GLiNER NER model used by the entity layer).
 MODELS_SUBDIR: str = "models"
 
 

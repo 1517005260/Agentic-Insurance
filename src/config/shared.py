@@ -23,11 +23,11 @@ Concurrency model:
   ``functools.lru_cache`` only locks the cache dict — two threads
   simultaneously missing the same key both run the factory body, then
   one wins the cache write while the other's expensive work is
-  thrown away. For 2 GB spaCy loads or 500 MB faiss reads, that
+  thrown away. For large model loads or 500 MB faiss reads, that
   duplication is exactly the OOM scenario this module exists to
   prevent. The pattern: ``with _LOCKS.get_or_create(key): return
   _cached(key)``.
-* Cached objects are shared across threads. spaCy pipelines and faiss
+* Cached objects are shared across threads. Model handles and faiss
   ``read_index`` handles are thread-safe for read; ``EmbeddingStore``
   serialises read+write internally via its own per-instance lock so
   ingest writers and query readers can't race.
@@ -80,8 +80,8 @@ logger = logging.getLogger(__name__)
 
 # Per-key lock pool so each unique cache key has its own factory-call
 # lock. Without this, a single global lock would serialise *all*
-# first-call loads (e.g. spaCy en + faiss passage waiting on each
-# other) when in fact they could run concurrently — they touch
+# first-call loads (e.g. a GLiNER model + faiss passage index waiting
+# on each other) when in fact they could run concurrently — they touch
 # different resources. Per-key locks keep concurrent miss correctness
 # while permitting parallelism across keys.
 _KEY_LOCK_REGISTRY_LOCK = threading.Lock()
@@ -122,8 +122,8 @@ def _gliner_cached(model_id: str) -> "GLiNER":
        gliner_multiv2.1) — *not* the local snapshot path — so even
        a local-path-only load triggers a HuggingFace Hub metadata
        probe (``…/tree/main/additional_chat_templates``). On
-       mainland-China deployments that probe times out at 60 s,
-       which we measured as a 5× ingest slowdown before this fix.
+       high-latency networks that probe can take up to 60 s per cold
+       start, dominating ingest time.
        The env vars must be set *before* transformers is imported the
        first time, because transformers caches the offline flag at
        module import. Our project never imports transformers
@@ -133,12 +133,10 @@ def _gliner_cached(model_id: str) -> "GLiNER":
        cuda fp16 (~0.6 GB VRAM resident, no measurable accuracy
        loss vs fp32).
 
-    GLiNER runs on native PyTorch, so the per-thread backend
-    re-activation dance the prior spaCy pipeline needed (thinc
-    ContextVar trick for ``run_in_executor`` worker threads) is
-    obsolete. PyTorch tensors carry their device with them; any
-    thread's forward pass on a cuda-resident model stays on GPU
-    without extra bookkeeping.
+    GLiNER runs on native PyTorch, so no per-thread backend
+    re-activation is needed: PyTorch tensors carry their device with
+    them, and any thread's forward pass on a cuda-resident model stays
+    on GPU without extra bookkeeping.
     """
     import os
 
@@ -151,8 +149,8 @@ def _gliner_cached(model_id: str) -> "GLiNER":
     # after ``from huggingface_hub import snapshot_download`` the
     # constants are already False and the GLiNER tokenizer load
     # below will hit api/models/microsoft/mdeberta-v3-base on every
-    # call — measured as the 60 s timeout per cold start on
-    # mainland-China deployments before this fix.
+    # call, incurring the remote-probe timeout (up to 60 s) per cold
+    # start on high-latency networks.
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 

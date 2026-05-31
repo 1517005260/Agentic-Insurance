@@ -29,9 +29,9 @@ _DEFAULT_GLINER_LABELS: List[str] = [
     "law",
     "regulation",
     "person role",
-    # Note: ``currency`` is intentionally OFF by default — the empirical
-    # benchmark surfaced "加元" / "英镑" entering the entity universe as
-    # spurious nodes, which polluted PPR neighbourhoods. Admins running
+    # Note: ``currency`` is intentionally OFF by default — currency
+    # surfaces like "加元" / "英镑" enter the entity universe as spurious
+    # nodes, which pollute PPR neighbourhoods. Admins running
     # an FX-heavy domain can add it via the config-store override.
 ]
 
@@ -52,8 +52,7 @@ class LinearRAGConfig:
     # Chinese ones in the multilingual variant.
     #
     # ``gliner_threshold`` controls the score floor for emitted spans;
-    # 0.3 was empirically the best-recall/lowest-noise setting on the
-    # 4-document insurance corpus we benchmarked against.
+    # 0.3 balances recall against noise.
     gliner_model_id: str = "urchade/gliner_multiv2.1"
     gliner_labels: List[str] = field(
         default_factory=lambda: list(_DEFAULT_GLINER_LABELS)
@@ -73,29 +72,28 @@ class LinearRAGConfig:
     # with >``ner_max_span_chars`` raw characters AND no bracket (real
     # product / clause names rarely exceed 80 chars; bracketed surfaces
     # are kept regardless of length) OR with interior hard sentence-end
-    # punctuation. 80 is a defensive cap — measured longest legitimate
-    # legal/insurance surface in the benchmark sits at ~50 chars.
+    # punctuation. 80 is a defensive cap; legitimate legal/insurance
+    # surfaces rarely exceed ~50 chars.
     ner_max_span_chars: int = 80
 
     max_workers: int = 4
 
     # How often LinearRAG.index() persists LinearRAG.graphml, in
-    # index() calls. Default 1 = write every doc (bit-identical to the
-    # pre-cadence behaviour; the per-file API builder makes a fresh
-    # instance per file so its counter is always 1 → unchanged). A
-    # persistent bulk driver (one LinearRAG over a whole corpus, e.g.
-    # GraphIndexBuilder(reuse_graph=True)) sets this >1 so the O(V+E)
-    # graphml (de)serialisation is amortised across docs instead of
-    # paid every doc (the 650-build O(N²) wall-time blow-up). Such a
+    # index() calls. Default 1 = write every doc; the per-file API
+    # builder makes a fresh instance per file so its counter is always
+    # 1. A persistent bulk driver (one LinearRAG over a whole corpus,
+    # e.g. GraphIndexBuilder(reuse_graph=True)) sets this >1 so the
+    # O(V+E) graphml (de)serialisation is amortised across docs instead
+    # of paid every doc, which is an O(N²) wall-time blow-up. Such a
     # driver must force a final flush_graphml() at the end and before
     # any checkpoint that reads the on-disk graphml.
     graphml_flush_every: int = 1
 
     # How often LinearRAG.index() recomputes the expensive Leiden
     # (compute_clusters) partition for the returned ``cluster_shape``,
-    # in index() calls. Default 1 = compute every doc (bit-identical to
-    # the pre-cadence behaviour; the per-file API builder makes a fresh
-    # instance per file so its counter is always 1 → unchanged). Leiden
+    # in index() calls. Default 1 = compute every doc; the per-file API
+    # builder makes a fresh instance per file so its counter is always
+    # 1. Leiden
     # is O(E_alias) and E_alias grows with the corpus, so paying it
     # every doc makes a persistent bulk build O(N²) in wall time. A
     # bulk driver (one LinearRAG over a whole corpus, e.g.
@@ -132,10 +130,8 @@ class LinearRAGConfig:
     # Domain-tuned: insurance product names top out at ~10, legal
     # clause titles can reach 18-25 ("中华人民共和国证券法第一百四十二条"),
     # patent technique names similar. Bracketed surfaces (product codes,
-    # SKU markers) are always kept regardless of length. 12 was chosen
-    # from a 56-sample benchmark (precision 95.5%, recall 52.5%, one
-    # false-positive on the boundary clause "保单分拆预设指示权益条款");
-    # legal / patent admins should raise it back to 18-25.
+    # SKU markers) are always kept regardless of length. Default 12;
+    # legal / patent admins should raise it to 18-25.
     junk_max_han_chars: int = 12
 
     # Literal-substring backfill (KAG-style "domain mount"). NER is
@@ -173,32 +169,29 @@ class LinearRAGConfig:
 
     # Acceptance handler. ``overlay`` is the default reversible path
     # (alias edges only, never collapses); ``collapse_basic`` /
-    # ``collapse_provenance`` are the B7a / B7b baselines (canonical
-    # absorbs members, reverse_map persisted). Collapse modes break
-    # native surface-path attribution (P4) and have non-zero rollback
-    # locality (P2) — only flip in for ablation experiments.
+    # ``collapse_provenance`` collapse the canonical (the latter
+    # persisting a reverse_map). Collapse modes break native
+    # surface-path attribution (P4) and have non-zero rollback
+    # locality (P2).
     acceptance_handler: str = "overlay"
 
     # Logical-entity partitioner over the (immutable) alias subgraph.
     # ``connected_components`` = raw transitive closure: single-linkage,
     # percolates to a giant component at open-domain scale (phase
-    # transition in N, not a tunable tail; kept for ablation /
-    # bit-compat). ``leiden_cpm`` = Leiden on the Constant-Potts-Model
+    # transition in N, not a tunable tail; available as an
+    # alternative). ``leiden_cpm`` = Leiden on the Constant-Potts-Model
     # objective (igraph, no new dep): the chaining-resistant principled
     # partition the ER / cross-doc-coref literature converges on.
     # Clusters are a recomputable derived view over immutable alias
     # edges, so reversibility / P1 / P4 are unchanged either way.
     #
-    # Default is ``leiden_cpm`` @ resolution 0.01 (weighted), chosen by
-    # a controlled retrieval A/B on a 154-doc open-domain stock: vs raw
-    # connected_components it cut largest_cc_ratio 0.335→0.0021 (G5 PASS,
-    # 10× margin; giant component 24717→153 entities) with **no
-    # retrieval regression** (ranked Page Recall@10 identical 0.828,
-    # Recall@5 within run noise). 0.01 is the least-aggressive
-    # resolution that clears G5 with margin → minimal risk of
-    # fragmenting genuine multi-surface entities. ``cluster_leiden_
-    # weighted`` uses the alias edge propagation weight so stronger
-    # aliases resist being cut.
+    # Default is ``leiden_cpm`` @ resolution 0.01 (weighted): versus raw
+    # connected_components it de-percolates the giant component without
+    # retrieval regression. 0.01 is the least-aggressive resolution that
+    # de-percolates with margin, minimising the risk of fragmenting
+    # genuine multi-surface entities. ``cluster_leiden_weighted`` uses
+    # the alias edge propagation weight so stronger aliases resist being
+    # cut.
     cluster_algorithm: str = "leiden_cpm"
     cluster_leiden_resolution: float = 0.01
     cluster_leiden_weighted: bool = True

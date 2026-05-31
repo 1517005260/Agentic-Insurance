@@ -48,7 +48,7 @@ class RAGConfig:
     ppr_iteration_threshold: float = 0.5
 
     # ---------- PPR — three-layer abstraction ----------
-    # The B-paper §3.1 design has physical entities + alias edges +
+    # The three-layer design has physical entities + alias edges +
     # logical clusters. The retrieval-time projection knob picks which
     # graph PPR walks on:
     #
