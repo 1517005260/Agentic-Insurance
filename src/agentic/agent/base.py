@@ -14,7 +14,7 @@ raising, so callers always get a result + trajectory even on stuck
 runs.
 
 Pre-warm:
-  Some tools (notably ``graph_explore`` via spaCy NER) absorb a 10–15 s
+  Some tools (notably ``graph_explore`` via GLiNER NER) absorb a 10–15 s
   one-time load on first use. :meth:`warm_up` walks every registered
   tool's optional ``warm_up()`` hook before the first user turn, so
   per-query latency stays comparable across runs.

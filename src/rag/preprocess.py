@@ -108,7 +108,7 @@ class QueryContext:
 
     # PPR-only knob: when True, GraphPPRChannel adds a query-side seed
     # fallback (literal gazetteer scan ➜ entity-embedding top-K) for
-    # questions where spaCy NER finds no entity. The 4-channel RAG path
+    # questions where NER finds no entity. The 4-channel RAG path
     # leaves this off (returning empty preserves RRF channel
     # independence). The graph_explore agent tool flips it on because
     # PPR is the only signal available there. See graph_ppr._seed_entities.

@@ -351,9 +351,9 @@ class GraphService:
         # BFS with hop tracking. We keep the SHORTEST hop to each node
         # AND the MAX edge weight along any same-hop incoming edge —
         # if a later parent at the same hop has a stronger edge, score
-        # bumps up. The previous "skip if already in visited" version
-        # would freeze the score at the order-of-first-visit edge,
-        # which made top_k truncation depend on igraph neighbor order.
+        # bumps up. Skipping nodes already in ``visited`` would instead
+        # freeze the score at the order-of-first-visit edge, making
+        # top_k truncation depend on igraph neighbor order.
         visited: Dict[int, int] = {seed_vidx: 0}     # vidx → hop
         score_to: Dict[int, float] = {seed_vidx: 1.0}
         frontier = [seed_vidx]
@@ -493,11 +493,9 @@ class GraphService:
                         file_ids_seen[file_id] = file_ids_seen.get(file_id, 0) + 1
             out["mention_count"] = mention_count
             top_files = sorted(file_ids_seen.items(), key=lambda kv: kv[1], reverse=True)
-            # Each entry now carries display_name so the frontend hover
+            # Each entry carries display_name so the frontend hover
             # card can render the human-friendly name instead of a
-            # truncated file_id stem (the previous list[str] form
-            # surfaced "_b8c2aa1a" style hashes which the user
-            # complained look like garbage).
+            # truncated file_id stem like "_b8c2aa1a".
             out["neighboring_files"] = [
                 {"file_id": fid, "display_name": self._file_label(fid)}
                 for fid, _ in top_files[:_NODE_DETAIL_NEIGHBOR_FILES]
@@ -515,10 +513,10 @@ class GraphService:
         """Entity-only sample of ``n`` vertices that each have at least
         one entity-entity edge, plus the induced edges among them.
 
-        Drives the GraphPage's first paint. The previous random draw
-        kept dropping isolated entities on the canvas; the previous
-        degree-rank draw oversampled the dense core and made the canvas
-        an illegible blob. So we look for entities that participate in
+        Drives the GraphPage's first paint. A random draw drops
+        isolated entities onto the canvas, and a degree-rank draw
+        oversamples the dense core into an illegible blob; instead we
+        look for entities that participate in
         an entity↔entity edge (mention edges to passage/sentence don't
         count — those vertices aren't on the canvas in sample mode), and
         keep up to ``n`` of them in graph order. If the corpus has

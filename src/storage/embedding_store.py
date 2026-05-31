@@ -154,11 +154,11 @@ class EmbeddingStore:
             self._index = faiss.read_index(str(self._index_path()))
             if self.dim is None:
                 self.dim = self._index.d
-            # ANN migration: an on-disk flat index for an HNSW-configured
-            # namespace is rebuilt to HNSW in memory (one-time per
-            # process; the next persist writes HNSW). reconstruct_n works
-            # on IndexFlat. Shadow-A/B-proven to leave the post-admission
-            # accepted alias set identical, so this is transparent.
+            # ANN format upgrade: an on-disk flat index for an
+            # HNSW-configured namespace is rebuilt to HNSW in memory
+            # (one-time per process; the next persist writes HNSW).
+            # reconstruct_n works on IndexFlat and preserves the stored
+            # vectors, so the rebuild is transparent.
             use, m, efc, efs = _hnsw_params(self.namespace)
             if use and not _index_is_hnsw(self._index) and self._index.ntotal > 0:
                 vecs = self._index.reconstruct_n(0, self._index.ntotal)

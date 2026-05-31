@@ -381,11 +381,10 @@ async def page_preview(
     subsequent hits. Re-ingest invalidates the cache (see
     ``purge_file_artifacts``).
 
-    The previous implementation served PaddleOCR's layout-detection
-    visualization (``layout_det_res_0.jpg``) which had bounding boxes
-    overlaid — visually it looked like a CV debug screenshot rather
-    than a page thumbnail. We now render via pypdfium2 (PDFium, the
-    same engine Chromium uses).
+    Renders via pypdfium2 (PDFium, the same engine Chromium uses)
+    rather than serving PaddleOCR's layout-detection visualization
+    (``layout_det_res_0.jpg``), whose overlaid bounding boxes look like
+    a CV debug screenshot rather than a page thumbnail.
     """
     # file_id flows from URL into a filesystem join; reject any token
     # that could escape the storage root before touching disk.

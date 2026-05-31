@@ -59,7 +59,7 @@ def _default_builders(*, linear_config: Optional[Any] = None) -> List[IndexBuild
     """Fresh builder instances per call so each holds its own faiss handle.
 
     Builder imports are local to this function — the heavy graph builder
-    pulls in spaCy / torch transitively, and the spawn-mode subprocess
+    pulls in torch + transformers transitively, and the spawn-mode subprocess
     that runs only ``GraphIndexBuilder`` must not pay for unused builder
     modules at child boot. Localising here keeps the parent-side worker
     factory eager but the child-side worker entry strictly minimal.

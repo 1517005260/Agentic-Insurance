@@ -179,8 +179,8 @@ async def fraud_ppr_stream(
     runner pre-fetches the PPR subgraph (no tool loop) and streams
     its analysis of the surrounding semantic neighborhood as token
     frames; passages cited via [^k] resolve to the same
-    CitationDrawer the chat surface uses. URL retained for backward
-    compat with persisted trace history under
+    CitationDrawer the chat surface uses. The URL path must match
+    the persisted trace artifacts under
     ``${STORAGE_PATH}/fraud_ppr/...``.
     """
     state = request.app.state

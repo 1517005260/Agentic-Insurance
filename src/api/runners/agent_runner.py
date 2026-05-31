@@ -395,8 +395,8 @@ def _accumulate_web_citations(
     ``web_search`` returns ``results: [{title, url, snippet, score,
     published_date}]`` (the field is ``results`` in the envelope, not
     ``hits`` — that's just the local variable name in the tool); we
-    accept ``hits`` too as backward compat in case the field is
-    renamed back. ``web_fetch`` returns ``{url, title, text}`` (the
+    accept ``hits`` too so either field name parses. ``web_fetch``
+    returns ``{url, title, text}`` (the
     ``url`` reflects ``final_url`` after redirects).
 
     The pool is keyed by canonical URL → field dict (no sup yet); sup

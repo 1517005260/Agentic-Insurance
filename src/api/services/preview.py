@@ -1,9 +1,9 @@
 """PDF page rendering for /files/{id}/preview.
 
-The previous preview implementation surfaced PaddleOCR's
-``layout_det_res_0.jpg`` — the layout-detector's *visualization* with
-colored bounding boxes overlaid on the page. That looks like a CV
-debug screenshot, not a "first page of the document" thumbnail.
+Renders the original PDF page rather than reusing PaddleOCR's
+``layout_det_res_0.jpg`` (the layout-detector's visualization with
+colored bounding boxes), which looks like a CV debug screenshot rather
+than a page thumbnail.
 
 This module renders the original PDF page via ``pypdfium2`` (the
 PDFium wrapper Chromium uses) and caches the result under

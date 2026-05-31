@@ -382,8 +382,8 @@ def _apply_thinking_off(payload: Dict[str, Any]) -> None:
     so skipping is safe.
     """
     model = (payload.get("model") or "").lower()
-    # Models that historically emit ``reasoning_content`` even when the
-    # caller doesn't ask for thinking — needs the explicit kill switch.
+    # Models that emit ``reasoning_content`` even when the caller
+    # doesn't ask for thinking — needs the explicit kill switch.
     thinking_prone = (
         "deepseek" in model
         or "qwen" in model

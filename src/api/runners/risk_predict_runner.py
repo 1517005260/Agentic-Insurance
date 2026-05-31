@@ -268,7 +268,7 @@ def _build_ppr_query(customer: CustomerProfile, scenario: Optional[str]) -> str:
     Concatenates the highest-signal customer fields with the optional
     scenario hint. PPR cares about *which entities the surface text
     matches*, not sentence structure, so a comma-joined list is good
-    enough — ``GraphPPRChannel`` runs spaCy NER over this string.
+    enough — ``GraphPPRChannel`` runs GLiNER NER over this string.
     """
     tokens: List[str] = [
         f"{customer.age}岁",

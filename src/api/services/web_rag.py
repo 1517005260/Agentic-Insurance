@@ -3,15 +3,14 @@
 A simpler cousin of :class:`rag.pipeline.RAGPipeline`: where the
 local pipeline runs four retrieval channels + RRF + rerank + LLM,
 this one substitutes the entire retrieval stack with a single
-Tavily call. The LLM still does the answering and citing.
+Tavily call. The LLM does the answering and citing.
 
 Two surfaces:
 
 * :func:`stream_chat` — async generator yielding event tuples for
   SSE conversion. Powers the chat web mode.
 * :func:`run_summarized` — synchronous, returns a complete dict.
-  Currently has no route caller (the regulation workbench that
-  consumed it has been retired); retained for any future
+  Standalone entrypoint with no current route caller, available for a
   synchronous workbench that wants the same recipe.
 
 Both share the same retrieve/prompt-build/answer recipe; only the
@@ -375,8 +374,7 @@ def run_summarized(
 ) -> WebRagResult:
     """Synchronous web-RAG: retrieve + single LLM call + return.
 
-    No route currently consumes this entrypoint (the regulation
-    workbench that did has been retired); kept available for future
+    No route currently consumes this entrypoint; it is available for
     synchronous callers and unit testing of the recipe. Caller is
     expected to wrap this in ``run_in_threadpool`` because the LLM
     call blocks.

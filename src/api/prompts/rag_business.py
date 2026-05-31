@@ -1,10 +1,9 @@
-"""Re-export shim — prompt body now lives in the algorithm-layer prompt tree.
+"""Re-export of the business RAG system prompt.
 
-The config-center schema needs to import the business RAG system prompt
-without dragging the web layer into the algorithm-side import graph,
-so the actual definition lives next to the base / proof / graph system
-prompts. This shim preserves the old import path for any caller that
-still does ``from api.prompts.rag_business import RAG_BUSINESS_SYSTEM_PROMPT``.
+The config-center schema imports this prompt without dragging the web
+layer into the algorithm-side import graph, so the definition lives
+next to the base / proof / graph system prompts and is re-exported here
+under ``api.prompts.rag_business``.
 """
 from agentic.agent.prompts.rag_business import RAG_BUSINESS_SYSTEM_PROMPT
 

@@ -27,9 +27,9 @@ Soundness boundary — what these rules certify, and what they do NOT:
   A loose pattern certifies a loose statement — the gate cannot
   detect "this regex over-matches the user's intent." This is the
   attested NL→obligation faithfulness boundary; predicates are
-  recorded as canonical_id in every obligation summary so the
-  ablation can audit them post-hoc. For benchmarks that need
-  stricter control, supply pre-computed obligations.
+  recorded as canonical_id in every obligation summary so they can be
+  audited after the fact. For stricter control, supply pre-computed
+  obligations.
 """
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Sequence, Union  # noqa: F401

@@ -17,9 +17,9 @@ Per-turn pair shape:
 * **assistant side** — taken from ``final.json.answer`` so we honour
   the "trace is the source of truth" rule for assistant output. (It
   matches ``chat_messages.assistant.content`` byte-for-byte under
-  normal operation; we still go through trace to keep the contract
-  uniform and to make a future "assistant.content stripped to a
-  pointer" optimisation feasible without touching this loader.)
+  normal operation; going through trace keeps the contract uniform and
+  leaves room to strip ``assistant.content`` to a pointer later without
+  touching this loader.)
 
 Failure mode: a missing / malformed trace, missing user partner row,
 etc. silently skips that turn. A user who deleted a trace folder

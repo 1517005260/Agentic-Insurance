@@ -52,8 +52,8 @@ class TavilyClient:
         # Default ``make_retry_session()`` uses total=5/read=5 — fine for
         # cheap embedding/rerank calls but catastrophic for Tavily: each
         # 30 s read timeout gets retried 5×, turning a slow first call
-        # into a ~150 s wall-clock stall (we measured 113 s for a single
-        # cold-start chat web turn). Tavily's own SLA is "1-3 s typical,
+        # into a ~150 s wall-clock stall on a cold-start chat web turn.
+        # Tavily's own SLA is "1-3 s typical,
         # 30 s outlier"; one retry is plenty. Connection retries stay at
         # 2 in case a TLS handshake races a transient DNS hiccup.
         # Process-wide shared session — distinct profile from the other
