@@ -198,10 +198,9 @@ def add_alias_edges(
       evidence). GraphML cannot store dict attributes natively, so the
       single JSON string is the audit sidecar.
 
-    Backwards-compat caller without features/w_prop falls back to
-    ``weight = cand.score`` (policy=cos equivalence), preserving the
-    original add_alias_edges semantics for tests / scripts that have
-    not adopted the explicit feature path yet.
+    A caller that omits features/w_prop falls back to
+    ``weight = cand.score`` (policy=cos equivalence), so the explicit
+    feature path is optional for tests / scripts.
     """
     if not candidates:
         return 0
@@ -335,13 +334,12 @@ def propagation_policy(features: Dict[str, Any], cfg: Any) -> float:
 # representative. Lower (more negative) = noisier; we pick the
 # **highest** score in a cluster as the canonical.
 #
-# The previous "longest surface" rule was empirically wrong on OCR
-# noise: spaCy's longest spans are usually mis-bounded chains
-# (``A(c1)、B(c2)、C(c3)``) or sentence fragments (``…保单。``),
-# both of which beat the clean prefix on length but are the worst
-# possible canonical name. The scoring below penalises the structural
-# defects that those bad spans exhibit, then breaks ties by
-# preferring shorter (cleaner) surfaces.
+# A "longest surface" rule fails on OCR noise: the NER model's longest
+# spans are usually mis-bounded chains (``A(c1)、B(c2)、C(c3)``) or sentence
+# fragments (``…保单。``), both of which beat the clean prefix on length
+# but are the worst possible canonical name. The scoring below
+# penalises the structural defects that those bad spans exhibit, then
+# breaks ties by preferring shorter (cleaner) surfaces.
 
 # Trailing punctuation / whitespace / dangling **opening** bracket that
 # strongly indicates a mid-sentence cut. Closing brackets ``)`` ``）``
@@ -352,7 +350,7 @@ def propagation_policy(features: Dict[str, Any], cfg: Any) -> float:
 # Bracket imbalance is handled separately by ``_bracket_imbalance``.
 _TRAILING_JUNK_RE = re.compile(r"[。\.,，;；:：、!?！？\s(（]+$")
 # A list separator inside the surface — the surface is a chain of
-# multiple mentions glued together by spaCy.
+# multiple mentions glued together.
 _LIST_SEP_INTERIOR_RE = re.compile(r"[、；;•｜|，]")
 # Bracket counts (both half- and full-width) for balance check.
 _OPEN_BRACKETS = ("(", "（")
@@ -388,8 +386,8 @@ def is_composite_surface(text: Optional[str]) -> bool:
 
     Used as an admission gate before alias-edge generation: composite
     surfaces are a mixture centroid in embedding space and pull in
-    cleanly-named neighbours, producing the c_0000-style "garbage
-    bucket" clusters we observed empirically. Skipping them at the
+    cleanly-named neighbours, producing c_0000-style "garbage
+    bucket" clusters. Skipping them at the
     alias-edge stage prevents pollution-via-transitivity (entity A
     aliased to composite C aliased to entity B → A and B end up in
     the same cluster despite never being aliased directly).
@@ -439,7 +437,7 @@ def surface_quality_score(surface: Optional[str]) -> float:
     The mild length penalty is the only "preference" component; the
     other three penalise concrete structural defects that the
     composite-surface gate (P2) and the cleanup pipeline (P0) would
-    have caught had spaCy bounded the span correctly.
+    have caught had the NER span been bounded correctly.
     """
     if not surface:
         return -1e6
@@ -471,8 +469,8 @@ def compute_clusters(
 
     * ``connected_components`` — raw transitive closure. Single-linkage;
       percolates to a giant component at open-domain scale (a phase
-      transition in N, not a tunable tail). Kept for ablation / bit
-      compatibility.
+      transition in N, not a tunable tail). Available as an
+      alternative partitioner.
     * ``leiden_cpm`` — Leiden on the Constant-Potts-Model objective
       (igraph ``community_leiden``). Chaining-resistant by construction
       (well-connected, resolution-bounded communities), the principled
@@ -538,10 +536,8 @@ def compute_clusters(
 
 
 # Cluster-cache schema version. Bump when ``compute_clusters`` /
-# ``surface_quality_score`` change so older cache files (which encode
-# the *previous* canonical-picker output) are silently invalidated and
-# recomputed on next read. v3: compute_clusters gained the algorithm
-# dispatch (connected_components | leiden_cpm).
+# ``surface_quality_score`` change so older cache files are silently
+# invalidated and recomputed on next read.
 CLUSTERS_CACHE_VERSION = 3
 
 
@@ -585,8 +581,7 @@ def get_clusters(
 
     "Fresh" = file exists AND ``version`` matches the current
     ``CLUSTERS_CACHE_VERSION``. Older versions are silently dropped and
-    recomputed (migration path for the canonical-picker v2 change and
-    the v3 algorithm dispatch). Freshness is intentionally version-keyed
+    recomputed. Freshness is intentionally version-keyed
     only, NOT keyed on ``algorithm``/``leiden_resolution``: in a
     deployment the partitioner is fixed by config, and a deliberate flip
     clears the cache (ingest invalidates on every alias-edge add), so
@@ -749,7 +744,7 @@ def _redirect_entity_passage_edges(
 
     When ``carry_provenance`` is True, each rewritten edge carries
     ``source_member`` = old vertex name and ``alias_features_json`` =
-    the alias features sidecar (Collapse-provenance / B7b).
+    the alias features sidecar (collapse-provenance mode).
     """
     if "edge_type" not in graph.es.attributes():
         return []
@@ -771,7 +766,7 @@ def _redirect_entity_passage_edges(
     # (canonical, dst) edge. The sidecar must record (a) every member
     # that contributed, (b) the alias_features dict that admitted each
     # contribution, and (c) each member's individual weight — without
-    # all three the B7b "self-contained sidecar" claim breaks for any
+    # all three the sidecar is no longer self-contained for any
     # post-collision edge. GraphML has no list attr, so we store the
     # member list as ``source_member`` CSV and the per-member features
     # as a JSON-encoded array under ``alias_features_json``.

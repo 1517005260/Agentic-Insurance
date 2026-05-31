@@ -12,8 +12,8 @@ Why a stopword override on top of GLiNER:
   routed to ``person``; same for "I" / "he" / "you" / "they". Adding a
   ``function word`` / ``pronoun`` decoy label to the inference prompt is
   not sufficient: GLiNER's score head does not emit competing scores for
-  closed-class function words on these surfaces (measured empirically on
-  pilot10 — 'we'=person 0.712, no noise-label competitor at any score).
+  closed-class function words on these surfaces, so a surface like "we"
+  scores as ``person`` with no noise-label competitor at any score.
 * The fix is linguistic, not statistical: closed-class function words /
   pronouns / determiners / prepositions are NOT entities in any language,
   and a multilingual stopword lexicon is the authoritative source. Per

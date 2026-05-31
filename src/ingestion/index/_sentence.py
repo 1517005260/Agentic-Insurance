@@ -1,8 +1,8 @@
 """Sentence segmentation via pysbd.
 
 Pure-Python rule-based sentence boundary disambiguation, 22 languages
-incl. zh/en. Replaces spaCy's blank+sentencizer for the lightweight
-passage→sentence split path used by ``text_dense`` / ``maintenance``.
+incl. zh/en. Drives the lightweight passage→sentence split path used by
+``text_dense`` / ``maintenance``.
 ~320 KB package, no model files, sub-millisecond per call.
 """
 
@@ -27,9 +27,7 @@ def _segmenter_for(text: str) -> pysbd.Segmenter:
 
 def split_sentences(text: str, lang: str = "xx") -> List[str]:
     """Return non-empty stripped sentences. ``lang`` is ignored — the
-    language is auto-detected per call by a Han-character scan; explicit
-    routing was a leftover of the spaCy ``blank("zh"|"en")`` API and not
-    used by callers.
+    language is auto-detected per call by a Han-character scan.
     """
     if not text:
         return []

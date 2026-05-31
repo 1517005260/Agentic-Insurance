@@ -36,11 +36,11 @@ class GraphIndexBuilder(IndexBuilder):
         self.embedding_client = embedding_client or get_cached_embedding_client()
         self.max_workers = max_workers
         # Default False = a fresh LinearRAG per _build (per-file API
-        # path: each upload must load+persist its own graphml, unchanged).
+        # path: each upload loads+persists its own graphml).
         # True = one persistent LinearRAG reused across _build calls so
         # a bulk corpus build loads graphml ONCE and writes on the
         # config's graphml_flush_every cadence instead of a full O(V+E)
-        # read+write per doc (the 650-build O(N²) fix). Opt-in only.
+        # read+write per doc, which would be O(N²). Opt-in only.
         self.reuse_graph = reuse_graph
         self._lr = None
         # Carries the admin-tuned literal-backfill flags + GLiNER knobs.

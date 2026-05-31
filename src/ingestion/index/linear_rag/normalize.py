@@ -75,7 +75,7 @@ _LEADING_ARTICLE_RE = regex.compile(r"^(the|a|an)\s+", regex.IGNORECASE)
 _TRAILING_PUNCT_RE = regex.compile(r"[。\.,，;；:：、!?！？\$ \t]+$")
 
 # A single dangling opening bracket at end of string — half-width `(`
-# or full-width `（`, with optional whitespace before it. spaCy
+# or full-width `（`, with optional whitespace before it. The NER model
 # occasionally cuts a token like ``万通危疾加护保(优越版)`` exactly at
 # the opening bracket, leaving us ``万通危疾加护保(`` which never
 # canonicalises to the same entity as the well-bounded mention.
@@ -92,9 +92,10 @@ _TRAILING_OPEN_BRACKET_RE = regex.compile(r"\s*[(（]\s*$")
 #   codes like ``"BISP5"``, ``"GMB1"``, ``"PHPS2"`` are not collateral
 #   damage. Add codes here only after seeing them produce noise.
 # * ``_CSS_ATTR_DENYLIST`` — explicit lookup of inline-style attribute
-#   tokens we've seen survive OCR + leak into entity output. Replaces
-#   the previous broad ``[a-z]+(-[a-z]+)+`` pattern that mis-killed
-#   ``risk-free`` / ``non-guaranteed``-style hyphenated terms.
+#   tokens that survive OCR and leak into entity output. An explicit
+#   denylist is used instead of a broad ``[a-z]+(-[a-z]+)+`` pattern,
+#   which mis-kills ``risk-free`` / ``non-guaranteed``-style
+#   hyphenated terms.
 # * ``han_fragment_max_chars`` — drops Chinese spans whose length
 #   exceeds 15 Han characters AND contain no bracket. GLiNER on
 #   ``"本公司保留絕對的酌情權決定復歸紅利的現金價值"`` (24 chars) at
@@ -120,11 +121,10 @@ _CSS_ATTR_DENYLIST = frozenset({
     "padding-top", "padding-bottom", "padding-left", "padding-right",
     "z-index", "box-sizing", "box-shadow", "overflow-x", "overflow-y",
 })
-# Han-fragment length cutoff. Empirically 15 works for insurance
-# product names (longest legit surface in the benchmark: "富饒萬家儲蓄保險計劃"
-# = 10 Han chars); legal and patent corpora have longer legitimate
-# spans ("中华人民共和国证券法第一百四十二条" = 18) so this MUST be
-# domain-configurable. Callers pass the active value via the
+# Han-fragment length cutoff. 15 suits insurance product names (e.g.
+# "富饒萬家儲蓄保險計劃" = 10 Han chars); legal and patent corpora have
+# longer legitimate spans ("中华人民共和国证券法第一百四十二条" = 18) so
+# this MUST be domain-configurable. Callers pass the active value via the
 # ``han_fragment_max_chars`` keyword to ``is_junk`` / ``normalize_for_hash``;
 # the constant here is only the conservative default for callers that
 # don't have a ``LinearRAGConfig`` in scope.
@@ -144,7 +144,7 @@ def cleanup(surface: str) -> str:
     * Strip HTML tag fragments leaked from OCR'd tables.
     * Collapse whitespace.
     * Trim a sentence-ending punctuation cluster + dangling opening
-      bracket — both are common spaCy boundary artefacts on
+      bracket — both are common NER boundary artefacts on
       bracket-heavy CJK product names (``"万通危疾加护保("`` →
       ``"万通危疾加护保"``). Run after whitespace collapse so the
       regexes can rely on a clean trailing edge.

@@ -10,7 +10,7 @@ Every builder consumes a ``PageAsset`` list and a ``file_id``. Stores are
 and per-file removal. Build-time the four builders are independent.
 
 This package intentionally re-exports nothing: each submodule pulls in
-heavyweight backends (spaCy + torch for ``graph_linearrag`` /
+heavyweight backends (torch + transformers for ``graph_linearrag`` /
 ``text_dense``, tantivy for ``bm25_tantivy``) and importing the
 package would chain-load all of them. Workers that need only one
 builder — most importantly the spawn-mode graph subprocess — would

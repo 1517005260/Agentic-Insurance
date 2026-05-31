@@ -3,12 +3,12 @@
 Why this exists
 ---------------
 
-spaCy NER decides per-context whether a token span is an entity, so the
+NER decides per-context whether a token span is an entity, so the
 same surface (e.g. "Heritage Protector Option") can be tagged on the
 page that introduces it but missed on later pages that merely refer
-back to it. On a 39-page closed insurance corpus this leaves a 52% gap
-between (entity, page) pairs where the surface literally appears and
-the entity↔passage edges actually written into the LinearRAG graph.
+back to it. This leaves a gap between (entity, page) pairs where the
+surface literally appears and the entity↔passage edges actually written
+into the LinearRAG graph.
 
 This module closes that gap by treating every entity surface NER ever
 produced anywhere in the corpus as an authoritative gazetteer, then
@@ -18,7 +18,7 @@ sweeping every passage with an Aho-Corasick automaton and emitting
 Why this is safe
 ----------------
 
-* The gazetteer is built from what spaCy already validated as entities.
+* The gazetteer is built from what NER already validated as entities.
   We are not inventing new entities — only finding additional mentions
   of entities the pipeline already accepted.
 * Word-boundary checks reject "us" matching "user", "axa" matching

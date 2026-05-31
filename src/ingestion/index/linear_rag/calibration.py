@@ -9,9 +9,8 @@ over-generation); T < 1 loosens it (recall-oriented).
 
 The temperature T is fitted offline on a silver span dev set
 (``experiments/ner_calibration.py``). The dev set is LLM-annotated
-(gpt-4o-mini via the project's chat API), collected from 40 sampled
-sentences of the 154-doc stock, and is **dev-only / not the evaluation
-set**. The annotator bias is declared in the dev-set JSON (annotator_model
+(gpt-4o-mini via the project's chat API), collected from sampled
+sentences, and is **dev-only / not the evaluation set**. The annotator bias is declared in the dev-set JSON (annotator_model
 field). Calibration is a standard post-hoc method independent of
 domain: the same temperature can be re-fitted on any annotated sample
 without touching the model or the label list.
