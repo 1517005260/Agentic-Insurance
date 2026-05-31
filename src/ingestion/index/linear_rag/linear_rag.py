@@ -5,7 +5,7 @@ file's contents into the global stores and graph:
 
     passages (plain page Markdown — no metadata prefix)
         → embed (passage store; meta carries file_id + page_number)
-        → spaCy NER per new passage (NER cache reuses existing)
+        → GLiNER NER per new passage (NER cache reuses existing)
         → entity_nodes / sentence_nodes / passage→entities
         → embed sentences and entities (hash dedup)
         → entity↔sentence and sentence↔entity hash-id maps
@@ -122,9 +122,9 @@ class LinearRAG:
             self.graph = ig.Graph(directed=False)
 
         # Per-instance index() call counter for graphml-flush cadence.
-        # Default cadence = 1 (write every call) → bit-identical to the
-        # pre-cadence behaviour, so the per-file production builder is
-        # unchanged. A persistent bulk driver (one instance over many
+        # Default cadence = 1 (write every call), so the per-file
+        # production builder writes every doc. A persistent bulk driver
+        # (one instance over many
         # docs) sets graphml_flush_every > 1 so the O(V+E) graphml
         # (de)serialisation is amortised instead of paid every doc.
         self._index_calls = 0
@@ -140,6 +140,7 @@ class LinearRAG:
         (
             self._passage_to_entities,
             self._sentence_to_entities,
+            self._passage_to_sentences,
         ) = self._load_ner_cache_or_empty()
         self._mentions_cache: dict[str, list[str]] = {}
         self._mention_seen: dict[str, set[str]] = {}
@@ -300,10 +301,11 @@ class LinearRAG:
     # entities or alias edges the current filters would reject, so
     # merging cached and freshly-extracted entities is unsafe; force
     # a clean rebuild on every schema change.
-    NER_CACHE_VERSION = 5
+    NER_CACHE_VERSION = 6
 
-    def _load_ner_cache_or_empty(self) -> tuple[dict, dict]:
-        """Load (passage_to_entities, sentence_to_entities) from disk once.
+    def _load_ner_cache_or_empty(self) -> tuple[dict, dict, dict]:
+        """Load (passage_to_entities, sentence_to_entities,
+        passage_to_sentences) from disk once.
 
         Returns empty dicts on missing file, parse error, or schema
         version mismatch. A version mismatch silently drops the cache
@@ -313,13 +315,13 @@ class LinearRAG:
         spans would survive forever.
         """
         if not self._ner_results_path.exists():
-            return {}, {}
+            return {}, {}, {}
         try:
             payload = json.loads(self._ner_results_path.read_text(encoding="utf-8"))
         except Exception:
-            return {}, {}
+            return {}, {}, {}
         if not isinstance(payload, dict):
-            return {}, {}
+            return {}, {}, {}
         if payload.get("version") != self.NER_CACHE_VERSION:
             logger.info(
                 "ner_results.json schema mismatch (cached=%s, current=%s); "
@@ -327,10 +329,11 @@ class LinearRAG:
                 payload.get("version"),
                 self.NER_CACHE_VERSION,
             )
-            return {}, {}
+            return {}, {}, {}
         return (
             payload.get("passage_hash_id_to_entities", {}) or {},
             payload.get("sentence_to_entities", {}) or {},
+            payload.get("passage_hash_id_to_sentences", {}) or {},
         )
 
     def _save_ner_results(self) -> None:
@@ -344,6 +347,7 @@ class LinearRAG:
                     "version": self.NER_CACHE_VERSION,
                     "passage_hash_id_to_entities": self._passage_to_entities,
                     "sentence_to_entities": self._sentence_to_entities,
+                    "passage_hash_id_to_sentences": self._passage_to_sentences,
                 },
                 ensure_ascii=False,
             ),
@@ -431,7 +435,11 @@ class LinearRAG:
 
         if new_passage_hash_ids:
             new_hash_id_to_passage = {h: hash_id_to_passage[h] for h in new_passage_hash_ids}
-            new_passage_to_entities, new_sentence_to_entities = self.ner.batch_ner(
+            (
+                new_passage_to_entities,
+                new_sentence_to_entities,
+                new_passage_to_sentences,
+            ) = self.ner.batch_ner(
                 new_hash_id_to_passage, self.config.max_workers
             )
             # 2b. Post-NER cleanup, applied ONLY to the per-doc delta.
@@ -463,6 +471,9 @@ class LinearRAG:
             # GLiNER cost again every doc.
             for h in new_passage_hash_ids:
                 self._passage_to_entities[h] = new_passage_to_entities_norm.get(h, [])
+                # Record sentence list (even when empty) so the diff
+                # against the cache stays consistent on re-runs.
+                self._passage_to_sentences[h] = new_passage_to_sentences.get(h, [])
             self._sentence_to_entities.update(new_sentence_to_entities)
             self._update_mention_index(new_sentence_to_entities)
             self._ner_dirty = True
@@ -472,7 +483,11 @@ class LinearRAG:
             entity_nodes,
             sentence_nodes,
             passage_hash_id_to_entities,
-        ) = self._extract_nodes(self._passage_to_entities, self._sentence_to_entities)
+        ) = self._extract_nodes(
+            self._passage_to_entities,
+            self._sentence_to_entities,
+            self._passage_to_sentences,
+        )
 
         # 4. Embed sentences and entities (hash dedup → only new ones embedded).
         added_sentence_hashes = self._insert_with_dedup(
@@ -822,7 +837,23 @@ class LinearRAG:
         return list(after - before)
 
     @staticmethod
-    def _extract_nodes(passage_to_entities, sentence_to_entities):
+    def _extract_nodes(passage_to_entities, sentence_to_entities, passage_to_sentences):
+        """Materialise the node sets the graph + faiss stores need.
+
+        ``sentence_nodes`` includes EVERY sentence ``split_sentences``
+        produced (drawn from ``passage_to_sentences``), not only the
+        entity-bearing subset from ``sentence_to_entities``. The
+        entity-bearing subset alone misses ~20 % of the corpus's
+        sentences (those whose GLiNER spans were either dropped or
+        never tagged) — fine for the original chain-mode edge
+        scoring (only co-occurrence sentences carry meaningful
+        weight) but breaks the question-conditioned preview snippet,
+        which looks for the top cos(q, sent) sentence on a candidate
+        page via ``GraphPPRChannel.passage_sentence_embs``. Without
+        the no-entity sentences in the store, the preview silently
+        picks a sub-optimal entity-bearing sentence when the answer
+        sentence carries no NER hit.
+        """
         entity_nodes: Set[str] = set()
         sentence_nodes: Set[str] = set()
         passage_hash_id_to_entities = defaultdict(set)
@@ -834,6 +865,9 @@ class LinearRAG:
             sentence_nodes.add(sentence)
             for entity in entities:
                 entity_nodes.add(entity)
+        for sentences in passage_to_sentences.values():
+            for sentence in sentences:
+                sentence_nodes.add(sentence)
         return entity_nodes, sentence_nodes, passage_hash_id_to_entities
 
     def _add_entity_to_passage_edges(
