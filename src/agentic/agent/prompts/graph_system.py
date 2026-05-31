@@ -1,61 +1,44 @@
 """Graph-only agent system prompt.
 
-Tools: ``graph_explore`` (entity / passage / sentence Tri-Graph in 5
-modes) and ``read`` (verbatim page Markdown). Each tool's full schema
-lives in its own ``get_schema`` description — this prompt only adds
-strategy and the answer contract on top.
+Tools: ``graph_explore`` (entity / passage / sentence Tri-Graph in
+multiple modes) and ``read`` (verbatim page Markdown). Per-tool detail
+lives in each tool's ``get_schema`` description — this prompt only
+states the role, the loop shape, and the answer contract.
+
+Style note: this prompt is intentionally minimal. Prescriptive
+*strategy* rules ("trust the ranking", "read N-M pages per call",
+multi-page disagreement clauses) hurt reader conversion versus the
+minimal version, so the LLM owns tool sequence and stop condition. The
+one *answer-shape* rule we pin is the shared conclusion-first
+``ANSWER_STYLE`` (see ``prompts/system.py``): the agent finds the gold
+page but tends to bury the answer in narrative that a judge then
+misses. That is a soft "lead with the conclusion" directive, not a
+rigid literal ``ANSWER:`` gate.
 """
 
 from typing import Optional
 
-
-_ROLE = """\
-You answer questions over a long-document corpus by navigating its
-entity knowledge graph and reading the source pages it surfaces.
-Quote verbatim from ``read`` output; cite ``[file_id#page_number]``;
-answer in the user's language. If the corpus does not support an
-answer, say so plainly."""
+from agentic.agent.prompts.system import ANSWER_STYLE
 
 
-_TOOLS = """\
-## Tools
-- ``graph_explore`` — entity-graph retrieval. Pick the mode by question
-  shape: ``ppr`` for topical / "discuss X" queries, ``entity_lookup``
-  for "what is Y / who is Y", ``chain`` for bridges between two known
-  entities, ``cluster_inspect`` / ``list_clusters`` for audits when
-  an alias cluster looks mixed.
-- ``read`` — verbatim page Markdown; the ONLY quote source. Pass
-  ``unit_ids=["file_id/p_NNNN"]``; read 2-5 pages per call."""
+GRAPH_SYSTEM_PROMPT = """\
+You answer questions over a document corpus by navigating an entity knowledge graph and reading source pages.
 
+## Available Tools
+- graph_explore: navigate the entity graph (modes: ppr for topical queries, chain for bridges between known entities, entity_analysis for surface/cluster resolution).
+- read: read full page Markdown by unit_ids.
 
-_STRATEGY = """\
 ## Strategy
-Iterate: ``graph_explore`` → ``read`` → answer. Trust the ranking —
-when ``graph_explore`` returns candidates, read the top ones first
-rather than skipping to lower-ranked picks. Reflect after every tool
-result; refine the query or switch mode on weak results. Issue
-independent calls in parallel."""
+Work iteratively: explore -> read -> evaluate -> explore -> read -> ... -> answer. For multi-hop questions, decompose into sub-questions.
 
-
-_RESPONSE = """\
-## Answer
-Before paraphrasing, quote the verbatim span from ``read`` that
-supports each fact. Cite each non-trivial claim as
-``[file_id#page_number]``; multiple cites per claim are fine
-(``[file_a#3, file_a#4]``). If two read pages give different values
-for the same attribute, surface both and explain which applies before
-answering.
-
-Last line of your output, exactly:
-``ANSWER: <shortest verbatim answer span — name / number / phrase>``.
-For unanswerable: ``ANSWER: unanswerable``."""
+## When Answering
+{answer_style}
+- Cite supporting pages as [file_id#page_number].
+- Avoid speculation beyond what the documents support.
+""".format(answer_style=ANSWER_STYLE)
 
 
 def build_graph_system_prompt(extra: Optional[str] = None) -> str:
-    parts = [_ROLE, _TOOLS, _STRATEGY, _RESPONSE]
-    if extra:
-        parts.append(extra.rstrip())
-    return "\n\n".join(parts)
-
-
-GRAPH_SYSTEM_PROMPT = build_graph_system_prompt()
+    if not extra:
+        return GRAPH_SYSTEM_PROMPT
+    return GRAPH_SYSTEM_PROMPT + "\n\n" + extra.rstrip()

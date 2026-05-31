@@ -7,6 +7,8 @@ then reads them for verbatim quoting.
 
 from typing import Optional
 
+from agentic.agent.prompts.system import ANSWER_STYLE
+
 
 _ROLE = """\
 You answer questions over a long-document corpus using two tools
@@ -45,13 +47,14 @@ _STRATEGY = """\
 
 _RESPONSE = """\
 ## Answer
+{answer_style}
 Quote verbatim from ``read``. Cite ``[file_id#page_number]``. If
 ``pattern_search`` + ``read`` cannot support an answer, say so
 plainly.
 
 Last line of your output, exactly:
 ``ANSWER: <shortest verbatim answer span — name / number / phrase>``.
-For unanswerable: ``ANSWER: unanswerable``."""
+For unanswerable: ``ANSWER: unanswerable``.""".format(answer_style=ANSWER_STYLE)
 
 
 def build_regex_system_prompt(extra: Optional[str] = None) -> str:

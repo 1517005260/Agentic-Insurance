@@ -6,6 +6,8 @@
   ``web_search`` + ``web_fetch`` and nothing else.
 """
 
+from agentic.agent.prompts.system import ANSWER_STYLE
+
 WEB_RAG_SYSTEM_PROMPT = """\
 You are an insurance / financial-regulation research assistant.
 
@@ -49,9 +51,9 @@ Workflow:
    guess.
 
 Answer:
+{answer_style}
 - Quote regulation names, dates, and monetary figures verbatim.
 - Cite ``[^k]`` per claim; end with a ``## Sources`` section
   ``[^k] <title> — <url>``.
 - Flag any jurisdiction mismatch (e.g. citing a Hong Kong source for a
-  mainland-China question).
-- Reply in the user's language."""
+  mainland-China question).""".format(answer_style=ANSWER_STYLE)
