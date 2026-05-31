@@ -35,7 +35,7 @@ Physical vs logical entity:
   navigation conditioned on the question.
 
 Pre-warming:
-  spaCy / GLiNER NER and igraph are heavy to load. The agent's
+  GLiNER NER and igraph are heavy to load. The agent's
   ``warm_up()`` invokes :meth:`warm_up` on this tool to absorb that
   one-time cost before the user's first turn.
 
@@ -78,7 +78,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_VALID_MODES = {"ppr", "chain", "entity_lookup", "cluster_inspect", "list_clusters"}
+_VALID_MODES = {"ppr", "chain", "entity_analysis"}
 # Agent path default: 5 candidates is enough for the typical
 # "see top hits → read 2-3 of them" workflow. The 20-default historical
 # value was tuned for the workbench UI (which renders all 20 as a
@@ -202,19 +202,18 @@ class GraphExploreTool(BaseTool):
             "function": {
                 "name": "graph_explore",
                 "description": (
-                    "Entity-graph retrieval. Each surface form is its own "
-                    "node; alias edges fuse near-synonyms into LOGICAL "
-                    "CLUSTERS. Modes:\n"
-                    "- ppr: personalized PageRank from a free-text question; "
-                    "returns top pages with preview + clusters touched.\n"
-                    "- chain: typed-edge beam search between entities. Seed "
+                    "Navigate the entity knowledge graph. Modes:\n"
+                    "- ppr: free-text query -> ranked candidate pages "
+                    "with a question-conditioned snippet per page.\n"
+                    "- chain: typed-edge bridge between entities; seed "
                     "via `question`, `from_page=\"file_id/p_NNNN\"`, or "
-                    "`from_entities=[...]`; optionally filter with `to_entities=[...]`.\n"
-                    "- entity_lookup: embedding-match a `surface` to physical "
-                    "entities + their logical cluster.\n"
-                    "- cluster_inspect: audit a `cluster_id` (members, top "
-                    "passages, alias quality).\n"
-                    "- list_clusters: enumerate top clusters by size or mention weight."
+                    "`from_entities=[...]`; optionally filter with "
+                    "`to_entities=[...]`.\n"
+                    "- entity_analysis: resolve a `surface` to its "
+                    "entity cluster + alias members + cross-doc top "
+                    "pages; alternatively pass a `cluster_id` for "
+                    "deep audit, or omit both to enumerate top "
+                    "clusters by size or mention_weight."
                 ),
                 "parameters": {
                     "type": "object",
@@ -229,7 +228,7 @@ class GraphExploreTool(BaseTool):
                         },
                         "surface": {
                             "type": "string",
-                            "description": "Entity surface form (mode=entity_lookup).",
+                            "description": "Entity surface form (mode=entity_analysis).",
                         },
                         "depth": {
                             "type": "integer",
@@ -259,7 +258,7 @@ class GraphExploreTool(BaseTool):
                         },
                         "cluster_id": {
                             "type": "string",
-                            "description": "Cluster to deep-dive (mode=cluster_inspect).",
+                            "description": "Cluster to deep-dive (mode=entity_analysis, with cluster_id only).",
                         },
                         "from_page": {
                             "type": "string",
@@ -278,11 +277,11 @@ class GraphExploreTool(BaseTool):
                         "sort_by": {
                             "type": "string",
                             "enum": ["size", "mention_weight"],
-                            "description": "Ranking metric (mode=list_clusters); default 'size'.",
+                            "description": "Ranking metric (mode=entity_analysis, when no surface or cluster_id is given); default 'size'.",
                         },
                         "surface_filter": {
                             "type": "string",
-                            "description": "Substring filter against cluster surfaces (mode=list_clusters).",
+                            "description": "Substring filter against cluster surfaces (mode=entity_analysis, when no surface or cluster_id is given).",
                         },
                     },
                     "required": ["mode"],
@@ -299,7 +298,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "invalid_argument",
                     f"`mode` must be one of {sorted(_VALID_MODES)}.",
-                    remediation="Set `mode` to 'ppr' (free-text PPR), 'chain' (query-time typed-edge beam), or 'entity_lookup' (surface→entity).",
+                    remediation="Set `mode` to 'ppr' (free-text PPR), 'chain' (typed-edge bridge), or 'entity_analysis' (surface/cluster resolution).",
                     valid_example={"mode": "chain", "question": "..."},
                 ),
                 {"error": "invalid_argument"},
@@ -309,7 +308,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "graph_unavailable",
                     "LinearRAG graph is not built; ingest the corpus first.",
-                    remediation="Fall back to semantic_search / bm25_search / pattern_search for this query — the entity graph is not available in this corpus.",
+                    remediation="The entity graph is not available in this corpus.",
                 ),
                 {"error": "graph_unavailable"},
             )
@@ -318,11 +317,66 @@ class GraphExploreTool(BaseTool):
             return self._run_ppr(context, **kwargs)
         if mode == "chain":
             return self._run_chain(context, **kwargs)
-        if mode == "cluster_inspect":
-            return self._run_cluster_inspect(context, **kwargs)
-        if mode == "list_clusters":
-            return self._run_list_clusters(context, **kwargs)
-        return self._run_entity_lookup(context, **kwargs)
+        return self._run_entity_analysis(context, **kwargs)
+
+    def _run_entity_analysis(self, context: "AgentContext", **kwargs):
+        """Single mode for all logical-entity (alias-cluster) operations.
+
+        Replaces the prior ``entity_lookup`` / ``cluster_inspect`` /
+        ``list_clusters`` mode trio: the dispatch is by argument shape,
+        not by an explicit mode name the agent has to memorise. Three
+        argument shapes:
+
+        * ``surface="Microsoft"`` → resolve the surface to its physical
+          entity hits + each hit's logical cluster (members, audit,
+          top pages where any member appears). This is the most common
+          path — translate a question-side surface into a cluster
+          handle + immediate cross-doc page anchors.
+        * ``cluster_id="c_2436"`` (no surface) → deep audit of one
+          cluster (members, top passages, alias quality, co-occurring
+          clusters). Used after PPR's ``clusters_touched`` flags a
+          cluster the agent wants to inspect.
+        * ``surface=""`` and ``cluster_id=""`` → enumerate the top
+          clusters in the corpus by ``sort_by={size, mention_weight}``
+          with optional ``surface_filter``. Discovery / audit path.
+
+        Old dispatches retained as private ``_run_entity_lookup`` /
+        ``_run_cluster_inspect`` / ``_run_list_clusters`` for direct
+        callers; the agent sees one ``entity_analysis`` mode.
+        """
+        surface = (kwargs.get("surface") or "").strip()
+        cluster_id = (kwargs.get("cluster_id") or "").strip()
+        if cluster_id and surface:
+            return err(
+                "invalid_argument",
+                "mode='entity_analysis' accepts EITHER `surface` OR `cluster_id`, not both.",
+                remediation=(
+                    "Drop one: pass `surface` to resolve a name to its "
+                    "cluster, OR pass `cluster_id` to deep-audit a "
+                    "known cluster. Mixing them is ambiguous."
+                ),
+                valid_example={"mode": "entity_analysis", "surface": "AXA"},
+            ), {"error": "invalid_argument"}
+        if cluster_id:
+            obs, meta = self._run_cluster_inspect(context, **kwargs)
+        elif surface:
+            obs, meta = self._run_entity_lookup(context, **kwargs)
+        else:
+            obs, meta = self._run_list_clusters(context, **kwargs)
+        # Rewrite the inner ``mode`` field to the public name so the
+        # agent's transcript only ever sees the 3 canonical modes
+        # ({ppr, chain, entity_analysis}) it was told about. The
+        # private dispatchers still emit the old internal mode names
+        # for debug / log clarity.
+        try:
+            import json as _json
+            payload = _json.loads(obs) if isinstance(obs, str) else obs
+            if isinstance(payload, dict) and "mode" in payload:
+                payload["mode"] = "entity_analysis"
+                obs = _json.dumps(payload, default=str) if isinstance(obs, str) else payload
+        except Exception:
+            pass
+        return obs, meta
 
     # ----------------------------------------------------------- PPR mode
 
@@ -392,7 +446,7 @@ class GraphExploreTool(BaseTool):
             return err(
                 "ppr_failed",
                 f"PPR raised: {exc}",
-                remediation="Retry with a simpler question or fall back to semantic_search / bm25_search; the PPR channel hit an internal error.",
+                remediation="Retry with a simpler question; if the PPR channel keeps failing, switch to mode=entity_analysis (surface lookup) or mode=chain.",
             ), {"error": "ppr_failed"}
 
         # Apply the page_range gate post-hoc (PPR channel honors file_ids
@@ -428,6 +482,21 @@ class GraphExploreTool(BaseTool):
         # several supporting pages on raw PPR score alone.
         eligible = self._doc_aware_rerank(eligible, limit)
 
+        # Per-doc page roll-up over the FULL eligible slate (pre-truncation
+        # so docs with several lower-ranked pages still surface in the
+        # rollup). Powers the ``docs_summary`` field — the agent's main
+        # batch-read signal: "doc X has K pages in the top-K, range
+        # p_lo..p_hi" lets it issue one ``read(unit_ids=[…])`` for all
+        # siblings in one shot, instead of reading only 1-2 of several
+        # gold pages on the same doc.
+        doc_pages_full: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
+        for hit, page_number in eligible:
+            if page_number is None:
+                continue
+            doc_pages_full[hit.file_id].append(
+                (int(page_number), float(hit.score))
+            )
+
         results: List[Dict[str, Any]] = []
         kept_hits: List[Any] = []
         for hit, page_number in eligible:
@@ -443,30 +512,145 @@ class GraphExploreTool(BaseTool):
             if len(results) >= limit:
                 break
 
+        # Cap doc_pages_full to the doc set that actually appears in
+        # ``results`` (i.e. survives the top-K cut). Including docs the
+        # agent can't reach via the visible candidate list is noise.
+        visible_docs = {r["file_id"] for r in results}
+        doc_pages_full = {
+            fid: ps for fid, ps in doc_pages_full.items() if fid in visible_docs
+        }
+
         seeds_dbg = debug_snapshot.get("seeds", [])
-        # Attach previews (240-char text excerpt) for disambiguation.
-        results_with_preview = self._attach_previews(results, kept_hits)
-        # L3 + L6: per-page logical-cluster provenance.  For each
-        # candidate, surface "which logical entities dominate this
-        # page" — lets the agent see at a glance whether the page is
-        # about (cluster_2436=Nagano) or (cluster_0000=political
-        # parties).  Decisive for refining queries when PPR drifts to
-        # high-degree hub clusters.
+        # Attach question-conditioned previews — single highest
+        # cos(q_emb, sent_emb) sentence per candidate page. Decisive
+        # for the agent's first read selection versus a first-N-chars
+        # preview, which surfaces table headers or references
+        # regardless of the question.
+        results_with_preview = self._attach_previews(results, kept_hits, question=question)
+
+        # Seed surfaces (lowercased once) — used for per-page
+        # ``supported_by`` and the global ``seeds_unsupported`` diagnostic.
+        # Substring check, same heuristic ``_calculate_passage_scores``
+        # uses internally — cheap on top-K * |seeds| ~= 5 * 8.
+        seed_surfaces: List[str] = []
+        for s in (seeds_dbg if isinstance(seeds_dbg, list) else []):
+            surf = (s.get("surface") or "").strip()
+            if surf:
+                seed_surfaces.append(surf)
+        seeds_with_any_support: set = set()
+
+        # L3 + L6: per-page logical-cluster provenance + corpus breadth
+        # (pages_in_cluster) so the agent can distinguish a specific
+        # anchor entity (≤ 5 pages) from a hub cluster spanning the
+        # corpus (≥ 100 pages) that PPR drifted into.
         for r, hit in zip(results_with_preview, kept_hits):
             ph = None
             for ev in (getattr(hit, "evidence", None) or []):
                 if isinstance(ev, dict) and ev.get("passage_hash_id"):
                     ph = ev["passage_hash_id"]
                     break
+            # ``supported_by`` — which seed surfaces actually appear on
+            # this passage's text. A page with high PPR score but no
+            # seed support was brought in by graph diffusion through a
+            # hub, not by direct match — a strong demote signal that
+            # the agent today can only guess from the preview.
+            page_text = ""
+            if ph is not None:
+                page_text = self._channel.passage_store.hash_id_to_text.get(ph, "") or ""
+            page_text_lower = page_text.lower()
+            supported: List[str] = []
+            for surf in seed_surfaces:
+                if surf.lower() in page_text_lower:
+                    supported.append(surf)
+                    seeds_with_any_support.add(surf)
+            # Cap to top 3 (most informative; whole list bloats the obs).
+            r["supported_by"] = supported[:3]
+
             if ph is None:
                 r["clusters_touched"] = []
                 continue
             try:
-                r["clusters_touched"] = self._channel.passage_top_clusters(
-                    ph, top_n=3
-                )
+                clusters = self._channel.passage_top_clusters(ph, top_n=3)
+                for c in clusters:
+                    cid = c.get("cluster_id")
+                    if cid:
+                        c["pages_in_cluster"] = self._channel.cluster_passage_count(cid)
+                r["clusters_touched"] = clusters
             except Exception:
                 r["clusters_touched"] = []
+
+        # ``seeds_unsupported`` — seeds that activated PPR but whose
+        # surface never appears in any top-K candidate's text. Telegraphs
+        # "your seed `Saint-Galmier` never landed in the surfaced pages"
+        # so the agent knows to switch tactic (entity_lookup / chain)
+        # instead of reformulating the same PPR query.
+        seeds_unsupported = [
+            s for s in seed_surfaces if s not in seeds_with_any_support
+        ]
+
+        # Per-doc rollup. Each row carries:
+        #  * ``pages_in_topk`` + ``page_numbers`` + ``page_span``
+        #    — the visible-from-PPR subset
+        #  * ``total_pages_in_doc`` + ``pages_not_in_topk_sample`` —
+        #    so the agent sees "PPR surfaced 2 of 11 pages this doc
+        #    has; 9 more exist (e.g. p_3, p_4, p_8, ...)" and can
+        #    batch-read the missing siblings without a second PPR
+        #  * ``dominant_cluster`` — the cluster_id occurring most
+        #    often across the doc's visible pages, plus its surface;
+        #    distinguishes "Gignac bio" from "Florida Panthers bio"
+        #    without reading p_1 of each
+        per_page_clusters: Dict[Tuple[str, Optional[int]], List[Dict[str, Any]]] = {
+            (r["file_id"], r.get("page_number")): r.get("clusters_touched") or []
+            for r in results_with_preview
+        }
+        channel = self._channel
+        docs_summary: List[Dict[str, Any]] = []
+        for fid, ps in doc_pages_full.items():
+            ps_sorted = sorted(ps, key=lambda t: t[0])
+            page_numbers = [pn for pn, _ in ps_sorted]
+            total = round(sum(s for _, s in ps), 6)
+            total_pages = channel.doc_page_count(fid)
+            not_in_topk = (
+                [pn for pn in range(1, total_pages + 1) if pn not in page_numbers]
+                if total_pages > 0 else []
+            )
+            # Cap the missing-pages list to keep token cost in check
+            # on very long docs; the first 15 are the most informative
+            # ("contiguous near the surfaced range" or "all of them").
+            not_in_topk_short = not_in_topk[:15]
+            cluster_counts: Dict[str, int] = defaultdict(int)
+            cluster_surface: Dict[str, str] = {}
+            for pn in page_numbers:
+                for c in per_page_clusters.get((fid, pn), []):
+                    cid = c.get("cluster_id")
+                    if not cid:
+                        continue
+                    cluster_counts[cid] += 1
+                    if cid not in cluster_surface:
+                        cluster_surface[cid] = c.get("top_surface") or ""
+            dominant = None
+            if cluster_counts:
+                cid_best, n_pages = max(cluster_counts.items(), key=lambda kv: kv[1])
+                dominant = {
+                    "cluster_id": cid_best,
+                    "top_surface": cluster_surface.get(cid_best, ""),
+                    "pages_anchored": n_pages,
+                }
+            row: Dict[str, Any] = {
+                "file_id": fid,
+                "pages_in_topk": len(page_numbers),
+                "total_pages_in_doc": total_pages,
+                "page_numbers": page_numbers,
+                "page_span": [page_numbers[0], page_numbers[-1]] if page_numbers else [],
+                "total_score": total,
+            }
+            if not_in_topk_short:
+                row["pages_not_in_topk_sample"] = not_in_topk_short
+            if dominant is not None:
+                row["dominant_cluster"] = dominant
+            docs_summary.append(row)
+        docs_summary.sort(key=lambda d: d["total_score"], reverse=True)
+        docs_summary = docs_summary[:5]  # token cap
         # L2: top logical clusters by PPR mass.  Surfaced as DIAGNOSTIC
         # CONTEXT only — LLMs navigate poorly via opaque cluster IDs
         # (exposing them as the primary navigation signal regresses
@@ -502,6 +686,23 @@ class GraphExploreTool(BaseTool):
         # logical-entity navigation. ``top_logical_clusters`` is the
         # decompressed form, ``clusters_touched`` per page localizes
         # which logical entities live on each candidate.
+        # ``unresolved`` — telegraphs "this PPR call did not anchor on
+        # any specific entity from the question". Fires when every
+        # activated seed surface was unsupported in the top-K AND the
+        # leading logical cluster's mass is below a low floor. Signals
+        # to the agent: do NOT answer-from-noise on this PPR slate;
+        # either pivot to entity_analysis with a more specific
+        # surface, or stop and ask for disambiguation. False when no
+        # seeds at all (different failure mode — "no_seeds_skip").
+        _top_cluster_mass = max(
+            (float(c.get("mass") or 0.0) for c in top_logical), default=0.0
+        )
+        unresolved = (
+            len(seed_surfaces) > 0
+            and len(seeds_unsupported) == len(seed_surfaces)
+            and _top_cluster_mass < 0.02
+        )
+
         return (
             ok(
                 "GraphExploreObservation",
@@ -512,7 +713,10 @@ class GraphExploreTool(BaseTool):
                     {"surface": s.get("surface"), "sim": s.get("sim")}
                     for s in (seeds_dbg if isinstance(seeds_dbg, list) else [])
                 ][:8],  # cap seed list — long NER seeds also bloat
+                seeds_unsupported=seeds_unsupported,
+                unresolved=unresolved,
                 top_logical_clusters=top_logical,
+                docs_summary=docs_summary,
                 candidate_pages=results_with_preview,
             ),
             {"retrieved_tokens": 0, "hits": len(results_with_preview)},
@@ -522,30 +726,51 @@ class GraphExploreTool(BaseTool):
         self,
         results: List[Dict[str, Any]],
         channel_hits: Optional[List[Any]] = None,
+        *,
+        question: str = "",
     ) -> List[Dict[str, Any]]:
-        """Add a short ``preview`` field per candidate page (240 chars
-        of the page's text_markdown, leading lines preferred).  The
-        agent uses it for fine-grained page selection before a
-        ``read`` call.  Falls through silently when the passage_store
-        lookup fails — the agent can still call ``read``.
+        """Add a question-conditioned ``preview`` field per candidate
+        page — the single sentence on that page that maximises
+        cos(q_emb, sent_emb). The agent uses it for fine-grained page
+        selection before a ``read`` call; question-conditioned snippets
+        flip "this candidate is about my topic" from a guess to a
+        direct signal, unlike a first-N-chars preview.
+
+        Channel artifact path: each page's sentences + their
+        embeddings come from
+        :meth:`GraphPPRChannel.passage_sentence_embs`, built once from
+        the ingest-persisted ``passage_hash_id_to_sentences`` map and
+        the sentence_store. The query embedding is encoded once per
+        call and reused across every candidate page.
 
         Prefers ``channel_hits[i].evidence[0]["passage_hash_id"]`` for
-        an exact passage match.  Falls back to a one-time-built
+        an exact passage match. Falls back to a one-time-built
         ``(file_id, page_number) → passage_hash`` map when evidence
         is unavailable (older trace formats / non-PPR modes).
         """
+        from agentic.tools.acquisition._preview import query_snippet
+
         if not results:
             return results
         out: List[Dict[str, Any]] = []
-        try:
-            page_store = getattr(self._channel, "passage_store", None)
-        except Exception:
-            page_store = None
+        channel = self._channel
+        page_store = getattr(channel, "passage_store", None)
+        embed_client = getattr(channel, "embedding_client", None)
+
+        # Encode the query once and reuse across every candidate page.
+        q_emb = None
+        if question and embed_client is not None:
+            try:
+                q_emb = embed_client.encode(question, is_query=True)
+                if q_emb.ndim == 2:
+                    q_emb = q_emb[0]
+            except Exception:
+                q_emb = None
+
         # Build the reverse meta map lazily — only if we end up needing
         # the fallback path (i.e. some hit lacks evidence).
         meta_map: Optional[Dict[Tuple[str, Optional[int]], str]] = None
         for i, hit_meta in enumerate(results):
-            preview = ""
             if page_store is None or not hasattr(page_store, "hash_id_to_text"):
                 out.append({**hit_meta, "preview": ""})
                 continue
@@ -580,12 +805,31 @@ class GraphExploreTool(BaseTool):
                 key = (str(hit_meta["file_id"]),
                        int(hit_meta["page_number"]) if hit_meta.get("page_number") is not None else None)
                 passage_hash = meta_map.get(key)
+
+            page_text = ""
+            cached_sentences = None
             if passage_hash is not None:
+                page_text = page_store.hash_id_to_text.get(passage_hash, "") or ""
+                # passage_sentence_embs is a one-time disk read + dict
+                # translation; any failure (missing ner_results.json,
+                # sentence_store schema drift) should degrade to the
+                # slow-path snippet, not lose the whole observation.
                 try:
-                    text = page_store.hash_id_to_text.get(passage_hash, "") or ""
-                    preview = " ".join(text.split())[:_PPR_PREVIEW_CHARS]
+                    cached_sentences = channel.passage_sentence_embs(passage_hash)
                 except Exception:
-                    preview = ""
+                    cached_sentences = None
+            try:
+                preview = query_snippet(
+                    page_text,
+                    question,
+                    embed_client,
+                    max_chars=_PPR_PREVIEW_CHARS,
+                    cached_query_emb=q_emb,
+                    cached_sentences=cached_sentences,
+                )
+            except Exception:
+                preview = (" ".join(page_text.split())[:_PPR_PREVIEW_CHARS]
+                           if page_text else "")
             out.append({**hit_meta, "preview": preview})
         return out
 
@@ -744,7 +988,7 @@ class GraphExploreTool(BaseTool):
             return err(
                 "graph_unavailable",
                 "Entity or sentence store is empty; index the corpus first.",
-                remediation="Fall back to semantic_search / bm25_search / pattern_search — chain mode needs both an entity layer and a sentence layer.",
+                remediation="chain mode needs both an entity layer and a sentence layer; the entity graph is not available in this corpus.",
             ), {"error": "graph_unavailable"}
 
         # Question embedding — used for seeding AND for the cached
@@ -762,7 +1006,7 @@ class GraphExploreTool(BaseTool):
             return err(
                 "embed_failed",
                 f"Embedding the query failed: {exc}",
-                remediation="Retry once; if it persists, fall back to semantic_search / bm25_search.",
+                remediation="Retry once; if it persists, switch to mode=ppr (free-text PPR) or mode=entity_analysis (surface lookup).",
             ), {"error": "embed_failed"}
         if q_emb.ndim == 2:
             q_emb = q_emb[0]
@@ -869,6 +1113,13 @@ class GraphExploreTool(BaseTool):
                             "head": nbr_hash,
                             "edge_score": float(edge_score),
                             "via_sentences": sids_top,
+                            # Per-sentence q-cos similarity, aligned to
+                            # ``via_sentences`` order. Lets the agent
+                            # see which snippet directly addresses the
+                            # question vs is shared vocab — informs
+                            # whether to quote the snippet or treat it
+                            # as a weak bridge.
+                            "via_sims": [float(s) for s in sims_top],
                             "n_support": int(cand_arr.size),
                         }
                     ]
@@ -1316,12 +1567,20 @@ class GraphExploreTool(BaseTool):
             edges_out: List[Dict[str, Any]] = []
             for e in p["edges"]:
                 via_snippets: List[Dict[str, Any]] = []
-                for sid in e["via_sentences"]:
+                # ``via_sims`` is aligned to ``via_sentences`` order
+                # when set by the beam path; the synthetic 1-hop
+                # bridge path omits it (sims weren't computed) and we
+                # fall back to None per snippet there.
+                via_sims_aligned = e.get("via_sims") or [None] * len(e["via_sentences"])
+                for sid, q_sim in zip(e["via_sentences"], via_sims_aligned):
                     txt = sent_text.get(sid, "")
                     if not txt:
                         continue
                     snippet = txt if len(txt) <= 220 else txt[:217] + "..."
-                    via_snippets.append({"sentence_id": sid, "text": snippet})
+                    entry = {"sentence_id": sid, "text": snippet}
+                    if q_sim is not None:
+                        entry["q_sim"] = round(float(q_sim), 4)
+                    via_snippets.append(entry)
                 edges_out.append(
                     {
                         "from": e["tail"],
@@ -1448,7 +1707,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "graph_unavailable",
                     "Entity store is empty; index the corpus first.",
-                    remediation="Fall back to semantic_search / bm25_search / pattern_search — the entity layer is not built for this corpus.",
+                    remediation="The entity layer is not built for this corpus; entity_analysis cannot run.",
                 ),
                 {"error": "graph_unavailable"},
             )
@@ -1460,7 +1719,7 @@ class GraphExploreTool(BaseTool):
                 err(
                     "embed_failed",
                     f"Embedding the surface failed: {exc}",
-                    remediation="Retry once; if the failure repeats, fall back to bm25_search or pattern_search using the surface form as the query.",
+                    remediation="Retry once; if the failure repeats, try a different surface spelling for entity_analysis.",
                 ),
                 {"error": "embed_failed"},
             )
@@ -1471,9 +1730,8 @@ class GraphExploreTool(BaseTool):
         # edges (high precision, low recall); query-time lookup wants
         # something looser, but 0.4 surfaces too much noise (e.g. a
         # surface like "Premium Refund" matched a sim=0.4 product name).
-        # 0.6 is the empirical sweet spot on this corpus; admin config
-        # `graph_explore.entity_lookup_min_sim` overrides it per
-        # corpus (see schema.py).
+        # 0.6 trades those off; admin config
+        # `graph_explore.entity_lookup_min_sim` overrides it per corpus.
         cands = gradient_topk_candidates(
             emb_arr,
             store,
@@ -1518,11 +1776,26 @@ class GraphExploreTool(BaseTool):
                 # blob (likely over-merged).
                 top_surfs = self._channel.cluster_top_surfaces(cid, top_n=8)
                 full_size = len(cluster_info.get("members") or [])
+                # Inline the top pages this cluster anchors so the agent
+                # gets immediate cross-doc page references in a single
+                # entity_lookup call (instead of needing a follow-up
+                # ``cluster_inspect`` round trip). Capped at 5 to keep
+                # token cost ~150 / cluster; skipped for hub clusters
+                # (>50 members) where the page list would just be the
+                # corpus's most-mentioned docs and dilute the signal.
+                if full_size <= 50:
+                    try:
+                        top_pages = self._channel.cluster_top_passages(cid, top_n=5)
+                    except Exception:
+                        top_pages = []
+                else:
+                    top_pages = []
                 entry["logical_cluster"] = {
                     "cluster_id": cid,
                     "canonical": cluster_info.get("canonical"),
                     "cluster_size": full_size,
                     "top_members": top_surfs,
+                    "top_pages": top_pages,
                     # Heuristic flag: clusters > 50 members likely
                     # include over-merges; agent should treat them
                     # with caution.  Concrete audit available via

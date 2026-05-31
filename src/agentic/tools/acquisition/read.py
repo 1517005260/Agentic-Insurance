@@ -36,6 +36,7 @@ from storage.page_store import PageAsset, PageStore, make_global_id
 
 if TYPE_CHECKING:
     from agentic.core.context import AgentContext
+    from rag.channels.graph_ppr import GraphPPRChannel
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,18 @@ _VALID_UNIT_TYPES = {"page", "passage", "table_row"}
 _VALID_MODES = {"text", "text_with_img"}
 _DEFAULT_VLM_PARALLELISM = 4
 
+# Per-page annotation caps for graph-aware reads (kept low; the agent
+# benefits from a tight key-entity list and a couple of neighbour
+# pointers, not a corpus dump).
+_READ_TOP_ENTITIES = 8
+_READ_TOP_NEIGHBOURS = 3
+# Cluster-size guard for the neighbour computation: pages whose top
+# entities all belong to giant hub clusters (e.g. one Pew Research
+# Center entity that incidentally appears on 200 pages) would dominate
+# the neighbour list and crowd out genuine cross-references. Skip
+# entities sitting in clusters above this size when picking neighbours.
+_READ_NEIGHBOUR_HUB_CUTOFF = 40
+
 
 class ReadTool(BaseTool):
     def __init__(
@@ -53,12 +66,22 @@ class ReadTool(BaseTool):
         inventory: InventoryStore,
         vlm_reader: Optional[VlmReader] = None,
         vlm_parallelism: int = _DEFAULT_VLM_PARALLELISM,
+        graph_channel: Optional["GraphPPRChannel"] = None,
     ) -> None:
         self.page_store = page_store
         self.inventory = inventory
         self.vlm_reader = vlm_reader if vlm_reader is not None else default_vlm_reader()
         self.vlm_parallelism = max(1, int(vlm_parallelism))
         self.tokenizer = shared_tiktoken_encoder("gpt-4o")
+        # When wired (graph_agent path), each page-level read attaches
+        # two graph-derived annotations: ``entities`` (top mention-
+        # weighted entities on this page; key-entity table prompts the
+        # reader to ground synthesis) and ``neighbour_pages`` (other
+        # pages sharing this page's anchor entities; lets the agent
+        # plan the next read without a fresh PPR query). None means
+        # no graph wiring (regex / web / default agents), in which
+        # case the original page observation shape is preserved.
+        self.graph_channel = graph_channel
 
     @property
     def name(self) -> str:
@@ -289,7 +312,7 @@ class ReadTool(BaseTool):
             ]
         except Exception:
             pass
-        return {
+        entry: Dict[str, Any] = {
             "unit_id": page.global_id,
             "file_id": page.file_id,
             "page_id": page.page_id,
@@ -307,6 +330,126 @@ class ReadTool(BaseTool):
                 "table_row_ids": rows,
             },
         }
+        self._attach_graph_annotations(entry, page)
+        return entry
+
+    def _attach_graph_annotations(
+        self, entry: Dict[str, Any], page: PageAsset
+    ) -> None:
+        """Add ``entities`` + ``neighbour_pages`` to a page-read entry
+        when the GraphPPRChannel is wired (graph_agent factory path).
+
+        ``entities``: top-K (surface, cluster_id, weight) on this page
+        — a structured key-entity table that prompts the reader to
+        ground synthesis. Multi-hop misses where the reader read all
+        gold pages but answered wrong often look like the reader
+        staring at a long Markdown page without the named hooks; this
+        is the entity-chained reading trick from prior work.
+
+        ``neighbour_pages``: top-K other pages sharing this page's
+        specific (non-hub) anchor entities. The agent's next-step
+        planning gets a direct sibling pointer without issuing a
+        fresh PPR query. Hub entities (cluster_size > cutoff) are
+        skipped so the neighbour list isn't dominated by corpus-wide
+        mentions of e.g. organization names.
+
+        All reverse maps (``page_meta_to_hash``, ``page_hash_to_meta``,
+        ``entity_to_passages``) live on the channel and are built once
+        with the channel's ``_call_lock``, then served in O(1) here —
+        no per-read full scans of ``passage_store.hash_ids``.
+        """
+        channel = self.graph_channel
+        if channel is None:
+            return
+        try:
+            channel._build_entity_passage_indexes()
+            _, m2c = channel._load_clusters_cached()
+        except Exception:
+            return
+
+        key = (page.file_id, int(page.page_number) if page.page_number is not None else None)
+        passage_hash = channel.page_meta_to_hash().get(key)
+        if passage_hash is None:
+            return
+
+        ent_list = (channel._passage_entities or {}).get(passage_hash, [])
+        if not ent_list:
+            return
+
+        ent_text = channel.entity_store.hash_id_to_text
+        entities_out: List[Dict[str, Any]] = []
+        for ent_hash, w in ent_list[:_READ_TOP_ENTITIES]:
+            cid = m2c.get(ent_hash, ent_hash)
+            ent_entry: Dict[str, Any] = {
+                "surface": ent_text.get(ent_hash, ""),
+                "cluster_id": cid,
+                "weight": round(float(w), 4),
+            }
+            # Multi-hop bridge hint via the tri-graph's sentence layer.
+            # Our entity graph has NO relation edges; predicates live
+            # in the sentences where two entities co-occur. Surfacing
+            # the top-2 sentence-co-occurring partners per entity
+            # lets the agent see the bridge directly on the read
+            # observation — no extra chain call needed to discover
+            # which entities are "documented near" this one. Capped
+            # at 2 surfaces per entity (~40 tokens/page total) to
+            # keep the read observation focused.
+            try:
+                co_partners = channel.entity_top_co_occurring(ent_hash, top_n=2)
+            except Exception:
+                co_partners = []
+            if co_partners:
+                ent_entry["co_occurring"] = [
+                    ent_text.get(other_h, "") for other_h, _ in co_partners
+                    if ent_text.get(other_h, "")
+                ]
+            entities_out.append(ent_entry)
+        entry["entities"] = entities_out
+
+        # Neighbour pages: union of other passages sharing this page's
+        # non-hub anchor entities. Score each neighbour by Σ shared-
+        # entity weight; surface top K.
+        entity_to_passages = channel.entity_to_passages()
+        neighbour_score: Dict[str, float] = {}
+        for ent_hash, w in ent_list[:_READ_TOP_ENTITIES]:
+            cid = m2c.get(ent_hash, ent_hash)
+            try:
+                if channel.cluster_passage_count(cid) > _READ_NEIGHBOUR_HUB_CUTOFF:
+                    continue
+            except Exception:
+                pass
+            for other_ph, other_w in entity_to_passages.get(ent_hash, []):
+                if other_ph == passage_hash:
+                    continue
+                neighbour_score[other_ph] = neighbour_score.get(other_ph, 0.0) + float(other_w)
+        if not neighbour_score:
+            entry["neighbour_pages"] = []
+            return
+
+        hash_to_meta = channel.page_hash_to_meta()
+        ranked = sorted(neighbour_score.items(), key=lambda kv: kv[1], reverse=True)
+        neighbours: List[Dict[str, Any]] = []
+        for ph_other, sc in ranked[: _READ_TOP_NEIGHBOURS * 3]:
+            meta = hash_to_meta.get(ph_other)
+            if meta is None:
+                continue
+            fid_o, pn_o = meta
+            if not fid_o or pn_o is None:
+                continue
+            # ``same_doc`` flag lets the agent see at a glance whether
+            # the neighbour is an intra-doc sibling (likely an
+            # unread section of the same article) or a cross-doc
+            # bridge. Intra-doc siblings are the dominant path on
+            # multi-page-gold questions.
+            neighbours.append({
+                "file_id": fid_o,
+                "page_number": pn_o,
+                "shared_entity_weight": round(sc, 4),
+                "same_doc": fid_o == page.file_id,
+            })
+            if len(neighbours) >= _READ_TOP_NEIGHBOURS:
+                break
+        entry["neighbour_pages"] = neighbours
 
     def _vlm_one(self, page: PageAsset) -> Dict[str, Any]:
         if self.vlm_reader is None or not page.page_image_path:

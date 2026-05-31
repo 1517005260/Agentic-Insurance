@@ -115,7 +115,9 @@ def build_default_agent(
             **(graph_explore_kwargs or {}),
         )
     )
-    registry.register(ReadTool(page_store=page_store, inventory=inventory))
+    registry.register(
+        ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
+    )
     registry.register(CodeRunTool())
 
     agent = BaseAgent(
@@ -182,7 +184,9 @@ def build_proof_agent(
             **(graph_explore_kwargs or {}),
         )
     )
-    acquisition.register(ReadTool(page_store=page_store, inventory=inventory_store))
+    acquisition.register(
+        ReadTool(page_store=page_store, inventory=inventory_store, graph_channel=graph_channel)
+    )
     acquisition.register(CodeRunTool())
 
     return ProofAgent(
@@ -220,11 +224,10 @@ def build_graph_agent(
     Markdown so the LLM can quote and cite verbatim — this mirrors
     upstream LinearRAG's "PPR retrieve → reader" split.
 
-    ``max_loops=16`` / ``max_token_budget=64_000``: the historical
-    tight defaults (8 / 20 000) had 38 % of wrong runs hitting a hard
-    cap in 300 q × deepseek; bumping to 16 / 64 000 dropped that to
-    3 % and lifted lenient-judge accuracy by ~4 pp. Override per call
-    site when running against a model whose context is smaller
+    ``max_loops=16`` / ``max_token_budget=64_000``: sized so navigation
+    rarely terminates against the loop or token cap rather than on a
+    real stop condition. Override per call site when running against a
+    model whose context is smaller
     (e.g. a vLLM-served Qwen3-8B at 40 960 context − 16 384 reserved
     for output = 24 576 effective input — there ``max_token_budget``
     should be lowered to ~20 000 with ~4 k headroom AND
@@ -249,7 +252,9 @@ def build_graph_agent(
             **(graph_explore_kwargs or {}),
         )
     )
-    registry.register(ReadTool(page_store=page_store, inventory=inventory))
+    registry.register(
+        ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
+    )
 
     return BaseAgent(
         llm_client=llm_client,
@@ -290,6 +295,9 @@ def build_regex_agent(
 
     registry = ToolRegistry()
     registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
+    # No graph channel on the regex path — pillar-2 baseline contract
+    # is "regex + read only"; surfacing graph-derived entities/neighbour
+    # pages would confound the comparison.
     registry.register(ReadTool(page_store=page_store, inventory=inventory))
 
     return BaseAgent(

@@ -1,18 +1,16 @@
 """GLiNER-backed NER with open-set labels.
 
-Replaces the prior spaCy en/zh ``_trf`` + HanLP MTL stack. GLiNER multi-v2.1
-takes a runtime list of natural-language label descriptions
-(``["product", "term", "law", ...]``) and returns spans in one model
-forward, so changing domains is a prompt-list change — never a domain
-dictionary. The closed OntoNotes / MSRA tagsets the previous models used
-have no PRODUCT / TERM / CONCEPT classes, which on insurance / legal /
-medical text caused the ~50% recall floor we measured pre-change.
+GLiNER multi-v2.1 takes a runtime list of natural-language label
+descriptions (``["product", "term", "law", ...]``) and returns spans in
+one model forward, so changing domains is a prompt-list change — never a
+domain dictionary. Closed tagsets like OntoNotes / MSRA have no
+PRODUCT / TERM / CONCEPT classes, which floors recall on insurance /
+legal / medical text.
 
-Two structural responsibilities preserved from the old SpacyNER:
+Two structural responsibilities:
 
-1. **Catalog mention split** — spaCy occasionally captured a Chinese
-   product list (``A、B、C``) as a single span. The same can happen with
-   GLiNER on the same input shape, so :func:`split_catalog_mentions`
+1. **Catalog mention split** — a Chinese product list (``A、B、C``) can
+   be captured as a single span, so :func:`split_catalog_mentions`
    stays as a NER-side post-processor (mention boundary repair, not
    domain knowledge).
 2. **Sentence-level NER** — the algorithm needs both
@@ -37,8 +35,8 @@ from ingestion.index.linear_rag.stopword_filter import StopwordFilter
 _IMG_RE = regex.compile(r"<img\b[^>]*?/?>", regex.IGNORECASE)
 # Drop opening / closing ``<script>`` ``<style>`` tags AND their bodies.
 # We never want the inner text of a stylesheet entering the entity
-# universe (``word-wrap`` / ``break-word`` etc surfaced as entities in
-# the previous run).
+# universe (``word-wrap`` / ``break-word`` etc. would otherwise surface
+# as entities).
 _SCRIPT_STYLE_RE = regex.compile(
     r"<(script|style)\b[^>]*?>.*?</\1>",
     regex.IGNORECASE | regex.DOTALL,
@@ -97,8 +95,8 @@ def preclean_for_ner(text: str) -> str:
 
     Applied to passage text on the way into the NER model — not to the
     ``passage_store`` which keeps the original markdown so evidence-side
-    rendering stays faithful. Targeting four structural OCR shapes the
-    benchmark surfaced as noise sources:
+    rendering stays faithful. Targeting four structural OCR shapes that
+    are noise sources:
 
     1. ``<img />`` and ``<script>`` / ``<style>`` blocks (drop entirely).
     2. ``<table>``: ``<tr>`` becomes a newline, ``<td>``/``<th>`` becomes
@@ -189,10 +187,9 @@ def _is_chinese_sentence_shape(text: str) -> bool:
     助词 u / 副词 d / 连词 c) that ties the verb to its arguments.
     Pure noun phrases rarely carry both signals together.
 
-    Empirical fit on a 13-fragment / 50-entity benchmark: precision
-    0.69, recall 0.85; the 4-5 misses are jieba dictionary noise
-    ('身故'/'载有' mistagged as n/b instead of v) which a different
-    segmenter (pkuseg) did not improve on this corpus.
+    Remaining misses are mostly jieba dictionary noise ('身故'/'载有'
+    mistagged as n/b instead of v), which an alternative segmenter such
+    as pkuseg does not fix.
     """
     tags = [f for _, f in _pos_tag(text)]
     has_verb = any(t.startswith("v") for t in tags)
@@ -248,8 +245,8 @@ _CATALOG_LIST_SEP_RE = regex.compile(r"[、；;•｜|，]+")
 def split_catalog_mentions(text: str) -> List[str]:
     """Fan out a catalog/list span into one surface per mention.
 
-    GLiNER (like spaCy before it) occasionally captures a Chinese product
-    list (``A、B、C`` or ``A；B；C``) as a single entity span. Split on the
+    GLiNER occasionally captures a Chinese product list (``A、B、C`` or
+    ``A；B；C``) as a single entity span. Split on the
     safe set of pure-punctuation list separators so each sub-mention
     enters the canonicaliser independently. Surfaces with no separator
     come back as a single-element list, so callers can iterate uniformly.
@@ -267,8 +264,7 @@ def split_catalog_mentions(text: str) -> List[str]:
     return out or [stripped]
 
 
-# Default open-set label list. Mirrors what the empirical study against
-# 4 real insurance documents showed to give the best mix of recall and
+# Default open-set label list. Chosen to give a good mix of recall and
 # precision: domain-specific surfaces (product names, codes, regulatory
 # terms) AND noise-control labels (currency, person role) so we don't
 # accidentally absorb pronouns / measurements / dates into the entity
@@ -287,12 +283,11 @@ DEFAULT_LABELS: Tuple[str, ...] = (
 
 
 class GLiNERAdapter:
-    """GLiNER-backed NER façade compatible with the prior SpacyNER call shape.
+    """GLiNER-backed NER façade.
 
-    Same public surface as the old SpacyNER (``batch_ner``,
-    ``question_ner``, ``extract_entities_sentences``) so all existing
-    callsites in ``LinearRAG`` and ``GraphPPRChannel`` swap in without
-    touching their orchestration logic.
+    Exposes ``batch_ner`` / ``question_ner`` /
+    ``extract_entities_sentences`` so ``LinearRAG`` and
+    ``GraphPPRChannel`` consume NER through one stable interface.
 
     Per-passage flow:
 
@@ -364,20 +359,26 @@ class GLiNERAdapter:
     def batch_ner(
         self,
         hash_id_to_passage: Dict[str, str],
-        max_workers: int,  # kept for SpacyNER-compatible signature; unused
-    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Run NER over a passage dict; return two maps GLM consumers want.
+        max_workers: int,  # unused; GLiNER batches on a single device
+    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], Dict[str, List[str]]]:
+        """Run NER over a passage dict; return three maps GLM consumers want.
 
-        Returns ``(passage_hash_id_to_entities, sentence_to_entities)``.
-        Entity surfaces are deduplicated per passage and per sentence
-        (preserving first-occurrence order).
+        Returns ``(passage_hash_id_to_entities, sentence_to_entities,
+        passage_hash_id_to_sentences)``. Entity surfaces are deduplicated
+        per passage and per sentence (preserving first-occurrence order).
+        The third map ``passage_hash_id_to_sentences`` records the
+        ordered sentence-text list that ``split_sentences`` produced for
+        each passage; persisted alongside the entity maps in
+        ``ner_results.json`` so query-time consumers (e.g. the
+        question-conditioned PPR preview snippet) can look up "which
+        sentences live on this page" without re-splitting passages at
+        query time.
 
         Sentence segmentation runs first across all passages so we can
         feed one large batched forward to the model rather than one call
-        per passage. ``max_workers`` is ignored — the bottleneck used to
-        be NumPy/CPU spaCy forward; on GPU FP16 GLiNER, single-process
-        batched inference is faster than thread-fanned single-passage
-        calls (no GIL release benefit on a CUDA forward).
+        per passage. ``max_workers`` is ignored: on GPU FP16 GLiNER,
+        single-process batched inference is faster than thread-fanned
+        single-passage calls (no GIL release benefit on a CUDA forward).
         """
         # Build a flat list of (passage_hash, sentence_text) pairs so we
         # can run one big batched forward and re-associate at the end.
@@ -396,7 +397,11 @@ class GLiNERAdapter:
                 sentence_index.append((hash_id, s))
 
         if not sentence_index:
-            return {h: [] for h in hash_id_to_passage}, {}
+            return (
+                {h: [] for h in hash_id_to_passage},
+                {},
+                passage_hash_id_to_sentences,
+            )
 
         all_sentences = [s for _, s in sentence_index]
         # GLiNER ``inference`` returns a list-of-lists of
@@ -480,7 +485,11 @@ class GLiNERAdapter:
                         passage_to_seen[hash_id].add(piece)
                         passage_to_entities[hash_id].append(piece)
 
-        return passage_to_entities, dict(sentence_to_entities)
+        return (
+            passage_to_entities,
+            dict(sentence_to_entities),
+            passage_hash_id_to_sentences,
+        )
 
     # ----------------------------------------------- query-side NER ----
 
@@ -488,8 +497,8 @@ class GLiNERAdapter:
         """Return a set of lowercased entity surfaces from the question.
 
         Used by ``GraphPPRChannel._seed_entities`` to find PPR seeds.
-        Same return contract as the prior SpacyNER (set of lowercase
-        strings) so the caller is unchanged.
+        Returns lowercase strings, matching what the seeding caller
+        expects.
         """
         if not question or not question.strip():
             return set()
@@ -534,10 +543,15 @@ class GLiNERAdapter:
     def extract_entities_sentences(
         self, text: str, passage_hash_id: str
     ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
-        """Single-passage convenience that mirrors the SpacyNER signature.
+        """Single-passage convenience over ``batch_ner``.
 
         Returns ``({passage_hash_id: [entities]}, {sent_text: [entities]})``.
-        Internally just routes through :meth:`batch_ner`.
+        Internally just routes through :meth:`batch_ner`. The third
+        ``passage_hash_id_to_sentences`` return value is discarded by
+        this thin shim — the single-passage callers are debug paths
+        that don't drive the preview index.
         """
-        passage_map, sentence_map = self.batch_ner({passage_hash_id: text}, 1)
+        passage_map, sentence_map, _passage_to_sentences = self.batch_ner(
+            {passage_hash_id: text}, 1
+        )
         return passage_map, sentence_map

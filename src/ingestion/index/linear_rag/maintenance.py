@@ -245,9 +245,18 @@ def remove_file(
         sentence_to_entities: Dict[str, List[str]] = ner.get(
             "sentence_to_entities", {}
         )
+        # v6: passage→ordered sentence-text list (drives PPR Q-cond
+        # preview). Drop the entries for removed passages alongside
+        # the entity map; otherwise the on-disk map keeps stale page
+        # references that the channel would happily look up after a
+        # reload, returning phantom sentences for deleted pages.
+        passage_to_sentences: Dict[str, List[str]] = ner.get(
+            "passage_hash_id_to_sentences", {}
+        )
 
         for h in dropped_passage_hashes:
             passage_to_entities.pop(h, None)
+            passage_to_sentences.pop(h, None)
 
         # Recompute the surviving sentence universe from the surviving
         # passage texts (rather than substring-matching, which would
@@ -276,6 +285,7 @@ def remove_file(
                 dropped_sentences.append(sent)
         ner["passage_hash_id_to_entities"] = passage_to_entities
         ner["sentence_to_entities"] = kept_sentences
+        ner["passage_hash_id_to_sentences"] = passage_to_sentences
         ner_path.write_text(json.dumps(ner, ensure_ascii=False), encoding="utf-8")
         counts["ner_passages_dropped"] = len(dropped_passage_hashes)
         counts["ner_sentences_dropped"] = len(dropped_sentences)

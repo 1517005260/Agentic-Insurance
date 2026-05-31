@@ -36,7 +36,6 @@ from config.shared import shared_tiktoken_encoder
 
 from agentic.tools.acquisition._common import (
     err,
-    make_snippet,
     ok,
     parse_scope,
     Scope,
@@ -286,7 +285,7 @@ class SemanticSearchTool(BaseTool):
         skipped = [c for c in wanted if c not in channel_hits and c not in channel_errors]
 
         fused = _rrf_fuse(channel_hits.values(), k=_RRF_K)[:limit]
-        results = self._materialize(fused, channel_hits)
+        results = self._materialize(fused, channel_hits, query=query)
 
         retrieved_tokens = (
             len(self._tokenizer.encode("\n".join(r["snippet"] for r in results)))
@@ -443,12 +442,25 @@ class SemanticSearchTool(BaseTool):
         self,
         fused: List[Tuple[str, float]],
         channel_hits: Dict[str, List[Tuple[str, float]]],
+        *,
+        query: str = "",
     ) -> List[Dict[str, Any]]:
+        from agentic.tools.acquisition._preview import query_snippet
+
         # Per-channel score lookup so each result row carries both the RRF
         # score and the raw cos sim from each channel that contributed.
         per_channel_lookup: Dict[str, Dict[str, float]] = {
             name: dict(hits) for name, hits in channel_hits.items()
         }
+        # Encode the query once and reuse across every materialised row.
+        q_emb = None
+        if query:
+            try:
+                q_emb = self.embedding_client.encode(query, is_query=True)
+                if q_emb.ndim == 2:
+                    q_emb = q_emb[0]
+            except Exception:
+                q_emb = None
         results: List[Dict[str, Any]] = []
         for global_id, rrf_score in fused:
             file_id, _, page_id = global_id.partition("/")
@@ -460,7 +472,12 @@ class SemanticSearchTool(BaseTool):
                 page = self.page_store.get(global_id)
                 if page is not None:
                     page_number = page.page_number
-                    snippet = make_snippet(page.text_markdown or "")
+                    snippet = query_snippet(
+                        page.text_markdown or "",
+                        query,
+                        self.embedding_client,
+                        cached_query_emb=q_emb,
+                    )
             row: Dict[str, Any] = {
                 "file_id": file_id,
                 "page_id": page_id,

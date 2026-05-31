@@ -123,6 +123,65 @@ class GraphPPRChannel(BaseChannel):
         # without ever invoking an LLM at build time.
         self._pair_via_sentences: Optional[Dict[frozenset, List[str]]] = None
 
+        # ``passage_hash → [(sentence_text, sentence_embedding), ...]``
+        # for the question-conditioned preview snippet that PPR returns
+        # on each candidate page. Built once from the ingest-persisted
+        # ``passage_hash_id_to_sentences`` map in ``ner_results.json``;
+        # each sentence_text is resolved to its hash via the same hash
+        # function the sentence_store used at ingest, then its
+        # embedding is pulled from the store. None until first access;
+        # cleared by :meth:`reload`.
+        self._passage_sentence_embs: Optional[
+            Dict[str, List[Tuple[str, np.ndarray]]]
+        ] = None
+
+        # ``cluster_id → number of passages that have at least one
+        # entity_passage edge to any cluster member``. Built once from
+        # ``_passage_entities`` + ``member_to_cluster``; powers the
+        # ``pages_in_cluster`` hub-vs-specific signal that the PPR
+        # observation attaches to each candidate page's
+        # ``clusters_touched`` entries. Cleared by :meth:`reload`.
+        self._cluster_passage_count: Optional[Dict[str, int]] = None
+
+        # ``entity_hash → [(passage_hash, edge_weight), ...]`` — inverse
+        # of ``_passage_entities``. Built once via one pass over the
+        # entity_passage edge list; powers ``ReadTool.neighbour_pages``
+        # ("which other pages share this page's anchor entities") in
+        # O(1) per-entity lookup. Cleared by :meth:`reload`.
+        self._entity_to_passages_cache: Optional[
+            Dict[str, List[Tuple[str, float]]]
+        ] = None
+
+        # ``(file_id, page_number) → passage_hash`` and its inverse,
+        # both derived from ``passage_store`` meta columns. Built once
+        # per channel; the meta is stable for the lifetime of the
+        # store (any reload swaps the underlying store and resets
+        # these caches in :meth:`reload`). Lookups are O(1) for every
+        # tool that needs the mapping (read annotations, PPR preview
+        # passage_hash resolution, chain page-seeding).
+        self._page_meta_to_hash: Optional[
+            Dict[Tuple[str, Optional[int]], str]
+        ] = None
+        self._page_hash_to_meta: Optional[
+            Dict[str, Tuple[str, Optional[int]]]
+        ] = None
+
+        # ``file_id → total page count in the corpus``. Lets the agent
+        # tell "PPR surfaced 2 of 11 pages this doc has" vs "PPR
+        # surfaced 2 of 2 — already complete." Cleared by reload().
+        self._doc_page_count: Optional[Dict[str, int]] = None
+
+        # ``entity_hash → [(other_entity_hash, co_occurrence_count), ...]
+        # sorted by count desc``. Derived from
+        # :meth:`pair_via_sentences`. Powers the per-entity bridge
+        # hint on ``read.entities``: which other entities share at
+        # least one sentence with this one — the implicit multi-hop
+        # relation predicate in our no-relation-edge tri-graph design.
+        # Cleared by reload().
+        self._entity_co_occur_top: Optional[
+            Dict[str, List[Tuple[str, int]]]
+        ] = None
+
         # Lazy gazetteer Aho-Corasick automaton over entity surfaces, used
         # as a query-side seed fallback when NER misses domain product
         # names (e.g. "Heritage Protector Option"). Mirrors the
@@ -252,6 +311,13 @@ class GraphPPRChannel(BaseChannel):
             self._entity_to_sents = None
             self._sent_to_entities = None
             self._pair_via_sentences = None
+            self._passage_sentence_embs = None
+            self._cluster_passage_count = None
+            self._entity_to_passages_cache = None
+            self._page_meta_to_hash = None
+            self._page_hash_to_meta = None
+            self._doc_page_count = None
+            self._entity_co_occur_top = None
             self._gazetteer_automaton = None
             self._quotient_graph = None
             self._quotient_member_to_super = {}
@@ -381,7 +447,7 @@ class GraphPPRChannel(BaseChannel):
 
         1. **Gazetteer literal scan.** Aho-Corasick word-boundary match
            of the question text against every known entity surface.
-           Catches "Heritage Protector Option" or "FATCA" that spaCy's
+           Catches "Heritage Protector Option" or "FATCA" that
            contextual NER fails to tag in question form.
         2. **Whole-question embedding ➜ entity-store top-K.** Mirrors
            HippoRAG-2's Query-to-Node fallback (+12.5 Recall@5 vs NER
@@ -438,13 +504,11 @@ class GraphPPRChannel(BaseChannel):
                     best[hid] = (self._name_to_vidx[hid], float(score))
 
         # Fallback path — fires when caller asked AND the NER signal
-        # is weak. "Weak" was historically ``not best`` (zero seeds),
-        # but the agent's failure analysis (Q-B-7 "2nd Cavalry
-        # Division", partial-NER cases) shows that **one or two
-        # low-confidence seeds also benefit from the gazetteer +
-        # question-embedding rescue**. The new gate ``< 2 seeds OR
-        # max(sim) < 0.7`` catches those without over-triggering on
-        # questions with strong full-NER coverage.
+        # is weak. Treating only zero seeds as "weak" misses the
+        # partial-NER case: one or two low-confidence seeds also benefit
+        # from the gazetteer + question-embedding rescue. The gate
+        # ``< 2 seeds OR max(sim) < 0.7`` catches those without
+        # over-triggering on questions with strong full-NER coverage.
         if enable_fallback and len(self.entity_store) > 0:
             max_sim = max((s for _, s in best.values()), default=0.0)
             if len(best) < 2 or max_sim < 0.7:
@@ -456,8 +520,8 @@ class GraphPPRChannel(BaseChannel):
         seeds = [(hid, vidx, sim) for hid, (vidx, sim) in best.items()]
 
         # Option A: spread reset mass to alias-cluster members. The
-        # logical entity (alias-connected component) is what the
-        # paper §3.1.3 calls a "cluster". Seeding only the matched
+        # logical entity is the alias-connected component, termed a
+        # "cluster". Seeding only the matched
         # physical surface gives PPR a sparse start; spreading to
         # all cluster members better approximates "I want to walk
         # from THIS LOGICAL ENTITY" without changing the underlying
@@ -606,6 +670,143 @@ class GraphPPRChannel(BaseChannel):
             }
             for cid, w in ranked
         ]
+
+    def page_meta_to_hash(self) -> Dict[Tuple[str, Optional[int]], str]:
+        """``(file_id, page_number) → passage_hash``, lazily built once.
+
+        ReadTool annotations + PPR preview resolution both need this
+        reverse map; building it per call (15 k iterations × N pages)
+        was a per-read hot loop. Cached on the channel since
+        passage_store meta is immutable until ``reload()``.
+        """
+        if self._page_meta_to_hash is None:
+            with self._call_lock:
+                if self._page_meta_to_hash is None:
+                    col_fid = self.passage_store.meta_column("file_id")
+                    col_pn = self.passage_store.meta_column("page_number")
+                    m: Dict[Tuple[str, Optional[int]], str] = {}
+                    for h, fid, pn in zip(self.passage_store.hash_ids, col_fid, col_pn):
+                        key_pn = int(pn) if pn is not None else None
+                        m.setdefault((str(fid), key_pn), h)
+                    self._page_meta_to_hash = m
+        return self._page_meta_to_hash
+
+    def page_hash_to_meta(self) -> Dict[str, Tuple[str, Optional[int]]]:
+        """Inverse of :meth:`page_meta_to_hash`. Same lazy contract."""
+        if self._page_hash_to_meta is None:
+            with self._call_lock:
+                if self._page_hash_to_meta is None:
+                    col_fid = self.passage_store.meta_column("file_id")
+                    col_pn = self.passage_store.meta_column("page_number")
+                    self._page_hash_to_meta = {
+                        h: (str(fid), int(pn) if pn is not None else None)
+                        for h, fid, pn in zip(
+                            self.passage_store.hash_ids, col_fid, col_pn
+                        )
+                    }
+        return self._page_hash_to_meta
+
+    def entity_to_passages(self) -> Dict[str, List[Tuple[str, float]]]:
+        """``entity_hash → [(passage_hash, edge_weight), ...]`` — inverse
+        of ``_passage_entities``. One pass over the entity_passage edge
+        list; cached on the channel since edges are immutable until
+        ``reload()``. Powers ``ReadTool.neighbour_pages``.
+        """
+        if self._entity_to_passages_cache is None:
+            with self._call_lock:
+                if self._entity_to_passages_cache is None:
+                    self._build_entity_passage_indexes()
+                    inv: Dict[str, List[Tuple[str, float]]] = {}
+                    for ph_other, ent_list in (self._passage_entities or {}).items():
+                        for ent_h, w_e in ent_list:
+                            inv.setdefault(ent_h, []).append(
+                                (ph_other, float(w_e))
+                            )
+                    self._entity_to_passages_cache = inv
+        return self._entity_to_passages_cache
+
+    def doc_page_count(self, file_id: str) -> int:
+        """Total pages in ``file_id`` across the corpus. Lets PPR
+        ``docs_summary`` rows convey "this doc has N pages and you
+        only saw K of them" — the partial-coverage signal that the
+        agent needs to decide whether to read sibling pages.
+        """
+        if self._doc_page_count is None:
+            with self._call_lock:
+                if self._doc_page_count is None:
+                    counts: Dict[str, int] = defaultdict(int)
+                    col_fid = self.passage_store.meta_column("file_id")
+                    for fid in col_fid:
+                        counts[str(fid)] += 1
+                    self._doc_page_count = dict(counts)
+        return self._doc_page_count.get(file_id, 0)
+
+    def entity_top_co_occurring(
+        self, entity_hash: str, top_n: int = 2
+    ) -> List[Tuple[str, int]]:
+        """Top entities that share at least one sentence with this one,
+        ranked by sentence-co-occurrence count.
+
+        In our tri-graph (entity ↔ passage ↔ sentence) there are NO
+        relation edges between entities — the predicate is the
+        natural-language sentence in which two entities co-occur.
+        This method projects ``pair_via_sentences`` into a per-entity
+        view: the agent reading a page can immediately see which
+        other entities the page's anchors are "documented near", and
+        decide whether to ``chain`` from them or jump to their pages
+        via entity_analysis. The multi-hop bridge surface, without
+        the agent having to call chain mode just to discover the
+        partner list exists.
+        """
+        if self._entity_co_occur_top is None:
+            with self._call_lock:
+                if self._entity_co_occur_top is None:
+                    pair_idx = self.pair_via_sentences()
+                    co_occur: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+                    for pair, sents in pair_idx.items():
+                        pair_list = list(pair)
+                        if len(pair_list) < 2:
+                            continue
+                        a, b = pair_list[0], pair_list[1]
+                        n = len(sents)
+                        co_occur[a].append((b, n))
+                        co_occur[b].append((a, n))
+                    for k in co_occur:
+                        co_occur[k].sort(key=lambda t: t[1], reverse=True)
+                    self._entity_co_occur_top = dict(co_occur)
+        return self._entity_co_occur_top.get(entity_hash, [])[:top_n]
+
+    def cluster_passage_count(self, cluster_id: str) -> int:
+        """Number of passages that have at least one entity_passage edge to
+        any member of ``cluster_id``. Cheap O(1) lookup after a one-time
+        O(E_entity_passage) build in :meth:`_build_cluster_passage_count`.
+
+        Used by the PPR observation to annotate each ``clusters_touched``
+        entry with corpus breadth — small (≤5) means a tight specific
+        entity worth following; large (≥100) means a hub cluster (e.g.
+        a generic organization name that mentions every page) the agent
+        should down-trust.
+        """
+        if self._cluster_passage_count is None:
+            with self._call_lock:
+                if self._cluster_passage_count is None:
+                    self._build_cluster_passage_count()
+        return self._cluster_passage_count.get(cluster_id, 0)
+
+    def _build_cluster_passage_count(self) -> None:
+        self._build_entity_passage_indexes()
+        _, m2c = self._load_clusters_cached()
+        cluster_pages: Dict[str, set] = defaultdict(set)
+        pe = self._passage_entities or {}
+        for pass_hash, ent_list in pe.items():
+            seen_clusters: set = set()
+            for ent_hash, _w in ent_list:
+                cid = m2c.get(ent_hash, ent_hash)
+                if cid in seen_clusters:
+                    continue
+                seen_clusters.add(cid)
+                cluster_pages[cid].add(pass_hash)
+        self._cluster_passage_count = {c: len(s) for c, s in cluster_pages.items()}
 
     def cluster_top_passages(
         self, cluster_id: str, top_n: int = 10
@@ -1131,6 +1332,82 @@ class GraphPPRChannel(BaseChannel):
         self._pair_via_sentences = pair_idx
         return pair_idx
 
+    def passage_sentence_embs(
+        self, passage_hash: str
+    ) -> List[Tuple[str, np.ndarray]]:
+        """Return ``[(sentence_text, sentence_embedding), ...]`` for a
+        page, in the original sentence order on the page.
+
+        Powers the question-conditioned preview snippet that
+        graph_explore's PPR observation surfaces on each candidate
+        page: agent picks the single highest-cos(q_emb, sent_emb)
+        sentence to discriminate "this page answers my question" from
+        "this page mentions the topic but isn't the answer".
+
+        The underlying ``passage_hash → [sentence_text]`` map is
+        recorded at ingest time inside ``ner_results.json``
+        (``passage_hash_id_to_sentences``); we only translate each
+        text to its embedding here via the sentence_store's hash
+        function. Built once on first access (resolves ~225 k
+        sentence texts to hashes in one pass over the persisted map),
+        then served from memory.
+
+        Returns an empty list when the page has no recorded
+        sentences (empty passage) or when the sentence text was
+        post-filtered out of the sentence_store (rare; would mean
+        ingest and serve schemas diverged).
+        """
+        if self._passage_sentence_embs is None:
+            with self._call_lock:
+                if self._passage_sentence_embs is None:
+                    self._build_passage_sentence_embs()
+        return self._passage_sentence_embs.get(passage_hash, [])
+
+    def _build_passage_sentence_embs(self) -> None:
+        """Load passage→sentence-text map from ``ner_results.json`` and
+        resolve each sentence text to its (text, embedding) pair via the
+        sentence_store. The map is a build-time artifact; this method
+        does not run sentence splitting or NER — pure dict translation.
+
+        Pre-materialises the full sentence embedding matrix ONCE via
+        ``sentence_store.embeddings`` (a faiss
+        ``reconstruct_n(0, ntotal)`` call) and indexes into it row-wise.
+        Naively calling ``ss.embeddings[idx]`` inside the loop would
+        reconstruct the full matrix on every access (the property has
+        no internal cache), turning a ~225 k-sentence build from
+        seconds into hours.
+        """
+        if not self._ner_path.is_file():
+            self._passage_sentence_embs = {}
+            return
+        cache = json.loads(self._ner_path.read_text(encoding="utf-8"))
+        passage_to_sent_text: Dict[str, List[str]] = (
+            cache.get("passage_hash_id_to_sentences") or {}
+        )
+        ss = self.sentence_store
+        # The sentence_store's hash function namespaces texts under
+        # ``"sentence"`` (same hash that ingest used to dedup adds).
+        hash_for = ss.hash_for
+        hash_id_to_text = ss.hash_id_to_text
+        idx_map = ss._hash_id_to_idx
+        all_embs = ss.embeddings  # one faiss reconstruct_n, cached locally below
+        out: Dict[str, List[Tuple[str, np.ndarray]]] = {}
+        for passage_hash, sent_texts in passage_to_sent_text.items():
+            pairs: List[Tuple[str, np.ndarray]] = []
+            for s_text in sent_texts:
+                sid = hash_for(s_text)
+                idx = idx_map.get(sid)
+                if idx is None:
+                    continue
+                # Use the canonical text stored under this hash so the
+                # snippet we surface matches what the index encoded
+                # (post-strip / post-normalise differences would
+                # otherwise leak through).
+                canonical = hash_id_to_text.get(sid, s_text)
+                pairs.append((canonical, all_embs[idx]))
+            out[passage_hash] = pairs
+        self._passage_sentence_embs = out
+
     # ----------------------------------------------------------- passage scoring
 
     def _calculate_passage_scores(
@@ -1531,14 +1808,15 @@ class GraphPPRChannel(BaseChannel):
         a blank canvas.
         """
         # Same lock as :meth:`retrieve` — prevents the gazetteer /
-        # spaCy state from interleaving with a concurrent agent call
+        # NER state from interleaving with a concurrent agent call
         # on the shared channel singleton AND keeps a concurrent
         # ``reload()`` from swapping the entity_store / graph out
-        # mid-payload-assembly. Earlier versions released the lock
-        # after ``_materialize_hits`` and then read
-        # ``self.entity_store.hash_id_to_text`` outside; under refresh
-        # that yielded vertex indices from the old graph paired with
-        # surface text from the new entity store.
+        # mid-payload-assembly. The lock must stay held through
+        # ``_materialize_hits`` and the subsequent
+        # ``self.entity_store.hash_id_to_text`` read: releasing it
+        # between them lets a concurrent refresh pair vertex indices
+        # from the old graph with surface text from the new entity
+        # store.
         with self._call_lock:
             if self.graph is None or len(self.passage_store) == 0:
                 return {"mode": "no_graph", "seeds": [], "actived_entities": {}, "passages": [], "cluster_scores": {}}
