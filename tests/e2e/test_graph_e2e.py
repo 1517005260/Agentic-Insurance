@@ -326,7 +326,7 @@ async def test_analyst_can_read_graph(app_harness):
 
 
 # =====================================================================
-# Auth required across the surface (codex round-1 LOW-5)
+# Auth required across the surface
 # =====================================================================
 
 
@@ -347,7 +347,7 @@ async def test_all_endpoints_require_auth(app_harness):
 
 
 # =====================================================================
-# /expand file_ids filter (codex round-1 LOW-5)
+# /expand file_ids filter
 # =====================================================================
 
 
@@ -376,7 +376,7 @@ async def test_expand_file_ids_filter(app_harness):
 
 
 # =====================================================================
-# /nodes/{id} for a passage vertex (codex round-1 LOW-5)
+# /nodes/{id} for a passage vertex
 # =====================================================================
 
 
@@ -408,7 +408,7 @@ async def test_node_detail_for_passage(app_harness):
 
 
 # =====================================================================
-# Schema-bound length cap (codex round-1 LOW-3)
+# Schema-bound length cap
 # =====================================================================
 
 
@@ -423,7 +423,7 @@ async def test_expand_rejects_oversized_node_id(app_harness):
 
 
 # =====================================================================
-# /ppr-subgraph induced edges over kept ids (codex round-1 LOW-5)
+# /ppr-subgraph induced edges over kept ids
 # =====================================================================
 
 

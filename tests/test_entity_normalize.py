@@ -81,14 +81,14 @@ class TestSplitCatalogMentions:
         pieces = split_catalog_mentions("ABC, Inc.")
         assert pieces == ["ABC, Inc."]
 
-    # ---- regression: conjunction words MUST NOT split (was a bug) ----
+    # ---- regression: conjunction words MUST NOT split ----
 
     def test_conjunction_huo_does_NOT_split_anymore(self):
-        # ``或`` was previously in the split set; debate with codex
-        # established this is too aggressive — conjunctions are real
-        # words that can appear inside legitimate organisation names.
-        # The composite surface stays whole and is later excluded from
-        # alias edges via ``is_composite_surface`` instead.
+        # ``或`` is intentionally excluded from the split set:
+        # conjunctions are real words that can appear inside legitimate
+        # organisation names. The composite surface stays whole and is
+        # later excluded from alias edges via ``is_composite_surface``
+        # instead.
         pieces = split_catalog_mentions("万通多元终身年金(mfa)或万通多元教育储蓄计划")
         assert pieces == ["万通多元终身年金(mfa)或万通多元教育储蓄计划"]
 
@@ -230,9 +230,9 @@ class TestComputeClustersCanonical:
         # Use the post-cleanup form of the sentence fragment (``保单``,
         # not ``保单。``) — that's what's actually in the live graph
         # after the ingest pipeline runs cleanup() on each surface.
-        # If we tested the un-cleanup'd form we'd hide the regression
-        # codex caught: a sentence fragment ending in plain text
-        # mustn't beat a balanced SKU just on length.
+        # If we tested the un-cleanup'd form we'd hide the case where a
+        # sentence fragment ending in plain text could beat a balanced
+        # SKU just on length.
         g = _alias_cluster_with_members([
             "万通危疾加护保(优越版)",
             "万通危疾加护保(",
@@ -242,8 +242,9 @@ class TestComputeClustersCanonical:
         assert clusters[0]["canonical"] == "万通危疾加护保(优越版)"
 
     def test_balanced_sku_beats_post_cleanup_sentence_fragment(self):
-        """Direct regression for codex P1.1: previous _TRAILING_JUNK_RE
-        included ``)`` so a balanced SKU was unfairly penalised."""
+        """A balanced SKU must outrank a post-cleanup sentence fragment:
+        ``_TRAILING_JUNK_RE`` must not include ``)``, which would
+        unfairly penalise a balanced SKU."""
         from ingestion.index.linear_rag.disambig import surface_quality_score
 
         sku = "万通危疾加护保(优越版)"
@@ -322,10 +323,10 @@ class TestIsCompositeSurface:
 
 
 class TestClusterCacheVersioning:
-    """When the canonical-picker algorithm changes (v1 → v2 in this PR),
-    legacy cache files MUST be silently invalidated so the upgraded
-    binary doesn't keep serving stale longest-surface canonicals.
-    Codex P1.3 regression."""
+    """When the canonical-picker algorithm changes, cache files written
+    under an older ``CLUSTERS_CACHE_VERSION`` MUST be silently
+    invalidated so the upgraded binary doesn't keep serving stale
+    longest-surface canonicals."""
 
     def test_v1_cache_is_invalidated_and_recomputed(self, tmp_path):
         import json

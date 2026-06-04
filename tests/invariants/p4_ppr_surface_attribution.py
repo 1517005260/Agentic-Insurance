@@ -75,7 +75,7 @@ def _build_with_handler(handler: str, tmp_path: Path) -> Tuple[ig.Graph, Dict[st
             accepted_pairs.append((a, b, cos))
     graph.delete_edges(alias_e_ids)
     for a, b, cos in accepted_pairs:
-        cand = AliasCandidate(b, cos, rerank_yes_prob=0.85)
+        cand = AliasCandidate(b, cos)
         feats = [{
             "cos_sim": cos, "reranker_score": 0.85,
             "admission_rule_version": "P4-test", "accepted_by": "test",

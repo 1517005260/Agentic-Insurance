@@ -58,7 +58,7 @@ class TestBuildRiskSubgraph:
 
     def test_ppr_drops_noise_entities_with_no_passage_edge(self):
         """Actived entities lacking real PPR adjacency to any in-scope
-        passage must NOT appear as risk_factors (codex P1-3)."""
+        passage must NOT appear as risk_factors."""
         ppr = {
             "mode": "ppr",
             "seeds": [],
@@ -79,7 +79,7 @@ class TestBuildRiskSubgraph:
         assert ids == {"rf_e-x"}
 
     def test_triggered_clauses_carry_no_sup(self):
-        """Codex P1-2: ``sup`` belongs to agent's read-order namespace
+        """``sup`` belongs to the agent's read-order namespace
         (citations[].sup); reusing it for PPR rank would cross-link
         Sankey clicks to wrong passages."""
         ppr = {

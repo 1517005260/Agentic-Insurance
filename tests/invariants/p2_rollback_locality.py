@@ -102,7 +102,7 @@ def _run_handler(handler: str, tmp_path: Path) -> Dict[str, object]:
 
     # Inject all K false alias edges via the requested handler.
     for a, b, cos in injected_pairs:
-        cand = AliasCandidate(b, cos, rerank_yes_prob=0.78)
+        cand = AliasCandidate(b, cos)
         features = [
             {"cos_sim": cos, "reranker_score": 0.78,
              "admission_rule_version": "P2-injection", "accepted_by": "test"}

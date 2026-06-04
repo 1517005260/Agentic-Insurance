@@ -81,7 +81,7 @@ def _random_alias_op(
                 add_alias_edges(
                     graph,
                     graph.vs[a]["name"],
-                    [AliasCandidate(graph.vs[b]["name"], 0.92, 0.85)],
+                    [AliasCandidate(graph.vs[b]["name"], 0.92)],
                 )
                 return "add"
         return "add_skipped_no_pair"

@@ -84,7 +84,7 @@ def test_p5_contamination_radius(tmp_path):
     add_alias_edges(
         graph,
         false_alias[0],
-        [AliasCandidate(false_alias[1], 0.86, rerank_yes_prob=0.71)],
+        [AliasCandidate(false_alias[1], 0.86)],
     )
     contaminated_eid = graph.get_eid(false_alias[0], false_alias[1], error=True)
 

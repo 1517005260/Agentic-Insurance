@@ -160,7 +160,7 @@ def _simulate_new_file_ingest(graph: ig.Graph) -> List[str]:
     add_alias_edges(
         graph,
         "entity-new1",
-        [AliasCandidate("entity-a1", 0.94, rerank_yes_prob=0.89)],
+        [AliasCandidate("entity-a1", 0.94)],
     )
     return [h for h, *_ in new_passages]
 
