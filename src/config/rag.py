@@ -73,6 +73,21 @@ class RAGConfig:
     ppr_seed_cluster_spread: bool = True
     ppr_on_logical: bool = False
 
+    # ---------- PPR — hub suppression (independent retrieval-time axis) ----------
+    # The build-time ER redesign cleans the alias graph; these two damp the
+    # residual hub effect at query time so a dense/garbage entity can't drain
+    # PPR mass. Both kwarg-injectable. TODO admin panel: expose via config_store.
+    #
+    # * ``ppr_node_specificity`` (HippoRAG, seed side): scale each seed's reset
+    #   mass by s_i = 1/|P_i| (inverse passage frequency) so a phrase appearing
+    #   in many passages contributes little reset mass.
+    # * ``ppr_hub_damping_p`` (SPRIG, transition side): scale each
+    #   entity_passage edge weight by df(entity)^(-p) so PPR mass flows less
+    #   freely through high-degree entities. p=0 disables; 0.5 is the default.
+    #   Applied to BOTH the physical and the logical/quotient PPR.
+    ppr_node_specificity: bool = True
+    ppr_hub_damping_p: float = 0.5
+
     # ---------- concurrency ----------
     # Cap concurrent HTTP / CPU work across the whole query. The 4 channels
     # plus their internal sub-paths run inside this pool.

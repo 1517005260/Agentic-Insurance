@@ -106,14 +106,25 @@ class LinearRAGConfig:
     # are a recomputable derived view over the immutable alias edges.
     cluster_shape_every: int = 1
 
-    # Alias-edge thresholds — see disambig.DEFAULT_MIN_SIM.
-    # The dual-query recall path (bare-surface + centroid) needs
-    # headroom for sequence-/pluralization-/abbreviation-level variants
-    # to make the cut; the gradient cutoff still trims unrelated
-    # long-tail candidates.
+    # Build-stage toggles (default True = current behavior preserved). A
+    # dataset whose entity surfaces are clean (e.g. Wikipedia multi-hop) can
+    # turn alias ER off — the per-new-entity dual-query + reranker veto is both
+    # the build's dominant cost and a source of false bridges there. A corpus
+    # of independent single-page documents (one file_id per passage) can turn
+    # adjacent-passage edges off — they would only link arbitrary corpus
+    # neighbours. Set per-build via LinearRAGConfig from the dataset driver;
+    # the algorithm layer never hard-codes a domain default.
+    alias_edges_enabled: bool = True
+    adjacent_passage_edges_enabled: bool = True
+
+    # Alias-edge RECALL stage (blocking) — dual-query top-k (bare-surface +
+    # mention centroid). Precision is NO LONGER decided here: it moves to the
+    # Stage-C gate below (IDF lexical overlap + co-occurrence veto). The recall
+    # floor is loosened from the old 0.85 so more true variants survive for the
+    # gate to judge; the gradient cutoff still trims the unrelated long tail.
     alias_top_k: int = 20
     alias_gradient: float = 0.3
-    alias_min_sim: float = 0.85
+    alias_min_sim: float = 0.80  # = er_recall_floor
 
     # Mention-context centroid: dedup mention sentences and cap per entity
     # so high-frequency entities don't get pulled toward boilerplate noise.
@@ -143,29 +154,44 @@ class LinearRAGConfig:
     literal_backfill_min_chars: int = 4          # drops "us", "irs"
     literal_backfill_multi_word_only: bool = True  # drops "axa", "company"
 
-    # Reranker veto layer — final gate on alias-edge creation.
-    # The dual-query gradient_topk recall is generous (top-K=20); a
-    # pairwise cross-encoder scores each surviving (anchor, candidate)
-    # pair and rejects below ``reranker_threshold``. The score is true
-    # pairwise (Qwen3-Reranker yes/no logit), so the threshold is a
-    # stable absolute boundary across calls. AUC vs hand-labelled set
-    # is ~0.66 — high enough to use as a low-confidence veto, NOT as
-    # an identity classifier; high scores do not auto-confirm alias on
-    # their own.
-    reranker_enabled: bool = True
-    reranker_threshold: float = 0.7
-    # ER-specific instruction. Spelled out as a hard-negative checklist
-    # because the model defaults to retrieval relevance ("are these
-    # topically related") and we need identity ("are these the same
-    # entity"); the negative-class enumeration is the difference.
-    reranker_instruction: str = (
-        "Score yes only if the two strings refer to the exact same real-world "
-        "entity or accepted alias (synonym, abbreviation, pluralization, "
-        "traditional/simplified Chinese variant). Reply no for any of: "
-        "related-but-distinct concepts; broader/narrower scope; ordered "
-        "options or tiers; negation or quantifier flips; modifier-introduced "
-        "variants; action vs entity phrases; sentence fragments."
-    )
+    # ===== 0-LLM ER precision gate + de-percolation (replaces reranker veto) =====
+    # Recall (ANN embedding) and precision now use DIFFERENT signal classes
+    # (record linkage / Fellegi-Sunter, xCoRe): a single semantic threshold
+    # cannot separate template collisions ("3rd Baron Acton" vs "3rd Baroness
+    # Herbert") from true variants, so the gate below is a distinct-class
+    # precision matcher run as a flush-time batch. All knobs kwarg-injectable.
+    # TODO admin panel: expose er_* via config_store/schema.py once tuned.
+
+    # Mutual/reciprocal-kNN symmetrization: keep a candidate pair only if each
+    # entity is in the other's top-k. Breaks single-linkage hub chaining
+    # (Maier/Hein/von Luxburg). Applied as a bulk symmetrization at flush.
+    er_mutual_knn: bool = True
+
+    # IDF-weighted lexical token-overlap threshold (surface-arm regime). Tokens
+    # are corpus-IDF weighted so frequent template tokens (baron/war/3rd) carry
+    # little weight and rare head tokens (acton/herbert) dominate: a
+    # surface-similar pair sharing only template tokens scores low → rejected.
+    # Weighted Jaccard in [0,1]; tune on the intrinsic alias dev set.
+    er_idf_lex_threshold: float = 0.35
+    # Han surfaces have no whitespace; tokenize them as character n-grams.
+    er_han_token_ngram: int = 2
+
+    # Centroid-arm-only regime (cross-surface synonyms like US / United States):
+    # surfaces differ so the lexical gate is skipped; require a high
+    # mention-centroid cosine instead.
+    er_ctx_synonym_threshold: float = 0.88
+
+    # Relational must-not-link veto (Bhattacharya-Getoor collective ER): two
+    # entities co-occurring in the same passage cannot be aliases. Skipped for
+    # entities in more than ``er_max_df_for_veto`` passages (hubs — an ABSOLUTE
+    # cap, not a percentile, keeps the veto O(N*k); hubs are handled by
+    # mutual-kNN + the outdegree cap + Leiden de-percolation instead).
+    er_cooccur_veto: bool = True
+    er_max_df_for_veto: int = 50
+
+    # Per-entity alias outdegree cap (SPRIG-PRUNE): keep only the top-L accepted
+    # edges by score. Bounds percolation regardless of the clustering step.
+    er_max_alias_degree: int = 8
 
     # Acceptance handler. ``overlay`` is the default reversible path
     # (alias edges only, never collapses); ``collapse_basic`` /
@@ -253,7 +279,7 @@ class LinearRAGConfig:
     # Chinese equivalents) into ``person``/``organization`` because its
     # training distribution treats first-person plurals as paper authors;
     # adding a 'function word' decoy label does not score-compete on these
-    # surfaces (measured empirically on pilot10). This filter consults the
+    # surfaces (measured empirically). This filter consults the
     # stopwords-iso multilingual lexicon and drops any NER surface whose
     # lowercased form is a stopword in any of the configured languages
     # AND whose GLiNER score is below ``gliner_stopword_confidence_floor``

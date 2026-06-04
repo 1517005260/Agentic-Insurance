@@ -412,47 +412,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "insurance / legal surface sits at ~50 chars."
         ),
     ),
-    ConfigEntry(
-        key="linear_rag.reranker_enabled",
-        type="bool",
-        default=_LINEAR_RAG_DEFAULTS.reranker_enabled,
-        group="linear_rag",
-        description=(
-            "Enable the Qwen3-Reranker veto on alias-edge generation. "
-            "When True, every candidate surviving cos-sim + composite gates "
-            "is also scored by the cross-encoder and dropped below "
-            "``reranker_threshold``. Disable to fall back to the pre-veto "
-            "behaviour for debugging or for corpora where the reranker "
-            "checkpoint is unavailable."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.reranker_threshold",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.reranker_threshold,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description=(
-            "Pairwise yes-probability floor for the reranker veto. "
-            "Below this score the alias edge is not created. 0.7 is a "
-            "balanced default; raise toward 0.9 to be stricter (recall "
-            "drops fast)."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.reranker_instruction",
-        type="str",
-        default=_LINEAR_RAG_DEFAULTS.reranker_instruction,
-        group="linear_rag",
-        description=(
-            "ER-specific instruction passed to Qwen3-Reranker. The model "
-            "defaults to retrieval relevance; the instruction is what "
-            "pins the label space to identity. The hard-negative checklist "
-            "(tiers / negation / modifier / sentence fragment) is the "
-            "essential part — without it the model drifts back to relevance."
-        ),
-    ),
     # ---------- linear_rag.acceptance_handler + propagation policy ----------
     ConfigEntry(
         key="linear_rag.acceptance_handler",
@@ -607,7 +566,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         group="linear_rag",
         description="Reranker threshold τ_r for policy=threshold_gate.",
     ),
-    # ---------- graph_explore.* (entity_lookup tool runtime) ----------
+    # ---------- graph_explore.* (chain_entity tool runtime) ----------
     ConfigEntry(
         key="graph_explore.entity_lookup_min_sim",
         type="float",
@@ -616,10 +575,10 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max=0.95,
         group="graph_explore",
         description=(
-            "Cosine similarity floor for the graph_explore entity_lookup "
-            "tool. The disambiguator's 0.85 (precision-tuned for adding "
-            "alias edges) is too strict at query time; 0.4 surfaces too "
-            "much noise; 0.6 trades these off."
+            "Input-resolution guard, not a retrieval-scoring threshold: a "
+            "deliberately-named chain_entity `focus` anchor whose best "
+            "embedding match is below this is flagged low-confidence and not "
+            "used to seed the walk (prevents anchoring on a garbage match)."
         ),
     ),
     ConfigEntry(
@@ -630,10 +589,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max=1.0,
         group="graph_explore",
         description=(
-            "Gradient g for gradient_topk_candidates() — controls how "
-            "fast similarity scores below the top hit are penalised. "
-            "Larger g → flatter top-k (more candidates pass); smaller "
-            "g → sharper cutoff (only the top match passes)."
+            "Reserved: unused by the current 2-mode entity-lookup tool. "
+            "Retained so persisted configs and the admin key still bind."
         ),
     ),
     # ---------- agent.web.* ----------
