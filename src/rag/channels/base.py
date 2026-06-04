@@ -112,6 +112,30 @@ def aggregate_per_doc(
     )
 
 
+def reciprocal_rank_fusion(
+    rank_lists: Iterable[Sequence[Hashable]],
+    *,
+    k: int = 60,
+) -> Dict[Hashable, float]:
+    """Fuse several ranked lists of item keys into one RRF score map.
+
+    Each input is an ordered sequence of hashable keys (best first). The
+    score of a key is ``Σ 1 / (k + rank)`` over the lists it appears in
+    (rank is 1-based). ``k=60`` is the published convention (Cormack et
+    al., SIGIR 2009): unsupervised, weight-free, robust over a range of
+    ``k`` — so fusing heterogeneous criteria (each as its own rank list)
+    needs no learned weights and no per-corpus calibration.
+
+    Returns ``{key: rrf_score}``; the caller sorts by score desc. An item
+    missing from a list simply contributes nothing from that list.
+    """
+    scores: Dict[Hashable, float] = defaultdict(float)
+    for rank_list in rank_lists:
+        for rank, key in enumerate(rank_list, start=1):
+            scores[key] += 1.0 / (k + rank)
+    return dict(scores)
+
+
 class BaseChannel:
     """Subclasses implement :meth:`retrieve`. ``name`` is used in trace logs."""
 

@@ -78,6 +78,13 @@ class GraphPPRChannel(BaseChannel):
         self.linear_config = linear_config or LinearRAGConfig(
             embedding_client=self.embedding_client
         )
+        # Runtime NER follows ingest. If this KG persisted the GLiNER knobs it
+        # was built with (``ner_config.json``, written by LinearRAG flush), they
+        # override the runtime config so query-time entity extraction uses the
+        # SAME labels as ingest. Each dataset (insurance / Double-Bench /
+        # multi-hop) therefore auto-uses its own labels with no runtime wiring.
+        # Absent file → config unchanged.
+        self.linear_config = self._apply_persisted_ner_config(self.linear_config)
 
         # Stores are pulled from the process-wide cache (storage.embedding_store
         # ::get_or_create_store) so the lifespan-built channel and any
@@ -327,6 +334,12 @@ class GraphPPRChannel(BaseChannel):
             self._member_to_cluster_cache = None
             self._entity_passage_degree = None
             self._passage_entities = None
+            # Hub-suppression caches (keyed by edge count) must drop on reload:
+            # a swapped-in graph can share an edge count with the old one, so
+            # ecount alone would otherwise hand back a stale df / damped-weight
+            # vector for the wrong graph.
+            self._entity_df_cache = None
+            self._hub_damped_cache = None
             # Drop the cached NER adapter too. The shared GLiNER model
             # itself stays pinned by ``shared_gliner``'s lru_cache, but
             # this adapter holds a frozen reference to the old
@@ -417,6 +430,30 @@ class GraphPPRChannel(BaseChannel):
         return bool(self.graph.vs[vidx]["hidden"])
 
     # ----------------------------------------------------------- seeding
+
+    def _apply_persisted_ner_config(self, cfg):
+        """Override ``cfg``'s GLiNER knobs with those ingest persisted in
+        ``faiss_graph_dir()/ner_config.json`` so query-time NER == ingest NER.
+        Returns ``cfg`` unchanged if the file is absent/unreadable."""
+        import json as _json
+        from dataclasses import replace as _replace
+
+        path = faiss_graph_dir() / "ner_config.json"
+        if not path.is_file():
+            return cfg
+        try:
+            nc = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return cfg
+        fields = {
+            "gliner_model_id", "gliner_labels", "gliner_noise_labels",
+            "gliner_threshold", "gliner_batch_size", "ner_max_span_chars",
+            "gliner_calibration_enabled", "gliner_temperature",
+            "gliner_label_thresholds", "gliner_stopword_languages",
+            "gliner_stopword_confidence_floor",
+        }
+        over = {k: v for k, v in nc.items() if k in fields}
+        return _replace(cfg, **over) if over else cfg
 
     def _ensure_ner(self) -> GLiNERAdapter:
         if self._ner is None:
@@ -775,6 +812,119 @@ class GraphPPRChannel(BaseChannel):
                         co_occur[k].sort(key=lambda t: t[1], reverse=True)
                     self._entity_co_occur_top = dict(co_occur)
         return self._entity_co_occur_top.get(entity_hash, [])[:top_n]
+
+    def cooccurrence_neighbors(
+        self,
+        tail_hash: str,
+        sent_sims: np.ndarray,
+        sent_idx: Dict[str, int],
+        *,
+        top_s: int = 32,
+        top_l: int = 20,
+        max_via: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """Sentence-first co-occurrence neighbors of one tail entity.
+
+        The chain beam's *only* source of entity→entity hops. Walking the
+        graph's entity-incident edges yields alias edges (variants), not
+        relations; this instead projects the tail's mention sentences —
+        ranked by query relevance — onto the entities they co-mention. The
+        natural-language sentence IS the predicate, so ranking sentences by
+        ``cos(query, sentence)`` types the hop at query time.
+
+        Sentence-first, not co-occurrence-count-first: a bridge entity that
+        shares a single sentence with the tail is reachable as long as that
+        sentence ranks high for the query. A count prefilter would drop
+        exactly those rare bridges, which are the multi-hop answer path.
+
+        Returns up to ``top_l`` neighbors, each folded to its alias cluster
+        (surface variants → one logical hop; a partner in the tail's own
+        cluster is dropped — an alias is not a relation). Each entry::
+
+            {hash_id, cluster_id, max_cos, mean_cos, support, via_sids}
+
+        ranked by ``(max_cos, mean_cos, support)`` desc. ``support`` (number
+        of distinct co-occurrence sentences in the top-S window) is evidence
+        metadata only, never a score penalty — repeated parent/spouse/office
+        sentences are the *good* bridge in multi-hop, not hub noise.
+
+        Cost per tail-cluster: O(Σ |sents(member)| over the cluster members)
+        to gather + argpartition the top-S (not a full sort) + O(Σ entities in
+        the top-S sentences). A giant alias cluster gives a one-time
+        O(cluster-incidence) spike on first expansion; ``top_s`` bounds the
+        downstream work. ``sent_sims`` is computed once per query by the caller
+        and shared across every tail in the beam.
+        """
+        ent_to_sents, sent_to_ents = self._mention_maps()
+        clusters, member_to_cluster = self._load_clusters_cached()
+        tail_cluster = member_to_cluster.get(tail_hash, tail_hash)
+        # Tail-side alias folding: a hop may start from any surface variant of
+        # the tail's logical entity, so pool every cluster member's mention
+        # sentences. This also makes the result a function of the cluster, so
+        # the beam can memoize neighbors per cluster (not per surface).
+        members = clusters.get(tail_cluster, [tail_hash])
+        sents: List[str] = []
+        seen_s: set = set()
+        for m in members:
+            for s in ent_to_sents.get(m, ()):
+                if s not in seen_s:
+                    seen_s.add(s)
+                    sents.append(s)
+        if not sents:
+            return []
+
+        # Rank the tail's mention sentences by query cosine; keep top-S.
+        pairs = [(s, float(sent_sims[sent_idx[s]])) for s in sents if s in sent_idx]
+        if not pairs:
+            return []
+        if len(pairs) > top_s:
+            sims_arr = np.fromiter(
+                (p[1] for p in pairs), dtype=np.float64, count=len(pairs)
+            )
+            keep = np.argpartition(sims_arr, -top_s)[-top_s:]
+            pairs = [pairs[int(i)] for i in keep]
+
+        # Aggregate co-mentioned entities → cluster-folded neighbors. ``via``
+        # is a {sentence → sim} map so the same sentence mentioning two
+        # cluster members counts once toward support.
+        agg: Dict[str, Dict[str, Any]] = {}
+        for sent_hash, sim in pairs:
+            for e2 in sent_to_ents.get(sent_hash, ()):
+                if e2 == tail_hash:
+                    continue
+                vidx = self._name_to_vidx.get(e2)
+                if vidx is None or self._is_hidden(vidx):
+                    continue
+                c2 = member_to_cluster.get(e2, e2)
+                if c2 == tail_cluster:
+                    continue  # alias variant of the tail, not a relational hop
+                slot = agg.get(c2)
+                if slot is None:
+                    agg[c2] = {"rep": e2, "rep_sim": sim, "via": {sent_hash: sim}}
+                    continue
+                if sim > slot["rep_sim"]:
+                    slot["rep"], slot["rep_sim"] = e2, sim
+                prev = slot["via"].get(sent_hash)
+                if prev is None or sim > prev:
+                    slot["via"][sent_hash] = sim
+
+        neighbors: List[Dict[str, Any]] = []
+        for c2, slot in agg.items():
+            via_items = sorted(slot["via"].items(), key=lambda t: t[1], reverse=True)
+            sims = [s for _, s in via_items]
+            support = len(sims)
+            neighbors.append({
+                "hash_id": slot["rep"],
+                "cluster_id": c2,
+                "max_cos": sims[0],
+                "mean_cos": sum(sims) / support,
+                "support": support,
+                "via_sids": [h for h, _ in via_items[:max_via]],
+            })
+        neighbors.sort(
+            key=lambda n: (n["max_cos"], n["mean_cos"], n["support"]), reverse=True
+        )
+        return neighbors[:top_l]
 
     def cluster_passage_count(self, cluster_id: str) -> int:
         """Number of passages that have at least one entity_passage edge to
@@ -1202,10 +1352,19 @@ class GraphPPRChannel(BaseChannel):
         n_vertices = self.graph.vcount()
         entity_weights = np.zeros(n_vertices, dtype=np.float64)
 
+        # HippoRAG node-specificity: scale each query seed's reset mass by
+        # s_i = 1/|P_i| (inverse passage frequency) so a phrase appearing in
+        # many passages (a hub) seeds little mass. ``actived`` keeps the raw
+        # similarity so the downstream semantic-expansion BFS is unchanged;
+        # only the reset vector is damped.
+        df = self._entity_passage_df() if getattr(cfg, "ppr_node_specificity", False) else None
         actived: Dict[str, Tuple[int, float, int]] = {}
         for hid, vidx, sim in seeds:
             actived[hid] = (vidx, sim, 1)
-            entity_weights[vidx] = sim
+            w = sim
+            if df is not None:
+                w = sim / max(1, df.get(vidx, 0))
+            entity_weights[vidx] = w
 
         if not seeds:
             return entity_weights, actived
@@ -1467,6 +1626,67 @@ class GraphPPRChannel(BaseChannel):
             )
         return passage_weights
 
+    # ------------------------------------------------- hub suppression
+
+    def _entity_passage_df(self) -> Dict[int, int]:
+        """Per-entity passage frequency (count of incident entity_passage
+        edges), keyed by vertex index and cached by edge count.
+
+        Feeds HippoRAG node-specificity (seed side, ``_calculate_entity_scores``)
+        and SPRIG df-damping (transition side). One O(E) pass; recomputed only
+        when the graph's edge count changes (store refresh)."""
+        ec = self.graph.ecount()
+        cache = getattr(self, "_entity_df_cache", None)
+        if cache is not None and cache[0] == ec:
+            return cache[1]
+        df: Dict[int, int] = {}
+        if (
+            "edge_type" in self.graph.es.attributes()
+            and "vertex_type" in self.graph.vs.attributes()
+        ):
+            vtype = self.graph.vs["vertex_type"]
+            for e in self.graph.es:
+                if e["edge_type"] != "entity_passage":
+                    continue
+                s, t = e.source, e.target
+                if vtype[s] == "entity":
+                    df[s] = df.get(s, 0) + 1
+                if vtype[t] == "entity":
+                    df[t] = df.get(t, 0) + 1
+        self._entity_df_cache = (ec, df)
+        return df
+
+    def _hub_damped_weights(self, p: float) -> List[float]:
+        """Per-edge PPR weights with entity_passage edges scaled by
+        df(entity)^(-p) (SPRIG). Non-entity_passage edges keep their raw
+        weight. Cached by (edge_count, p)."""
+        ec = self.graph.ecount()
+        cache = getattr(self, "_hub_damped_cache", None)
+        if cache is not None and cache[0] == ec and cache[1] == p:
+            return cache[2]
+        df = self._entity_passage_df()
+        base = self.graph.es["weight"]
+        has_et = "edge_type" in self.graph.es.attributes()
+        vtype = (
+            self.graph.vs["vertex_type"]
+            if "vertex_type" in self.graph.vs.attributes() else None
+        )
+        out: List[float] = []
+        for i, e in enumerate(self.graph.es):
+            w = float(base[i])
+            if has_et and vtype is not None and e["edge_type"] == "entity_passage":
+                ent = (
+                    e.source if vtype[e.source] == "entity"
+                    else (e.target if vtype[e.target] == "entity" else None)
+                )
+                if ent is not None:
+                    d = df.get(ent, 0)
+                    if d > 1:
+                        w *= d ** (-p)
+            out.append(w)
+        self._hub_damped_cache = (ec, p, out)
+        return out
+
     # ----------------------------------------------------------- PPR
 
     def _run_ppr(self, node_weights: np.ndarray) -> List[Tuple[str, float]]:
@@ -1499,11 +1719,18 @@ class GraphPPRChannel(BaseChannel):
         reset = np.where(np.isnan(node_weights) | (node_weights < 0), 0.0, node_weights)
         if reset.sum() <= 0:
             return [], None
+        # SPRIG transition-side hub damping: scale entity_passage edge weights
+        # by df(entity)^(-p) so PPR mass flows less freely into high-degree
+        # entities. p=0 → use the raw "weight" attribute (zero-copy).
+        weights_param = "weight" if "weight" in self.graph.es.attributes() else None
+        p = float(getattr(cfg, "ppr_hub_damping_p", 0.0) or 0.0)
+        if p > 0 and weights_param is not None:
+            weights_param = self._hub_damped_weights(p)
         scores = self.graph.personalized_pagerank(
             vertices=range(self.graph.vcount()),
             damping=cfg.ppr_damping,
             directed=False,
-            weights="weight" if "weight" in self.graph.es.attributes() else None,
+            weights=weights_param,
             reset=reset.tolist(),
             implementation="prpack",
         )
@@ -1607,6 +1834,15 @@ class GraphPPRChannel(BaseChannel):
         # actually filtered out of the quotient.
         has_edge_type = "edge_type" in self.graph.es.attributes()
         has_weight = "weight" in self.graph.es.attributes()
+        # SPRIG transition-side hub damping, applied to entity_passage edges
+        # before they aggregate into super-edges — same df(entity)^(-p) rule as
+        # the physical path so the two views are consistent. p=0 disables.
+        p_hub = float(getattr(self.config, "ppr_hub_damping_p", 0.0) or 0.0)
+        df_map = self._entity_passage_df() if p_hub > 0 else None
+        vtype_q = (
+            self.graph.vs["vertex_type"]
+            if "vertex_type" in self.graph.vs.attributes() else None
+        )
         for e in self.graph.es:
             if has_edge_type and e["edge_type"] == "alias":
                 continue
@@ -1620,6 +1856,18 @@ class GraphPPRChannel(BaseChannel):
                 continue
             key = (su, sv) if su < sv else (sv, su)
             w = float(e["weight"]) if has_weight else 1.0
+            if (
+                df_map is not None and has_edge_type
+                and e["edge_type"] == "entity_passage" and vtype_q is not None
+            ):
+                ent = (
+                    e.source if vtype_q[e.source] == "entity"
+                    else (e.target if vtype_q[e.target] == "entity" else None)
+                )
+                if ent is not None:
+                    d = df_map.get(ent, 0)
+                    if d > 1:
+                        w *= d ** (-p_hub)
             edge_weight[key] = edge_weight.get(key, 0.0) + w
 
         if edge_weight:
