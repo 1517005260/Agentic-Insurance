@@ -232,13 +232,13 @@ def is_misbound_span(text: str, max_span_chars: int) -> bool:
 # punctuation characters inside organisation names, so they are almost
 # always enumeration glyphs.
 #
-# Conjunction words (或 / 及 / 与) were intentionally REMOVED after a
-# review surfaced realistic counter-examples like "保险及再保险公司" /
-# "联通及电信合作社" — those would be incorrectly split. The catalog
-# OCR symptom we're targeting (`A(code)、B(code)、C(code)`) is fully
-# covered by the punctuation set; conjunction-glued chains are rare
-# enough to leave as composite surfaces (the ``is_composite_surface``
-# gate downstream prevents them from polluting alias clusters).
+# Conjunction words (或 / 及 / 与) are excluded: realistic
+# counter-examples like "保险及再保险公司" / "联通及电信合作社" would be
+# incorrectly split. The catalog OCR symptom we're targeting
+# (`A(code)、B(code)、C(code)`) is fully covered by the punctuation
+# set; conjunction-glued chains are rare enough to leave as composite
+# surfaces (the ``is_composite_surface`` gate downstream prevents them
+# from polluting alias clusters).
 _CATALOG_LIST_SEP_RE = regex.compile(r"[、；;•｜|，]+")
 
 

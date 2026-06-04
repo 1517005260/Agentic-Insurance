@@ -1,35 +1,35 @@
-"""Entity disambiguation: dual-query gradient top-k + cluster.
+"""Entity disambiguation: 0-LLM blocking → matching → de-percolation.
 
-Pipeline for each new entity ``e`` (already embedded):
+Run as a flush-time batch over the entity store (orchestration in
+``LinearRAG._resolve_entities``); the functions here are pure helpers:
 
-    1. Two faiss top-k queries against the entity store:
-       - bare-surface query (symmetric: query and store are both
-         bare-surface embeddings → same space, true cos sim)
-       - mention-context centroid query (semantic recall path)
-       Their results are merged by max cosine similarity per candidate.
-       The bare-surface arm carries character-level variants
-       (singular/plural, abbreviation, light reordering); the centroid
-       arm carries semantic synonyms. Symmetric bare-vs-bare scoring
-       removes the need for a separate mutual top-k step.
-    2. Apply absolute floor ``alias_min_sim`` to the merged list.
-    3. Walk down candidates; cut at the first relative similarity drop
-       > g (default g=0.3, i.e. 30% drop between consecutive candidates).
-    4. Add (e, c) alias edges with weight = max cos sim from step 1.
-    5. Logical entities = connected components of the alias subgraph
-       (computed lazily and cached to clusters.json).
+    1. RECALL (blocking): two faiss top-k queries per entity against the
+       entity store — bare-surface and mention-context centroid — give the
+       candidate neighbourhood (``gradient_topk_candidates``). ANN search.
+    2. SYMMETRIZE: keep only reciprocal-kNN pairs (``mutual_knn_pairs``) so a
+       one-directional hub pull cannot chain a giant component.
+    3. MATCH (precision): a gate of a DIFFERENT signal class than recall —
+       IDF-weighted lexical token overlap (``build_surface_idf`` /
+       ``idf_weighted_overlap``) for surface-similar pairs, plus a relational
+       co-occurrence veto (entities sharing a passage are distinct entities).
+    4. Add (e, c) alias edges (overlay) with weight from ``propagation_policy``,
+       capped at the top-L per entity.
+    5. Logical entities = Leiden communities of the alias subgraph
+       (``compute_clusters``), a recomputable derived view over immutable edges.
 
-The new entity is always added as a separate physical node (no merging) so
-mistakes are reversible by deleting an alias edge.
+The new entity is always a separate physical node (no merging) so mistakes are
+reversible by deleting an alias edge.
 """
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import igraph as ig
 import numpy as np
+import regex  # \p{Han} Unicode property class (third-party, as in normalize.py)
 
 from storage import EmbeddingStore
 
@@ -43,11 +43,11 @@ DEFAULT_GRADIENT = 0.3  # relative drop threshold (sim[i] - sim[i+1]) / sim[i]
 # noise. Tunable via ``LinearRAGConfig.alias_min_sim``.
 DEFAULT_MIN_SIM = 0.85
 
-# Admission rule version — bump whenever the admission pipeline (gradient
-# top-k, composite gate, reranker veto, normalization) changes so each
-# edge's ``features_json["admission_rule_version"]`` records which gate set
-# accepted it. Audit and rule-regression depend on this string.
-ADMISSION_RULE_VERSION = "D3+V4-reranker-v1"
+# Admission rule version — bump whenever the admission pipeline (recall
+# top-k, mutual-kNN, IDF lexical gate, co-occurrence veto, outdegree cap)
+# changes so each edge's ``features_json["admission_rule_version"]`` records
+# which gate set accepted it. Audit and rule-regression depend on this string.
+ADMISSION_RULE_VERSION = "D4-idf+mutualknn+cooccur-v1"
 
 # Reasonable propagation policy names (A–E variants of decoupled
 # audit-vs-propagation weighting).
@@ -57,14 +57,9 @@ PROPAGATION_POLICIES = {"const", "cos", "clipped_cos", "threshold_gate", "calibr
 @dataclass
 class AliasCandidate:
     hash_id: str
+    # Max cosine across the recall arms (bare-surface / mention-centroid) that
+    # surfaced this candidate; drives the edge weight via ``propagation_policy``.
     score: float
-    # Filled in by ``reranker_veto`` when the cross-encoder gate runs;
-    # ``None`` means the reranker did not score this candidate (gate
-    # disabled or candidate already vetoed upstream). Downstream callers
-    # check for None before plugging into ``propagation_policy`` —
-    # threshold-gate and calibrated policies tolerate the missing
-    # signal explicitly.
-    rerank_yes_prob: Optional[float] = None
 
 
 def gradient_topk_candidates(
@@ -110,73 +105,118 @@ def gradient_topk_candidates(
     return cands[:cut]
 
 
-def merge_topk_candidates(
-    *candidate_lists: Sequence[AliasCandidate],
-) -> List[AliasCandidate]:
-    """Merge multiple top-k result lists, keeping the max score per hash_id.
+# =============================================================== lexical signal
+# Precision matcher of a DIFFERENT signal class than the embedding recall step
+# (Fellegi-Sunter / record linkage): IDF-weighted token overlap. A single
+# semantic threshold cannot separate template collisions ("3rd Baron Acton" vs
+# "3rd Baroness Herbert", high cosine, distinct) from true variants; the lexical
+# signal can, because corpus-frequent template tokens carry little IDF weight
+# and rare head tokens carry most of it.
 
-    Used to combine the bare-surface and centroid query result lists in
-    the dual-query recall path: a candidate that surfaces in either
-    list at sufficient similarity should be considered, and we keep
-    whichever score is higher so the gradient cutoff downstream sees
-    the strongest signal.
+_HAN_RUN_RE = regex.compile(r"\p{Han}+")
+# Non-Han word tokens: maximal runs of word characters (letters / digits /
+# underscore, any script) excluding Han. ``[^\W\p{Han}]`` = "word char AND not
+# Han", so punctuation and whitespace are dropped — ``"dark river (2017 film)"``
+# → ``dark river 2017 film`` rather than gluing ``(2017`` / ``film)``. Script-
+# agnostic (Cyrillic, Greek, accented Latin all count) and never corpus-tuned.
+_LATIN_TOKEN_RE = regex.compile(r"[^\W\p{Han}]+")
+
+
+def tokenize_surface(surface: Optional[str], *, han_ngram: int = 2) -> List[str]:
+    """Language-agnostic tokens for the lexical-overlap signal.
+
+    Latin/Cyrillic/digit runs → whitespace-delimited word tokens. Han runs have
+    no whitespace, so they are cut into character ``han_ngram``-grams (default
+    bigrams) — bigrams keep enough identity to tell ``万通危疾`` from ``富饶万家``
+    while staying segmenter-free. Tokens are namespaced (``w:`` / ``h:``) so a
+    Latin word can never collide with a Han n-gram in the IDF table.
     """
-    by_hash: Dict[str, float] = {}
-    for cands in candidate_lists:
-        for c in cands:
-            prev = by_hash.get(c.hash_id)
-            if prev is None or c.score > prev:
-                by_hash[c.hash_id] = c.score
-    merged = [AliasCandidate(h, s) for h, s in by_hash.items()]
-    merged.sort(key=lambda c: c.score, reverse=True)
-    return merged
-
-
-def reranker_veto(
-    anchor_text: str,
-    candidates: Sequence[AliasCandidate],
-    store: EmbeddingStore,
-    *,
-    threshold: float,
-    instruction: str,
-) -> List[AliasCandidate]:
-    """Drop candidates whose pairwise reranker score is below ``threshold``.
-
-    Cross-encoder pairwise score is used as a **low-confidence veto** —
-    the rerank AUC on cold-start short-surface ER measured around 0.66,
-    enough to filter ordered-tier false merges (`option 1` vs `option 2`)
-    and a few range/scope variants, but not high enough to use the score
-    as an identity classifier. High scores do not certify alias status
-    on their own; they only mean "the reranker did not veto". The
-    upstream cos-sim + gradient cutoff + composite gate still set the
-    real admission criteria.
-
-    Surface-only input (not surface + mention) — empirically the model
-    treats long sentence context as semantic-relevance signal, which
-    dilutes the identity decision. The hardened instruction is what
-    forces the yes/no head toward identity rather than relevance.
-    """
-    if not candidates:
+    if not surface:
         return []
-    # Lazy import — keeps `disambig.py` cheap when only the gradient
-    # path is exercised (e.g. test fixtures without a downloaded
-    # reranker checkpoint).
-    from model_client import get_cached_rerank_client
+    tokens: List[str] = ["w:" + m for m in _LATIN_TOKEN_RE.findall(surface)]
+    n = max(1, int(han_ngram))
+    for run in _HAN_RUN_RE.findall(surface):
+        if len(run) <= n:
+            tokens.append("h:" + run)
+        else:
+            tokens.extend("h:" + run[i : i + n] for i in range(len(run) - n + 1))
+    return tokens
 
-    client = get_cached_rerank_client()
-    pairs = [
-        (anchor_text, store.get_text(c.hash_id)) for c in candidates
-    ]
-    scores = client.score_pairs(pairs, instruction=instruction)
-    kept: List[AliasCandidate] = []
-    for c, s in zip(candidates, scores):
-        if s < threshold:
-            continue
-        # Preserve the upstream cos-sim score on ``score`` so admission /
-        # debug paths keep their existing meaning; the reranker yes-prob
-        # lives on its own field for downstream propagation policies.
-        kept.append(AliasCandidate(hash_id=c.hash_id, score=c.score, rerank_yes_prob=float(s)))
-    return kept
+
+def smoothed_idf(df: int, n: int) -> float:
+    """BM25-style smoothed IDF with a positive floor: ``ln((n+1)/(df+0.5))``.
+
+    A plain ``ln(n/df)`` gives a token present in EVERY surface weight 0, so a
+    true variant whose shared tokens are all corpus-frequent (e.g. an insurance
+    corpus where ``保险`` appears in most product names) underflows to zero
+    overlap and is wrongly rejected. The smoothing keeps even a ubiquitous
+    token at a small POSITIVE weight while rare head tokens still dominate, so
+    the relative ordering (and template-collision rejection) is preserved.
+    """
+    if n <= 0:
+        return 0.0
+    return math.log((n + 1.0) / (df + 0.5))
+
+
+def build_surface_idf(
+    surfaces: Sequence[str], *, han_ngram: int = 2
+) -> Dict[str, float]:
+    """Corpus smoothed-IDF over entity surfaces (each surface = one document).
+
+    ``df[t]`` = number of distinct surfaces containing token ``t``, ``N`` =
+    surface count; weight = :func:`smoothed_idf`. Frequent template tokens
+    (``baron`` / ``war`` / ``3rd``) get a small weight; rare head tokens
+    (``acton``) a large one. One pass: O(Σ tokens). The incremental build path
+    maintains ``df`` itself and calls :func:`smoothed_idf` directly.
+    """
+    df: Dict[str, int] = {}
+    n = 0
+    for s in surfaces:
+        n += 1
+        for t in set(tokenize_surface(s, han_ngram=han_ngram)):
+            df[t] = df.get(t, 0) + 1
+    if n == 0:
+        return {}
+    return {t: smoothed_idf(c, n) for t, c in df.items()}
+
+
+def idf_weighted_overlap(
+    tokens_a: Sequence[str], tokens_b: Sequence[str], idf: Dict[str, float]
+) -> float:
+    """IDF-weighted Jaccard over two token sets (record-linkage matcher).
+
+    ``Σ_{t∈A∩B} idf[t] / Σ_{t∈A∪B} idf[t]`` — overlap on distinctive (high-IDF)
+    tokens dominates; sharing only frequent template tokens scores near 0.
+    Returns 0.0 when either side is empty or the union carries no IDF mass.
+    """
+    sa, sb = set(tokens_a), set(tokens_b)
+    if not sa or not sb:
+        return 0.0
+    denom = sum(idf.get(t, 0.0) for t in (sa | sb))
+    if denom <= 0.0:
+        return 0.0
+    num = sum(idf.get(t, 0.0) for t in (sa & sb))
+    return num / denom
+
+
+def mutual_knn_pairs(neighbors: Dict[str, Set[str]]) -> Set[frozenset]:
+    """Reciprocal-kNN edge set: ``frozenset({e, c})`` for every pair where
+    ``c ∈ neighbors[e]`` AND ``e ∈ neighbors[c]``.
+
+    ``neighbors[e]`` = the entity hash_ids recalled for ``e`` (union of recall
+    arms). O(Σ|neighbors|). Single-linkage chaining through a one-directional
+    hub pull is impossible once edges must be reciprocal (Maier/Hein/von
+    Luxburg).
+    """
+    out: Set[frozenset] = set()
+    for e, nbrs in neighbors.items():
+        for c in nbrs:
+            if c == e:
+                continue
+            other = neighbors.get(c)
+            if other is not None and e in other:
+                out.add(frozenset((e, c)))
+    return out
 
 
 def add_alias_edges(
@@ -186,6 +226,7 @@ def add_alias_edges(
     *,
     features_list: Optional[Sequence[Dict[str, Any]]] = None,
     w_prop_list: Optional[Sequence[float]] = None,
+    name_to_idx: Optional[Dict[str, int]] = None,
 ) -> int:
     """Add alias edges from ``new_hash_id`` to each candidate.
 
@@ -194,17 +235,21 @@ def add_alias_edges(
     * ``weight``        — propagation weight ``w_prop`` (drives PPR).
     * ``edge_type``     — ``"alias"``.
     * ``features_json`` — JSON-stringified per-edge features dict
-      (cos_sim / reranker_score / admission_rule_version / accepted_by /
+      (cos_sim / idf_overlap / admission_rule_version / accepted_by /
       evidence). GraphML cannot store dict attributes natively, so the
       single JSON string is the audit sidecar.
 
     A caller that omits features/w_prop falls back to
     ``weight = cand.score`` (policy=cos equivalence), so the explicit
-    feature path is optional for tests / scripts.
+    feature path is optional for tests / scripts. ``name_to_idx`` (name →
+    vertex index) may be passed in by a batch caller built ONCE for the whole
+    ER pass; omitting it rebuilds the map here (O(V) per call) — passing it is
+    what keeps the batch O(N) instead of O(N·V).
     """
     if not candidates:
         return 0
-    name_to_idx = {v["name"]: v.index for v in graph.vs if "name" in v.attributes()}
+    if name_to_idx is None:
+        name_to_idx = {v["name"]: v.index for v in graph.vs if "name" in v.attributes()}
     if new_hash_id not in name_to_idx:
         return 0
 
@@ -231,9 +276,8 @@ def add_alias_edges(
         else:
             features = {
                 "cos_sim": float(cand.score),
-                "reranker_score": cand.rerank_yes_prob,
                 "admission_rule_version": ADMISSION_RULE_VERSION,
-                "accepted_by": "gradient_er",
+                "accepted_by": "idf_mutualknn_er",
             }
         features_payloads.append(json.dumps(features, ensure_ascii=False))
 
@@ -718,6 +762,8 @@ def _on_alias_accepted_overlay(
     candidates: Sequence[AliasCandidate],
     features_list: Sequence[Dict[str, Any]],
     w_prop_list: Sequence[float],
+    *,
+    name_to_idx: Optional[Dict[str, int]] = None,
     **_,
 ) -> int:
     """Overlay handler: just add alias edges. The default reversible path."""
@@ -727,6 +773,7 @@ def _on_alias_accepted_overlay(
         candidates,
         features_list=features_list,
         w_prop_list=w_prop_list,
+        name_to_idx=name_to_idx,
     )
 
 
@@ -804,7 +851,7 @@ def _redirect_entity_passage_edges(
             try:
                 existing_records = json.loads(prev_fj) if prev_fj else []
                 if not isinstance(existing_records, list):
-                    # Legacy single-dict shape from a prior format. Wrap.
+                    # Single-dict shape (not a list): wrap it.
                     existing_records = [existing_records]
             except (ValueError, TypeError):
                 existing_records = []
@@ -848,6 +895,7 @@ def _on_alias_accepted_collapse(
     *,
     reverse_map: Dict[str, str],
     carry_provenance: bool,
+    name_to_idx: Optional[Dict[str, int]] = None,
     **_,
 ) -> int:
     """Collapse handler (basic + provenance variants).
@@ -868,7 +916,8 @@ def _on_alias_accepted_collapse(
     """
     if not candidates:
         return 0
-    name_to_idx = {v["name"]: v.index for v in graph.vs if "name" in v.attributes()}
+    if name_to_idx is None:
+        name_to_idx = {v["name"]: v.index for v in graph.vs if "name" in v.attributes()}
     accepted = 0
     for i, cand in enumerate(candidates):
         new_canon = follow_reverse_map(new_hash_id, reverse_map)
@@ -915,16 +964,20 @@ def on_alias_accepted(
     w_prop_list: Sequence[float],
     *,
     reverse_map: Optional[Dict[str, str]] = None,
+    name_to_idx: Optional[Dict[str, int]] = None,
 ) -> int:
     """Dispatch alias acceptance to the handler named in ``handler``.
 
     ``reverse_map`` is mutated in place for collapse handlers (callers
-    persist it after the batch); ignored for overlay. Unknown handlers
-    raise ``ValueError`` — silent fallback would hide a config typo.
+    persist it after the batch); ignored for overlay. ``name_to_idx`` (name →
+    vertex index) is an optional prebuilt map a batch caller passes once for
+    the whole ER pass to avoid the O(V) rebuild per accepted entity. Unknown
+    handlers raise ``ValueError`` — silent fallback would hide a config typo.
     """
     if handler == ACCEPTANCE_HANDLER_OVERLAY:
         return _on_alias_accepted_overlay(
-            graph, new_hash_id, candidates, features_list, w_prop_list
+            graph, new_hash_id, candidates, features_list, w_prop_list,
+            name_to_idx=name_to_idx,
         )
     if handler in (ACCEPTANCE_HANDLER_COLLAPSE_BASIC, ACCEPTANCE_HANDLER_COLLAPSE_PROVENANCE):
         if reverse_map is None:
@@ -939,6 +992,7 @@ def on_alias_accepted(
             w_prop_list,
             reverse_map=reverse_map,
             carry_provenance=(handler == ACCEPTANCE_HANDLER_COLLAPSE_PROVENANCE),
+            name_to_idx=name_to_idx,
         )
     raise ValueError(f"on_alias_accepted: unknown handler {handler!r}")
 

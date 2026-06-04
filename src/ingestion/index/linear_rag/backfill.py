@@ -94,8 +94,8 @@ def build_gazetteer_automaton(
     "company" — drop, "Heritage Protector Option" — keep), but is
     waived for CJK surfaces ("萬通保險" — keep) since Chinese has no
     word boundary character. Without this carve-out the gazetteer
-    came out empty on Chinese-heavy corpora and silently produced
-    zero backfill edges (the symptom that led to this fix).
+    comes out empty on Chinese-heavy corpora and silently produces
+    zero backfill edges.
     """
     A = ahocorasick.Automaton()
     n_kept = 0

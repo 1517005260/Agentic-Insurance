@@ -99,6 +99,46 @@ class GraphIndexBuilder(IndexBuilder):
             },
         )
 
+    def bulk_build(self, pages: List[PageAsset], *, flush: bool = True) -> IndexBuildResult:
+        """O(N) build for a corpus of many tiny single-page documents: flatten all
+        PageAssets to ``(file_id, page_number, text_markdown)`` and index them in
+        one :meth:`LinearRAG.bulk_index_passages` pass, then flush once. The
+        production per-file path keeps using :meth:`_build`; this is for bulk
+        dataset builds only. Always uses one persistent LinearRAG (a bulk build is
+        inherently a single graph operation) regardless of ``reuse_graph``.
+        """
+        from dataclasses import replace as _replace
+
+        base_lc = self.linear_config or LinearRAGConfig()
+        config = _replace(
+            base_lc,
+            embedding_client=self.embedding_client,
+            max_workers=self.max_workers,
+        )
+        if self._lr is None:
+            self._lr = LinearRAG(config)
+        items = [
+            (p.file_id, p.page_number if p.page_number is not None else 0, p.text_markdown)
+            for p in pages
+            if p.text_markdown.strip()
+        ]
+        added = self._lr.bulk_index_passages(items, final_flush=flush)
+        graph = self._lr.graph
+        return IndexBuildResult(
+            index_name=self.name,
+            file_id="__bulk__",
+            output_dir=str(self.output_dir),
+            item_count=added["passages"],
+            extra={
+                "ner_model": config.gliner_model_id,
+                "embedding_model": self.embedding_client.model,
+                "graphml": str(self.output_dir / "LinearRAG.graphml"),
+                "graph_v": graph.vcount(),
+                "graph_e": graph.ecount(),
+                "added": added,
+            },
+        )
+
     def flush(self) -> None:
         """Force-persist the reused graph + all deferred writes.
 

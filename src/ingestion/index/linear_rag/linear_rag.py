@@ -29,7 +29,7 @@ import logging
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Sequence, Set
 
 import igraph as ig
 
@@ -42,20 +42,22 @@ from config.settings import (
 from ingestion.index.linear_rag.disambig import (
     ACCEPTANCE_HANDLER_OVERLAY,
     ADMISSION_RULE_VERSION,
-    add_alias_edges,
+    AliasCandidate,
     cluster_shape_metrics,
     compute_clusters,
     compute_clusters_for_collapse,
     get_clusters,
     gradient_topk_candidates,
+    idf_weighted_overlap,
     is_composite_surface,
     invalidate_clusters,
     load_reverse_map,
-    merge_topk_candidates,
+    mutual_knn_pairs,
     on_alias_accepted,
     propagation_policy,
-    reranker_veto,
     save_reverse_map,
+    smoothed_idf,
+    tokenize_surface,
 )
 from ingestion.index.linear_rag.ner import GLiNERAdapter
 from ingestion.index.linear_rag.normalize import canonical_form, normalize_for_hash
@@ -146,6 +148,22 @@ class LinearRAG:
         self._mention_seen: dict[str, set[str]] = {}
         self._rebuild_mention_index(self._sentence_to_entities)
 
+        # Incremental ER caches (mirror the mentions-cache pattern so the
+        # flush-time _resolve_entities batch is O(|pending|), not O(store) per
+        # flush — which would make a cadenced / per-file build O(N²)):
+        #   _token_df / _idf_surface_count — per-token corpus document
+        #     frequency, the IDF source for the lexical gate; bumped as
+        #     entities are inserted (never recomputed over the whole store).
+        #   _name_to_vidx — entity/passage name → igraph vertex index, so the
+        #     batch never rebuilds the O(V) vertex map per flush; kept current
+        #     by _augment_graph as vertices are added.
+        self._token_df: dict[str, int] = {}
+        self._idf_surface_count = 0
+        self._name_to_vidx: dict[str, int] = {
+            v["name"]: v.index for v in self.graph.vs if "name" in v.attributes()
+        }
+        self._warm_token_df()
+
         # Dirty flags for deferred persistence + literal backfill.
         # _ner_dirty: ner_results.json has unflushed mutations.
         # _backfill_pending_new_entities / _backfill_pending_new_passages:
@@ -156,6 +174,11 @@ class LinearRAG:
         self._ner_dirty = False
         self._backfill_pending_new_entities: Set[str] = set()
         self._backfill_pending_new_passages: Set[str] = set()
+        # Entities added since the last entity-resolution batch. ER is a
+        # flush-time batch (``_resolve_entities``), not a per-document step —
+        # this is the delta it resolves so the pass stays O(N) per flush
+        # instead of re-resolving the whole store every document.
+        self._er_pending_entities: Set[str] = set()
 
         # Cached cluster_shape returned from the most recent on-cadence
         # compute. Off-cadence index() calls reuse this snapshot instead
@@ -178,6 +201,33 @@ class LinearRAG:
         tmp = self._graphml_path.with_suffix(".graphml.tmp")
         self.graph.write_graphml(str(tmp))
         os.replace(tmp, self._graphml_path)
+
+    def _save_ner_config(self) -> None:
+        """Persist the GLiNER knobs this KG was built with, so query-time NER
+        (GraphPPRChannel) follows ingest rather than a runtime default. Each
+        dataset (insurance / Double-Bench / multi-hop) fixes its own labels at
+        ingest; the runtime channel reloads them from here so the two never
+        drift. Tiny, written every flush, independent of the NER cache version
+        (a label change must always be reflected even when the cache is warm)."""
+        cfg = self.config
+        payload = {
+            "gliner_model_id": cfg.gliner_model_id,
+            "gliner_labels": list(cfg.gliner_labels),
+            "gliner_noise_labels": list(cfg.gliner_noise_labels),
+            "gliner_threshold": cfg.gliner_threshold,
+            "gliner_batch_size": cfg.gliner_batch_size,
+            "ner_max_span_chars": cfg.ner_max_span_chars,
+            "gliner_calibration_enabled": cfg.gliner_calibration_enabled,
+            "gliner_temperature": cfg.gliner_temperature,
+            "gliner_label_thresholds": cfg.gliner_label_thresholds,
+            "gliner_stopword_languages": cfg.gliner_stopword_languages,
+            "gliner_stopword_confidence_floor": cfg.gliner_stopword_confidence_floor,
+        }
+        path = faiss_graph_dir() / "ner_config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def flush_all(self) -> int:
         """Run all deferred persistence + literal backfill, then graphml.
@@ -211,12 +261,23 @@ class LinearRAG:
         ):
             added_backfill_edges = self._run_pending_backfill()
 
-        # Refresh cluster_shape against the post-backfill graph so the
-        # final-flush monitoring snapshot is current rather than carrying
-        # whatever stale value the cadenced index() loop happened to
-        # leave behind. Cheap path (cheap=True) — same as the per-doc
-        # cluster_shape computation.
+        # Entity resolution batch — blocking → mutual-kNN → precision gate →
+        # alias edges, over the entities added since the last flush. Run AFTER
+        # backfill so the co-occurrence veto sees the complete entity_passage
+        # edge set. One pass per flush keeps every stage O(N); see
+        # ``_resolve_entities``. No-op when alias edges are disabled.
         is_collapse = self.config.acceptance_handler != ACCEPTANCE_HANDLER_OVERLAY
+        if self.config.alias_edges_enabled and self._er_pending_entities:
+            added_alias = self._resolve_entities(self._er_pending_entities)
+            self._er_pending_entities.clear()
+            if added_alias:
+                invalidate_clusters(faiss_graph_dir() / "clusters.json")
+            if is_collapse and self._reverse_map:
+                save_reverse_map(self._reverse_map_path, self._reverse_map)
+
+        # Refresh cluster_shape against the post-ER graph so the final-flush
+        # monitoring snapshot is current rather than carrying whatever stale
+        # value the cadenced index() loop left behind. Cheap path (cheap=True).
         if is_collapse:
             partition = compute_clusters_for_collapse(self.graph, self._reverse_map)
         else:
@@ -235,6 +296,8 @@ class LinearRAG:
         )
 
         self.flush_graphml()
+        self._save_ner_config()
+        self._save_er_config()
         return added_backfill_edges
 
     def _run_pending_backfill(self) -> int:
@@ -381,6 +444,31 @@ class LinearRAG:
                     seen.add(sent)
                     self._mentions_cache.setdefault(ent, []).append(sent)
 
+    def _warm_token_df(self) -> None:
+        """One-time warm of the token document-frequency table from any entity
+        surfaces already in the store (mirrors the mentions-cache warm)."""
+        han_ngram = int(self.config.er_han_token_ngram)
+        for surface in self.entity_embedding_store.get_hash_id_to_text().values():
+            self._idf_surface_count += 1
+            for t in set(tokenize_surface(surface, han_ngram=han_ngram)):
+                self._token_df[t] = self._token_df.get(t, 0) + 1
+
+    def _update_token_df(self, new_entity_hashes) -> None:
+        """Bump the token document-frequency table for newly added entity
+        surfaces (each unique surface = one document). O(|new|·tokens) — uses
+        per-hash ``get_text`` so it never copies the whole store map."""
+        if not new_entity_hashes:
+            return
+        han_ngram = int(self.config.er_han_token_ngram)
+        store = self.entity_embedding_store
+        for h in new_entity_hashes:
+            surface = store.get_text(h)
+            if not surface:
+                continue
+            self._idf_surface_count += 1
+            for t in set(tokenize_surface(surface, han_ngram=han_ngram)):
+                self._token_df[t] = self._token_df.get(t, 0) + 1
+
     # --------------------------------------------------------------- index
 
     def index(
@@ -446,12 +534,12 @@ class LinearRAG:
             #     Each entity surface goes through cleanup → junk filter
             #     → canonical form (LaTeX wrappers, pure numerics, etc.
             #     dropped; survivors collapsed to a language-aware
-            #     canonical key). Previously this was run over the full
-            #     accumulated state every doc — pure waste, since cached
-            #     entries were normalised when they were the delta on
-            #     their own ingest call (version-bump forces a full
-            #     rebuild via _load_ner_cache_or_empty when the
-            #     normalisation rules change).
+            #     canonical key). Restricting cleanup to the delta avoids
+            #     re-normalising cached entries, which were normalised
+            #     when they were the delta on their own ingest call (a
+            #     version-bump forces a full rebuild via
+            #     _load_ner_cache_or_empty when the normalisation rules
+            #     change).
             new_passage_to_entities_norm = self._normalize_entity_surfaces(
                 new_passage_to_entities,
                 fold_traditional=self.config.fold_traditional,
@@ -505,16 +593,21 @@ class LinearRAG:
         )
 
         # 6. Append adjacent-passage edges within this file_id only.
-        self._add_adjacent_passage_edges(file_id=file_id)
+        if self.config.adjacent_passage_edges_enabled:
+            self._add_adjacent_passage_edges(file_id=file_id)
 
         # 7. Augment graph: add new vertices, append new edges (preserve existing).
         self._augment_graph(new_passage_hash_set, new_entity_hash_set)
 
-        # 8. Entity disambiguation — add alias edges via dual-query
-        #    (bare-surface + mention-centroid) gradient-cutoff recall,
-        #    composite-surface admission gates, and a final pairwise
-        #    Qwen3-Reranker veto. Physical nodes are NOT merged.
-        added_alias_edges = self._add_alias_edges_for_new_entities(new_entity_hash_set)
+        # 8. Entity resolution is deferred to flush_all() — it is a flush-time
+        #    BATCH over the entities added since the last flush, not a per-doc
+        #    step. Running it per document re-resolved against the whole
+        #    accumulated store every call; batching keeps the pass O(N) and
+        #    lets mutual-kNN see every candidate's neighbourhood at once.
+        if self.config.alias_edges_enabled:
+            self._er_pending_entities |= new_entity_hash_set
+            self._update_token_df(new_entity_hash_set)
+        added_alias_edges = 0
 
         # 9. Literal mention backfill is deferred to flush_all(). NER is
         #    contextual (same surface tagged on intro page, missed on
@@ -531,26 +624,19 @@ class LinearRAG:
             self._backfill_pending_new_entities |= new_entity_hash_set
         added_backfill_edges = 0
 
-        # Cluster cache is now stale — invalidate so it recomputes lazily.
-        clusters_path = faiss_graph_dir() / "clusters.json"
-        if added_alias_edges:
-            invalidate_clusters(clusters_path)
-
-        # Persist reverse_map for collapse handlers; in overlay mode the
-        # map stays empty and we skip the write to keep ingest output
-        # bit-identical to the pre-v0.5 layout (no spurious file).
+        # Alias edges + reverse_map + clusters.json are all produced by the
+        # flush-time ER batch (see flush_all), so nothing alias-related is
+        # touched per document here.
         is_collapse = self.config.acceptance_handler != ACCEPTANCE_HANDLER_OVERLAY
-        if is_collapse and self._reverse_map:
-            save_reverse_map(self._reverse_map_path, self._reverse_map)
 
         # Cluster shape (a derived, monitoring-only view). On cadence
         # we recompute against the live graph + cache the result; off
         # cadence we reuse the cached snapshot. Collapse mode always
         # recomputes — it walks the reverse_map, not the alias subgraph.
-        # The previous off-cadence "fallback" path still ran
+        # Recomputing off cadence would run
         # compute_clusters(connected_components), which is O(E) per doc
         # (alias-edge filter + subgraph extract + union-find) — paying
-        # that per doc was its own O(N²) tail. Cached reuse drops it to
+        # that per doc is its own O(N²) tail. Cached reuse drops it to
         # a dict reference.
         self._index_calls += 1
         _cl_every = max(1, int(getattr(self.config, "cluster_shape_every", 1)))
@@ -621,136 +707,426 @@ class LinearRAG:
             "cluster_shape": cluster_shape,
         }
 
+    def bulk_index_passages(
+        self,
+        items: Sequence,
+        *,
+        final_flush: bool = True,
+    ) -> dict:
+        """Index many passages — each its own ``(file_id, page_number)`` — in ONE
+        pass. The O(N) build path for corpora of many tiny documents (e.g.
+        cross-document multi-hop wiki: 6k-12k single-passage file_ids).
+
+        Calling :meth:`index` once per passage is O(N²): each call re-materialises
+        node sets from the full accumulated NER cache (``_extract_nodes``) and
+        re-hashes the full sentence/entity sets (``_insert_with_dedup``). Here
+        every stage runs once over the whole batch: passage embed (1 dedup call),
+        NER (1 batched ``batch_ner``), node extraction (delta-only via
+        ``_extract_nodes_for_passages``), sentence/entity embed (1 each),
+        entity→passage edges, adjacency (1 grouped scan, gated), graph augment (1
+        call), alias ER (1 call, gated), and a single final ``flush_all``.
+
+        ``items`` = sequence of ``(file_id, page_number, text)``; ``text`` is the
+        plain passage markdown (no metadata prefix). Per-dataset knobs
+        (``alias_edges_enabled`` / ``adjacent_passage_edges_enabled`` /
+        ``literal_backfill_enabled``) come from ``self.config``. ``final_flush``
+        drains the deferred backfill + graphml + ner_config once; pass False to
+        chain several bulk calls before a manual ``flush_all``.
+        """
+        rows = [
+            (str(f), (0 if p is None else int(p)), t)
+            for f, p, t in items
+            if t and t.strip()
+        ]
+        if not rows:
+            return {"passages": 0, "entities": 0, "sentences": 0,
+                    "alias_edges": 0, "backfill_edges": 0}
+        self.node_to_node_stats = defaultdict(dict)
+
+        texts = [t for _, _, t in rows]
+        file_ids = [f for f, _, _ in rows]
+        page_numbers = [p for _, p, _ in rows]
+        input_hashes = {self.passage_embedding_store.hash_for(t) for t in texts}
+
+        # 1. Embed all passages once (hash dedup); identity in meta columns.
+        added_passage_hashes = self._insert_with_dedup(
+            self.passage_embedding_store,
+            texts,
+            extra_metadata={"file_id": file_ids, "page_number": page_numbers},
+        )
+        new_passage_hash_set: Set[str] = set(added_passage_hashes)
+        hash_id_to_passage = self.passage_embedding_store.get_hash_id_to_text()
+
+        # 2. NER the passages not already cached — ONE batched call.
+        missing = input_hashes - set(self._passage_to_entities.keys())
+        if missing:
+            batch = {h: hash_id_to_passage[h] for h in missing if h in hash_id_to_passage}
+            new_p2e, new_s2e, new_p2s = self.ner.batch_ner(batch, self.config.max_workers)
+            new_p2e = self._normalize_entity_surfaces(
+                new_p2e,
+                fold_traditional=self.config.fold_traditional,
+                han_fragment_max_chars=self.config.junk_max_han_chars,
+            )
+            new_s2e = self._normalize_entity_surfaces(
+                new_s2e,
+                fold_traditional=self.config.fold_traditional,
+                han_fragment_max_chars=self.config.junk_max_han_chars,
+            )
+            for h in missing:
+                self._passage_to_entities[h] = new_p2e.get(h, [])
+                self._passage_to_sentences[h] = new_p2s.get(h, [])
+            self._sentence_to_entities.update(new_s2e)
+            self._update_mention_index(new_s2e)
+            self._ner_dirty = True
+
+        # 3. Node sets for THIS batch only (delta), then embed once each.
+        entity_nodes, sentence_nodes, passage_hash_id_to_entities = (
+            self._extract_nodes_for_passages(input_hashes)
+        )
+        added_sentence_hashes = self._insert_with_dedup(
+            self.sentence_embedding_store, list(sentence_nodes)
+        )
+        added_entity_hashes = self._insert_with_dedup(
+            self.entity_embedding_store, list(entity_nodes)
+        )
+        new_entity_hash_set: Set[str] = set(added_entity_hashes)
+
+        # 4. Edges + graph augment (each once over the batch).
+        self._add_entity_to_passage_edges(
+            passage_hash_id_to_entities, restrict_passages=new_passage_hash_set
+        )
+        if self.config.adjacent_passage_edges_enabled:
+            self._add_adjacent_passage_edges_for_file_ids(set(file_ids))
+        self._augment_graph(new_passage_hash_set, new_entity_hash_set)
+
+        # 5. Defer entity resolution to flush_all() — one batch over all
+        #    pending entities (no-op when alias_edges_enabled is False).
+        if self.config.alias_edges_enabled:
+            self._er_pending_entities |= new_entity_hash_set
+            self._update_token_df(new_entity_hash_set)
+        added_alias_edges = 0
+
+        # 6. Defer backfill to the final flush.
+        if self.config.literal_backfill_enabled:
+            self._backfill_pending_new_passages |= new_passage_hash_set
+            self._backfill_pending_new_entities |= new_entity_hash_set
+
+        self._index_calls += 1
+        added_backfill_edges = self.flush_all() if final_flush else 0
+
+        logger.info(
+            "bulk_index_passages done: graph=(%d v, %d e), added passages=%d "
+            "entities=%d sentences=%d alias_edges=%d",
+            self.graph.vcount(),
+            self.graph.ecount(),
+            len(new_passage_hash_set),
+            len(new_entity_hash_set),
+            len(set(added_sentence_hashes)),
+            added_alias_edges,
+        )
+        return {
+            "passages": len(new_passage_hash_set),
+            "entities": len(new_entity_hash_set),
+            "sentences": len(set(added_sentence_hashes)),
+            "alias_edges": added_alias_edges,
+            "backfill_edges": added_backfill_edges,
+        }
+
     # ------------------------------------------------------ disambiguation
 
-    def _add_alias_edges_for_new_entities(self, new_entity_hashes: Set[str]) -> int:
-        """Run dual-query gradient ER for every newly added entity.
+    def _resolve_entities(self, pending: Set[str]) -> int:
+        """Flush-time batch entity resolution: blocking → mutual-kNN →
+        precision gate → outdegree-capped alias edges.
 
-        Two parallel queries against the entity store, merged by max
-        score per candidate:
+        ``pending`` = entity hash_ids added since the last flush. For a bulk
+        single-flush build that is every entity, so mutual-kNN is exact over
+        the whole store; in incremental use it is the per-flush delta and we
+        additionally recall each candidate's neighbourhood so the reciprocity
+        test stays exact without rescanning the store. Every stage is
+        O(|pending|·k) — no O(N²) per-document rescan.
 
-        * **Bare-surface query** — the entity's own surface embedding.
-          Since the store also holds bare-surface entries, this is a
-          true symmetric cos sim and reliably surfaces character-level
-          variants (singular/plural, abbreviation, light reordering).
-        * **Mention-context centroid query** — average of up to
-          ``config.centroid_max_mentions`` distinct sentence embeddings
-          mentioning the entity. Provides the semantic recall path.
-          Falls back to the bare-surface embedding when fewer than 2
-          mentions are available (no second signal to combine).
+        Recall and precision use DIFFERENT signal classes (record linkage):
+        embedding ANN recalls candidates; admission is decided by an IDF
+        lexical-overlap gate (for surface-similar pairs) plus a co-occurrence
+        must-not-link veto. Physical nodes are never merged (overlay); collapse
+        handlers still route through ``on_alias_accepted``.
 
-        ``alias_min_sim`` applies uniformly to the merged list. The
-        bare-surface arm is symmetric (query and store are both
-        bare-surface embeddings), so a single floor is sufficient even
-        when the centroid arm is asymmetric.
+        The gate decisions (veto / lexical / context) use a single snapshot of
+        ``passages`` taken before any acceptance. In OVERLAY mode (default) this
+        is exact — adding alias edges never moves passage membership. In COLLAPSE
+        mode (the destructive DEG-RAG-style foil tier) an early collapse can
+        redirect a passage onto a canonical, so a later pair's veto reads
+        pre-collapse membership; collapse is therefore intentionally slightly
+        more aggressive within a batch — acceptable for a baseline we compare
+        against, not our shipped overlay path.
         """
-        if not new_entity_hashes:
-            return 0
         cfg = self.config
-        # Build entity → set(mention sentences) over the WHOLE corpus
-        # (existing + just-added). The map is recomputed each call rather
-        # than maintained incrementally — at our scale (sub-10k entities)
-        # the cost is negligible and it keeps the path easy to reason about.
-        entity_text_to_mentions = self._collect_entity_mentions()
-        total_added = 0
-        for hash_id in new_entity_hashes:
-            entity_text = self.entity_embedding_store.get_text(hash_id)
-            # Composite-surface admission gate — entity-side. Surfaces
-            # that look like multiple mentions glued together (chain
-            # of products, conjunction-joined SKU codes) have a
-            # mixture-centroid embedding and would pull in cleanly-
-            # named neighbours, polluting the alias subgraph by
-            # transitivity. Skip outbound alias generation for them
-            # entirely; they remain in the graph as standalone
-            # vertices and PPR can still hit them via passage edges.
-            if is_composite_surface(entity_text):
-                continue
-            mention_sentences = entity_text_to_mentions.get(entity_text, [])
-            bare_emb = self.entity_embedding_store.get_embedding(hash_id)
-            bare_cands = gradient_topk_candidates(
-                bare_emb,
-                self.entity_embedding_store,
-                k=cfg.alias_top_k,
-                g=cfg.alias_gradient,
-                min_sim=cfg.alias_min_sim,
-                self_hash_id=hash_id,
-            )
-            centroid_emb = self._mention_centroid(mention_sentences)
-            if centroid_emb is not None:
-                centroid_cands = gradient_topk_candidates(
-                    centroid_emb,
-                    self.entity_embedding_store,
-                    k=cfg.alias_top_k,
-                    g=cfg.alias_gradient,
-                    min_sim=cfg.alias_min_sim,
-                    self_hash_id=hash_id,
+        store = self.entity_embedding_store
+        # O(1) membership per hash (``hash_id_to_idx`` is a property that COPIES
+        # the whole map — never touch it on the per-flush path).
+        pending = {h for h in pending if store.has(h)}
+        if not pending or len(store) == 0:
+            return 0
+
+        # --- Stage 0: per-batch handles (all incremental/cached — never
+        #     O(store) per flush, which would make a cadenced build O(N²)) ---
+        name_to_idx = self._name_to_vidx          # maintained in _augment_graph
+        mentions = self._mentions_cache
+        han_ngram = int(cfg.er_han_token_ngram)
+        n_surfaces = max(1, self._idf_surface_count)
+        token_df = self._token_df                  # corpus df, maintained on insert
+
+        text_of: dict[str, str] = {}
+
+        def _text(h: str) -> str:
+            t = text_of.get(h)
+            if t is None:
+                t = store.get_text(h) or ""        # O(1) per hash, no full-map copy
+                text_of[h] = t
+            return t
+
+        # --- Stage A: dual-query recall for pending + their candidates ---
+        bare: dict[str, dict[str, float]] = {}
+        ctx: dict[str, dict[str, float]] = {}
+        neighbors: dict[str, Set[str]] = {}
+
+        def _recall(h: str) -> None:
+            if h in neighbors:
+                return
+            text = _text(h)
+            # Composite surfaces (glued mention chains) have mixture-centroid
+            # embeddings that pull in clean neighbours — never an alias source
+            # or target.
+            if is_composite_surface(text):
+                bare[h], ctx[h], neighbors[h] = {}, {}, set()
+                return
+            b = {
+                c.hash_id: c.score
+                for c in gradient_topk_candidates(
+                    store.get_embedding(h), store, k=cfg.alias_top_k,
+                    g=cfg.alias_gradient, min_sim=cfg.alias_min_sim, self_hash_id=h,
                 )
-                cands = merge_topk_candidates(bare_cands, centroid_cands)
-            else:
-                cands = bare_cands
-            # Composite-surface admission gate — candidate-side.
-            # Mirror the entity-side check: never add an alias edge
-            # whose **target** is composite either, otherwise a clean
-            # entity could still be transitively pulled into a
-            # garbage-bucket cluster through a single composite hop.
-            cands = [
-                c for c in cands
-                if not is_composite_surface(
-                    self.entity_embedding_store.get_text(c.hash_id)
-                )
-            ]
-            # Reranker veto — final low-confidence gate that filters
-            # ordered-tier false merges (option 1 vs option 2 etc) the
-            # cosine-similarity path cannot tell apart. The threshold is
-            # an absolute pairwise score boundary; below it we don't
-            # build the edge. See disambig.reranker_veto for the AUC
-            # caveat (~0.66 — veto only, not identity classification).
-            if cfg.reranker_enabled and cands:
-                cands = reranker_veto(
-                    entity_text,
-                    cands,
-                    self.entity_embedding_store,
-                    threshold=cfg.reranker_threshold,
-                    instruction=cfg.reranker_instruction,
-                )
-            if not cands:
-                continue
-            # Decouple admission (boolean above) from propagation
-            # strength (continuous). One features dict per surviving
-            # candidate; w_prop is the policy's verdict on that dict.
-            features_list: List[dict] = []
-            w_prop_list: List[float] = []
-            for c in cands:
-                feats = {
-                    "cos_sim": float(c.score),
-                    "reranker_score": c.rerank_yes_prob,
-                    "admission_rule_version": ADMISSION_RULE_VERSION,
-                    "accepted_by": "gradient_er",
+                if not is_composite_surface(_text(c.hash_id))
+            }
+            c_map: dict[str, float] = {}
+            centroid = self._mention_centroid(mentions.get(text, []))
+            if centroid is not None:
+                c_map = {
+                    c.hash_id: c.score
+                    for c in gradient_topk_candidates(
+                        centroid, store, k=cfg.alias_top_k, g=cfg.alias_gradient,
+                        min_sim=cfg.alias_min_sim, self_hash_id=h,
+                    )
+                    if not is_composite_surface(_text(c.hash_id))
                 }
-                features_list.append(feats)
-                w_prop_list.append(float(propagation_policy(feats, cfg)))
-            total_added += on_alias_accepted(
+            bare[h], ctx[h] = b, c_map
+            neighbors[h] = set(b) | set(c_map)
+
+        for h in pending:
+            _recall(h)
+        for h in list(pending):
+            for c in neighbors[h]:
+                _recall(c)  # candidate neighbourhood → exact reciprocity
+
+        # Co-occurrence passage sets ONLY for involved entities (pending ∪ their
+        # candidates) — scoped to O(|involved|·deg), never an O(E) full scan.
+        involved = set(neighbors)
+        passages = self._entity_passage_sets(
+            [name_to_idx[h] for h in involved if h in name_to_idx]
+        )
+
+        # --- Stage B: mutual-kNN (reciprocal pairs touching pending) ---
+        if cfg.er_mutual_knn:
+            all_pairs = mutual_knn_pairs(neighbors)
+        else:
+            all_pairs = {
+                frozenset((h, c)) for h, nbrs in neighbors.items() for c in nbrs
+            }
+        pairs = [p for p in all_pairs if p & pending]
+
+        # --- Stage C: precision gate + co-occurrence veto ---
+        # Lexical-overlap value routes the decision (NOT a cos_bare regime
+        # split, which leaves a hole where a high-bare-cos zero-overlap
+        # abbreviation can reach neither accept path):
+        #   lex >= τ_lex          → true surface variant            → accept
+        #   0 < lex < τ_lex       → shares only template/common tokens, distinct
+        #                           head tokens = template collision → reject
+        #                           (do NOT fall through to context: template
+        #                            collisions have similar contexts too)
+        #   lex == 0              → no shared tokens (cross-surface synonym like
+        #                           US/USA, or unrelated)            → arbitrate
+        #                           by mention-context cosine
+        idf: dict[str, float] = {}
+        tokens: dict[str, list] = {}
+
+        def _tok(h: str) -> list:
+            t = tokens.get(h)
+            if t is None:
+                t = tokenize_surface(_text(h), han_ngram=han_ngram)
+                tokens[h] = t
+                for tk in t:
+                    if tk not in idf:
+                        idf[tk] = smoothed_idf(token_df.get(tk, 0), n_surfaces)
+            return t
+
+        accepted: dict[str, list] = defaultdict(list)  # src -> [(other, score, feat)]
+        veto_cap = cfg.er_max_df_for_veto
+        for pair in pairs:
+            a, b = tuple(pair)
+            if cfg.er_cooccur_veto:
+                pa, pb = passages.get(a), passages.get(b)
+                # Skip the veto for hubs (df above the absolute cap) — they are
+                # handled by mutual-kNN + outdegree cap + Leiden; this keeps the
+                # intersection work O(cap) per pair.
+                if pa and pb and len(pa) <= veto_cap and len(pb) <= veto_cap:
+                    small, large = (pa, pb) if len(pa) <= len(pb) else (pb, pa)
+                    if any(p in large for p in small):
+                        continue  # share a passage → distinct co-occurring entities
+            cos_bare = max(bare.get(a, {}).get(b, 0.0), bare.get(b, {}).get(a, 0.0))
+            cos_ctx = max(ctx.get(a, {}).get(b, 0.0), ctx.get(b, {}).get(a, 0.0))
+            score = max(cos_bare, cos_ctx)
+            lex = idf_weighted_overlap(_tok(a), _tok(b), idf)
+            if lex >= cfg.er_idf_lex_threshold:
+                feat = {
+                    "cos_sim": float(score), "cos_bare": float(cos_bare),
+                    "idf_overlap": float(lex), "arm": "lexical",
+                    "admission_rule_version": ADMISSION_RULE_VERSION,
+                    "accepted_by": "idf_mutualknn_er",
+                }
+            elif lex > 0.0:
+                continue  # partial template overlap → template collision
+            else:
+                if cos_ctx < cfg.er_ctx_synonym_threshold:
+                    continue
+                feat = {
+                    "cos_sim": float(score), "cos_ctx": float(cos_ctx),
+                    "idf_overlap": 0.0, "arm": "centroid",
+                    "admission_rule_version": ADMISSION_RULE_VERSION,
+                    "accepted_by": "idf_mutualknn_er",
+                }
+            accepted[a].append((b, score, feat))
+            accepted[b].append((a, score, feat))
+
+        # --- Stage D: outdegree cap (symmetric top-L) + build edges ---
+        # The cap bounds TOTAL per-entity alias degree (percolation bound must
+        # hold across flushes), so each entity's budget starts from its
+        # already-present incident alias edges, not from zero.
+        cap = max(1, cfg.er_max_alias_degree)
+        existing_deg = self._existing_alias_degree(set(accepted))
+        topl: dict[str, Set[str]] = {}
+        for h, lst in accepted.items():
+            budget = cap - existing_deg.get(h, 0)
+            if budget <= 0:
+                topl[h] = set()
+                continue
+            lst.sort(key=lambda t: t[1], reverse=True)
+            topl[h] = {c for c, _, _ in lst[:budget]}
+        kept: dict[frozenset, tuple] = {}
+        for h, lst in accepted.items():
+            for c, sc, feat in lst:
+                if c in topl.get(h, set()) and h in topl.get(c, set()):
+                    kept[frozenset((h, c))] = (sc, feat)
+
+        # One add_alias_edges call per source vertex, with the prebuilt
+        # name_to_idx so no per-source O(V) vertex-map rebuild.
+        by_source: dict[str, list] = defaultdict(list)
+        for pair in kept:
+            src, _ = sorted(tuple(pair))
+            by_source[src].append(pair)
+        total = 0
+        for src, keys in by_source.items():
+            cands: List[AliasCandidate] = []
+            feats: List[dict] = []
+            wprops: List[float] = []
+            for pair in keys:
+                other = next(x for x in pair if x != src)
+                sc, feat = kept[pair]
+                cands.append(AliasCandidate(other, sc))
+                feats.append(feat)
+                wprops.append(float(propagation_policy(feat, cfg)))
+            total += on_alias_accepted(
                 cfg.acceptance_handler,
                 self.graph,
-                hash_id,
+                src,
                 cands,
-                features_list,
-                w_prop_list,
+                feats,
+                wprops,
                 reverse_map=self._reverse_map,
+                name_to_idx=name_to_idx,
             )
-        return total_added
+        return total
 
-    def _collect_entity_mentions(self) -> dict:
-        """Return ``entity_text → list[unique_sentence_text]`` (cached).
+    def _entity_passage_sets(self, involved_vidx) -> dict:
+        """entity hash_id → set(passage hash_id) for the given entity vertex
+        indices, from their incident entity_passage edges.
 
-        Maintained incrementally: warmed once in __init__ from any
-        on-disk ner_results.json, then updated by ``_update_mention_index``
-        on every per-doc delta. Reading is now O(1) — the previous
-        implementation re-read the 38 MB JSON file and rebuilt the
-        reverse index from scratch on every ingest call, which was the
-        dominant fixed cost in the bulk-build profile.
-        """
-        return self._mentions_cache
+        Scoped to ``involved_vidx`` (the ER batch's pending ∪ candidate
+        entities) and read via per-vertex O(1) access, so the co-occurrence
+        veto costs O(|involved|·deg) — never an O(V+E) full-graph materialise
+        per flush."""
+        out: dict[str, set] = defaultdict(set)
+        g = self.graph
+        if "edge_type" not in g.es.attributes() or "vertex_type" not in g.vs.attributes():
+            return out
+        for vidx in involved_vidx:
+            if g.vs[vidx]["vertex_type"] != "entity":
+                continue
+            ename = g.vs[vidx]["name"]
+            for e in g.incident(vidx):
+                edge = g.es[e]
+                if edge["edge_type"] != "entity_passage":
+                    continue
+                other = edge.target if edge.source == vidx else edge.source
+                if g.vs[other]["vertex_type"] == "passage":
+                    out[ename].add(g.vs[other]["name"])
+        return out
+
+    def _existing_alias_degree(self, entity_hashes) -> dict:
+        """Count each entity's already-present incident alias edges (so the
+        outdegree cap bounds total degree across flushes). O(|hashes|·deg)."""
+        out: dict[str, int] = {}
+        g = self.graph
+        if "edge_type" not in g.es.attributes():
+            return out
+        for h in entity_hashes:
+            vidx = self._name_to_vidx.get(h)
+            if vidx is None:
+                continue
+            d = sum(1 for e in g.incident(vidx) if g.es[e]["edge_type"] == "alias")
+            if d:
+                out[h] = d
+        return out
+
+    def _save_er_config(self) -> None:
+        """Persist the ER knobs this KG was built with (audit / reproducibility).
+
+        ER is build-time only — query-time reads the derived clusters.json — so
+        this file is not consumed at runtime; it exists so a graph's alias edges
+        can be traced back to the exact gate that produced them (the intrinsic
+        transparency the maintenance / over-merge-rate reporting depends on)."""
+        cfg = self.config
+        payload = {
+            "admission_rule_version": ADMISSION_RULE_VERSION,
+            "alias_edges_enabled": cfg.alias_edges_enabled,
+            "acceptance_handler": cfg.acceptance_handler,
+            "alias_top_k": cfg.alias_top_k,
+            "alias_gradient": cfg.alias_gradient,
+            "er_recall_floor": cfg.alias_min_sim,
+            "er_mutual_knn": cfg.er_mutual_knn,
+            "er_idf_lex_threshold": cfg.er_idf_lex_threshold,
+            "er_han_token_ngram": cfg.er_han_token_ngram,
+            "er_ctx_synonym_threshold": cfg.er_ctx_synonym_threshold,
+            "er_cooccur_veto": cfg.er_cooccur_veto,
+            "er_max_df_for_veto": cfg.er_max_df_for_veto,
+            "er_max_alias_degree": cfg.er_max_alias_degree,
+            "cluster_algorithm": cfg.cluster_algorithm,
+            "cluster_leiden_resolution": cfg.cluster_leiden_resolution,
+        }
+        path = faiss_graph_dir() / "er_config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def _mention_centroid(
         self, mention_sentences: List[str]
@@ -870,6 +1246,25 @@ class LinearRAG:
                 sentence_nodes.add(sentence)
         return entity_nodes, sentence_nodes, passage_hash_id_to_entities
 
+    def _extract_nodes_for_passages(self, passage_hash_ids):
+        """Delta sibling of :meth:`_extract_nodes`: materialise node sets from
+        ONLY the given passage hashes, not the whole accumulated cache. This is
+        what keeps :meth:`bulk_index_passages` O(target) per pass instead of the
+        O(total) full-state walk ``index()`` does — the difference between O(N)
+        and O(N²) over a corpus of N single-passage documents."""
+        entity_nodes: Set[str] = set()
+        sentence_nodes: Set[str] = set()
+        passage_hash_id_to_entities = defaultdict(set)
+        for ph in passage_hash_ids:
+            for entity in self._passage_to_entities.get(ph, []):
+                entity_nodes.add(entity)
+                passage_hash_id_to_entities[ph].add(entity)
+            for sentence in self._passage_to_sentences.get(ph, []):
+                sentence_nodes.add(sentence)
+                for entity in self._sentence_to_entities.get(sentence, []):
+                    entity_nodes.add(entity)
+        return entity_nodes, sentence_nodes, passage_hash_id_to_entities
+
     def _add_entity_to_passage_edges(
         self, passage_hash_id_to_entities, restrict_passages: Set[str]
     ):
@@ -930,6 +1325,30 @@ class LinearRAG:
             nxt = items[i + 1][1]
             self.node_to_node_stats[current][nxt] = (1.0, "adjacent_passage")
 
+    def _add_adjacent_passage_edges_for_file_ids(self, file_ids: Set[str]) -> None:
+        """Bulk sibling of :meth:`_add_adjacent_passage_edges`: ONE scan over the
+        passage metadata, grouped by file_id, linking adjacent pages within each
+        — equivalent to calling the per-file version once per file_id but without
+        re-scanning the whole store per file."""
+        hash_ids = self.passage_embedding_store.hash_ids
+        meta_fid = self.passage_embedding_store.meta_column("file_id")
+        meta_pn = self.passage_embedding_store.meta_column("page_number")
+        by_file: dict = defaultdict(list)
+        for h, fid, pn in zip(hash_ids, meta_fid, meta_pn):
+            if fid not in file_ids or pn is None:
+                continue
+            try:
+                by_file[fid].append((int(pn), h))
+            except (TypeError, ValueError):
+                continue
+        for fid, rows in by_file.items():
+            rows.sort(key=lambda x: x[0])
+            for i in range(len(rows) - 1):
+                self.node_to_node_stats[rows[i][1]][rows[i + 1][1]] = (
+                    1.0,
+                    "adjacent_passage",
+                )
+
     def _augment_graph(
         self, new_passage_hashes: Set[str], new_entity_hashes: Set[str]
     ):
@@ -947,21 +1366,23 @@ class LinearRAG:
         for hash_id in new_passage_hashes:
             if hash_id in existing_names:
                 continue
-            self.graph.add_vertex(
+            v = self.graph.add_vertex(
                 name=hash_id,
                 content=passage_id_to_text.get(hash_id, ""),
                 vertex_type="passage",
             )
             existing_names.add(hash_id)
+            self._name_to_vidx[hash_id] = v.index  # keep the ER batch's map current
         for hash_id in new_entity_hashes:
             if hash_id in existing_names:
                 continue
-            self.graph.add_vertex(
+            v = self.graph.add_vertex(
                 name=hash_id,
                 content=entity_id_to_text.get(hash_id, ""),
                 vertex_type="entity",
             )
             existing_names.add(hash_id)
+            self._name_to_vidx[hash_id] = v.index
 
         # Append edges that don't exist yet, set per-edge weight + edge_type
         # without touching pre-existing edges' attributes.

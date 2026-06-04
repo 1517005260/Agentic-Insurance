@@ -266,9 +266,9 @@ def remove_file(
         # LaTeX strip) then ``split_sentences`` — otherwise sentence
         # keys here drift from the keys ingest wrote into
         # ``sentence_to_entities`` and the membership test below
-        # rejects every legitimate entry. The bug surfaced as a
-        # cascading wipe of the NER mention map on any
-        # ``remove_file`` call against an HTML-heavy corpus.
+        # rejects every legitimate entry, cascading into a wipe of the
+        # NER mention map on any ``remove_file`` call against an
+        # HTML-heavy corpus.
         from ingestion.index._sentence import split_sentences
         from ingestion.index.linear_rag.ner import preclean_for_ner
 
