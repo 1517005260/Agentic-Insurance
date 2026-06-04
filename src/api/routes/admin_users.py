@@ -47,7 +47,7 @@ router = APIRouter(
 
 
 # Process-wide lock that serializes any mutation that could affect
-# the active-admin set. The risk codex flagged: two admins each
+# the active-admin set. The risk: two admins each
 # demoting / deactivating / soft-deleting the OTHER would both pass
 # `_count_active_admins() > 1`, then both commit, leaving zero
 # admins. WAL + synchronous=NORMAL doesn't serialize the predicate;

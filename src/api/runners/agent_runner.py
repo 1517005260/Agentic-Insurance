@@ -637,13 +637,13 @@ def _project_graph_explore(
 ) -> Optional[Dict[str, Any]]:
     """Extract a canvas-shaped projection from a graph_explore envelope.
 
-    Returned shape (one of the three modes plus a no-op for non-ok
+    Returned shape (one per agent-visible mode, plus a no-op for non-ok
     envelopes):
 
-      ``{loop, mode: "neighbors", hops, seed_ids: [...], entity_ids: [...],
-         page_refs: [{file_id, page_id}], paths: [...]}``
-      ``{loop, mode: "ppr", question, seed_surfaces: [...], page_refs: [...]}``
-      ``{loop, mode: "entity_lookup", question, candidate_ids: [...]}``
+      ``{loop, mode: "ppr", question, seed_surfaces: [...], seed_ids: [...],
+         page_refs: [{file_id, page_id}]}``
+      ``{loop, mode: "chain_entity", question, focus: [...], seed_ids: [...],
+         entity_ids: [...], page_refs: [...]}``
 
     All ``*_ids`` are vertex hash_ids the frontend can pass straight to
     /graph/expand or use to highlight existing nodes on the canvas.
@@ -657,67 +657,46 @@ def _project_graph_explore(
     if not isinstance(payload, dict) or not payload.get("ok"):
         return None
     mode = payload.get("mode")
-    if mode == "neighbors":
-        seeds_resolved = payload.get("seeds_resolved") or []
-        seed_ids = [s.get("hash_id") for s in seeds_resolved if s.get("hash_id")]
-        entity_ids = [
-            e.get("hash_id")
-            for e in (payload.get("candidate_entities") or [])
-            if e.get("hash_id")
-        ]
-        page_refs = [
+
+    def _page_refs():
+        return [
             {"file_id": p.get("file_id"), "page_id": p.get("page_id")}
             for p in (payload.get("candidate_pages") or [])
             if p.get("file_id") and p.get("page_id")
         ]
-        return {
-            "loop": loop,
-            "mode": "neighbors",
-            "hops": payload.get("hops"),
-            "seed_ids": seed_ids,
-            "entity_ids": entity_ids,
-            "page_refs": page_refs,
-        }
+
+    def _seed_ids():
+        return [s.get("hash_id") for s in (payload.get("seeds") or []) if s.get("hash_id")]
+
     if mode == "ppr":
         seed_surfaces = [
             s.get("surface") for s in (payload.get("seeds") or []) if s.get("surface")
-        ]
-        # PPR mode envelope today carries seeds + candidate_pages but no
-        # entity / passage hash_ids — frontends that want to drive a
-        # /graph/expand call (RiskExploreCanvas, GraphPage agent mode)
-        # need ids. Surface seed_ids when the algorithm-layer envelope
-        # exposes them in future without breaking older callers (the
-        # field is optional on the FE side).
-        seed_ids = [
-            s.get("hash_id") for s in (payload.get("seeds") or []) if s.get("hash_id")
-        ]
-        page_refs = [
-            {"file_id": p.get("file_id"), "page_id": p.get("page_id")}
-            for p in (payload.get("candidate_pages") or [])
-            if p.get("file_id") and p.get("page_id")
         ]
         return {
             "loop": loop,
             "mode": "ppr",
             "question": payload.get("question"),
             "seed_surfaces": seed_surfaces,
-            "seed_ids": seed_ids,
-            "page_refs": page_refs,
+            "seed_ids": _seed_ids(),
+            "page_refs": _page_refs(),
         }
-    if mode == "entity_lookup":
-        # entity_lookup envelope is {surface, physical: [{hash_id, ...}]} —
-        # the agent passes a `surface` query, not a `question`, and hits land
-        # under `physical` (the disambiguator's term for "physical entity").
-        candidate_ids = [
-            c.get("hash_id")
-            for c in (payload.get("physical") or [])
-            if c.get("hash_id")
-        ]
+    if mode == "chain_entity":
+        # Bridge entities the walk traversed (path nodes) drive /graph/expand
+        # and canvas highlights; candidate_pages → page_refs for read targets.
+        entity_ids: List[str] = []
+        for p in (payload.get("paths") or []):
+            for n in (p.get("nodes") or []):
+                h = n.get("hash_id")
+                if h and h not in entity_ids:
+                    entity_ids.append(h)
         return {
             "loop": loop,
-            "mode": "entity_lookup",
-            "question": payload.get("surface"),
-            "candidate_ids": candidate_ids,
+            "mode": "chain_entity",
+            "question": payload.get("question"),
+            "focus": payload.get("focus") or [],
+            "seed_ids": _seed_ids(),
+            "entity_ids": entity_ids,
+            "page_refs": _page_refs(),
         }
     return None
 
