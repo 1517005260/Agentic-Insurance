@@ -407,10 +407,10 @@ class TableRowStore:
             # source we never dedup — two genuinely-distinct rows in
             # different tables that share text must both stay
             # enumerated. Cross-source dedup is byte-exact on the
-            # row's html string only (see the harvest loop below);
-            # an earlier bag-subset heuristic risked dropping a
-            # legitimate source whose row-text bag happened to be a
-            # subset of an earlier source.
+            # row's html string only (see the harvest loop below).
+            # Bag-subset dedup is avoided because it would drop a
+            # legitimate source whose row-text bag happens to be a
+            # subset of another source's.
             sources: List[List[Dict[str, Any]]] = []
             for tbl in (page.table_blocks or []):
                 html = tbl.get("html") or ""

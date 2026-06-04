@@ -81,7 +81,7 @@ class QwenEmbeddingClient:
         encoded with ``is_query=False`` at ingest time). Caller contract:
         every natural-language user question goes through with
         ``is_query=True``; entity-to-entity / doc-to-doc lookups stay
-        ``False``. Mismatch silently degrades top-K — see docs §11.
+        ``False``. Mismatch silently degrades top-K.
 
         Mirrors ``EmbeddingClient.encode`` byte-for-byte in shape and
         normalization so the two backends are interchangeable behind
