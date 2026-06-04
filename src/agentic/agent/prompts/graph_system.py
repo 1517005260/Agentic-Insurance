@@ -1,7 +1,8 @@
 """Graph-only agent system prompt.
 
-Tools: ``graph_explore`` (entity / passage / sentence Tri-Graph in
-multiple modes) and ``read`` (verbatim page Markdown). Per-tool detail
+Tools: ``graph_explore`` (entity / passage / sentence Tri-Graph; two
+declarative modes ``ppr`` / ``chain_entity``) and ``read`` (verbatim page
+Markdown). Per-tool detail
 lives in each tool's ``get_schema`` description — this prompt only
 states the role, the loop shape, and the answer contract.
 
@@ -25,7 +26,7 @@ GRAPH_SYSTEM_PROMPT = """\
 You answer questions over a document corpus by navigating an entity knowledge graph and reading source pages.
 
 ## Available Tools
-- graph_explore: navigate the entity graph (modes: ppr for topical queries, chain for bridges between known entities, entity_analysis for surface/cluster resolution).
+- graph_explore: navigate the entity graph. mode=ppr for a topical question ("which pages discuss X"); mode=chain_entity for a relational/multi-hop question (the system follows the relations and returns the bridge + answer pages itself) — for a comparison, put both entities in `focus`; or give `focus` alone to look up what one entity is and where it appears.
 - read: read full page Markdown by unit_ids.
 
 ## Strategy

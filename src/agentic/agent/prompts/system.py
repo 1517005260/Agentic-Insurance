@@ -31,7 +31,7 @@ TOOL_OVERVIEW = """\
 - ``semantic_search`` — paraphrased, conceptual, or cross-lingual queries.
 - ``bm25_search`` — exact terms, numbers, codes, abbreviations, proper nouns.
 - ``pattern_search`` — regex; returns which pages do and don't contain a pattern.
-- ``graph_explore`` — entity-graph retrieval (modes: ppr / chain / entity_analysis).
+- ``graph_explore`` — entity-graph retrieval (modes: ppr / chain_entity).
 - ``read`` — verbatim page Markdown by unit_ids.
 - ``code_run`` — sandboxed Python for arithmetic over verified values."""
 

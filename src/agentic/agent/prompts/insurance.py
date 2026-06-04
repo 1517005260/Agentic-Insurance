@@ -277,7 +277,7 @@ RISK_PREDICT_SYSTEM_PROMPT = """\
 未来发生理赔争议 / 拒赔 / 隐性除外触发 的风险预判。
 
 可用工具：
-- `graph_explore`：mode 取 ppr / neighbors / entity_lookup。
+- `graph_explore`：mode 取 ppr（主题检索）/ chain_entity（关系多跳 + 实体消歧）。
 - `read`：按 file_ids 或 unit_ids 取条款原文。
 
 固定推理流水线（**必须按序至少各执行一次**，否则结论无依据）：
@@ -285,13 +285,13 @@ RISK_PREDICT_SYSTEM_PROMPT = """\
    场景关键词）作为 query 投到知识图谱，envelope 含 `seeds[]`
    （surface form + sim）和 `candidate_pages[]`（file_id / page_id /
    score，按 PPR 得分排序）。
-2. **mode=neighbors** 用 PPR 返回的 `seeds[].surface`（取 top-3）+
-   top 1-2 条 `candidate_pages` 的 `<file_id>/<page_id>` 作为
-   `seeds` 参数，取一跳邻居，覆盖"客户没明说但条款会触发"的隐性
-   风险因子（等待期、地域限制、既往症、职业类别变更、运动类除外）。
+2. **mode=chain_entity** 把 PPR 返回的 `seeds[].surface`（取 top-3）作为
+   `focus`、整体风险问题作 `question`，取关系一跳邻居，覆盖"客户没明说
+   但条款会触发"的隐性风险因子（等待期、地域限制、既往症、职业类别
+   变更、运动类除外）；返回 `paths`（桥证据句）+ `candidate_pages`。
 3. **read** 对每条要写进结论的条款，按 `<file_id>/<page_id>` 取
    verbatim 原文以便 [^k] 引用。建议至少 read 2-3 条 candidate_pages
-   或 neighbors 命中的页。
+   或 chain_entity 命中的页。
 4. 综合输出最终风险报告（一次性，不再调用工具）。
 
 输出 markdown（**严格遵守此结构**）：
@@ -317,7 +317,7 @@ RISK_PREDICT_SYSTEM_PROMPT = """\
 ```
 
 严格规则：
-1. 只能引用 read 过的 passage 的 `[^k]`；mode=ppr / neighbors 返回的
+1. 只能引用 read 过的 passage 的 `[^k]`；mode=ppr / chain_entity 返回的
    passage 摘要不能直接引用——必须先 read 再 cite。
 2. 客户档案中**为空 / 未提供**的字段不要外推（"用户没说有既往症" ≠
    "用户健康"）。
