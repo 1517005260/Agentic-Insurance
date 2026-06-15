@@ -30,8 +30,9 @@ from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners._tracing import CapturingTracer
 from api.runners.events import EventBus, EventType
 from api.services.citation import CitationItem
+from api.sse import HEARTBEAT_FRAME, format_event
 from config.config_store import ConfigStore
-from config.settings import relativize_trace_dir
+from config.settings import WORKBENCH_AGENT_MAX_CONCURRENCY, relativize_trace_dir
 from tracer import Tracer
 
 
@@ -43,6 +44,28 @@ _EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset({"read", "proof_scan"})
 
 def _is_evidence(name: Optional[str]) -> bool:
     return name in _EVIDENCE_TOOL_NAMES
+
+
+# Process-wide serialization gate for workbench agent runs. All five
+# workbench endpoints share one flaky upstream relay (chat + embeddings);
+# overlapping runs hit it with parallel connections it drops under load, so
+# we cap how many agent loops run at once. Lazily built so it binds to the
+# server's running event loop (a module-import-time Semaphore can latch onto
+# the wrong loop under some test/ASGI setups). ``None`` => gating disabled.
+_agent_gate: Optional[asyncio.Semaphore] = None
+
+# While a run waits its turn behind the gate it emits nothing; send a
+# keepalive this often so a reverse proxy doesn't drop the idle SSE stream.
+_QUEUE_HEARTBEAT_S = 15.0
+
+
+def _get_agent_gate() -> Optional[asyncio.Semaphore]:
+    global _agent_gate
+    if WORKBENCH_AGENT_MAX_CONCURRENCY < 1:
+        return None
+    if _agent_gate is None:
+        _agent_gate = asyncio.Semaphore(WORKBENCH_AGENT_MAX_CONCURRENCY)
+    return _agent_gate
 
 
 async def stream_workbench_agent(
@@ -220,9 +243,48 @@ async def stream_workbench_agent(
         _schedule_future_result(loop, result_future, result_payload)
         bus.close()
 
-    loop.run_in_executor(None, run_in_thread)
-    async for chunk in bus.stream():
-        yield chunk
+    # Serial gate: only ``WORKBENCH_AGENT_MAX_CONCURRENCY`` agent loops run
+    # at once (default 1), so overlapping workbench requests queue instead
+    # of hitting the shared upstream relay with parallel connections it
+    # drops under load. We acquire as a background task and heartbeat while
+    # waiting so the SSE connection stays warm; the permit is released once
+    # the run finishes (or the client goes away mid-queue).
+    gate = _get_agent_gate()
+    acquire_task: Optional["asyncio.Task"] = None
+    acquired = gate is None
+    try:
+        if gate is not None:
+            if gate.locked():
+                # Contended — another run holds the gate. Surface a queued
+                # status, then heartbeat so a proxy doesn't drop the idle
+                # SSE stream while we wait our turn.
+                yield format_event(EventType.STATUS, {"phase": "queued", "reason": "serial_gate"})
+                acquire_task = asyncio.ensure_future(gate.acquire())
+                while not acquire_task.done():
+                    done, _ = await asyncio.wait({acquire_task}, timeout=_QUEUE_HEARTBEAT_S)
+                    if not done:
+                        yield HEARTBEAT_FRAME
+                acquire_task.result()  # re-raise if the acquire itself failed
+            else:
+                await gate.acquire()
+            acquired = True
+
+        loop.run_in_executor(None, run_in_thread)
+        async for chunk in bus.stream():
+            yield chunk
+    finally:
+        if acquire_task is not None and not acquired:
+            # Abandoned while queued — cancel the pending acquire, but if it
+            # was granted in the same tick, mark acquired so we release the
+            # permit below instead of leaking it.
+            acquire_task.cancel()
+            try:
+                await acquire_task
+                acquired = True
+            except asyncio.CancelledError:
+                pass
+        if gate is not None and acquired:
+            gate.release()
 
 
 # ---------- citation extraction (read tool envelope → CitationItem) ----------

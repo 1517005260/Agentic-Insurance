@@ -327,6 +327,15 @@ CORS_ORIGINS: list[str] = [
     if o.strip()
 ]
 
+# The insurance workbench agents (compare / recommend / claim-check / ...)
+# all drive the same upstream relay for chat + embeddings. When two runs
+# overlap, the relay sees parallel connections it drops under load
+# (RemoteDisconnected / read stalls), so the workbench layer serializes
+# agent runs through an asyncio gate sized here. 1 = strictly serial
+# (default); raise only if the upstream provider tolerates concurrency,
+# 0/negative disables the gate.
+WORKBENCH_AGENT_MAX_CONCURRENCY: int = int(_get("WORKBENCH_AGENT_MAX_CONCURRENCY") or "1")
+
 
 # -------------------------------------------------------------- tavily ----
 
@@ -461,6 +470,7 @@ __all__ = [
     "DEFAULT_ADMIN_PASSWORD",
     "DEFAULT_ADMIN_PASSWORD_IS_DEFAULT",
     "CORS_ORIGINS",
+    "WORKBENCH_AGENT_MAX_CONCURRENCY",
     "PADDLE_OCR_API_URL",
     "PADDLE_OCR_TOKEN",
     "PADDLE_OCR_MAX_PAGES_PER_BATCH",
