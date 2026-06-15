@@ -83,3 +83,4 @@ playwright-cli.json         # local playwright skill config (browserName: chromi
 .codex/                     # local codex CLI scratch
 .claude/                    # local Claude Code scratch
 docs/
+.diag/
