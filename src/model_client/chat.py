@@ -7,7 +7,10 @@ Falls back to a `default` price tuple for unknown model strings.
 import json
 import logging
 import threading
+import time
 from typing import Any, Dict, Iterator, List, Optional
+
+import requests
 
 from config.shared import shared_tiktoken_encoder
 
@@ -27,6 +30,16 @@ class StreamProtocolError(RuntimeError):
 from config.http import make_retry_session
 from config.shared import shared_session
 from config.settings import CHAT_API_BASE_URL, CHAT_API_KEY, CHAT_MODEL
+
+
+# Transient-connection-drop retry for the chat path. The shared session runs
+# ``read_retries=0`` to cap wall-clock on a *hung* relay (ReadTimeout); that
+# same setting also suppresses retries on *instant* connection drops
+# (RemoteDisconnected / reset → ``requests.ConnectionError``), which cost ~0
+# wall-clock and almost always recover on a fresh connection. These knobs
+# re-enable retries for that case only.
+_DEFAULT_CONN_RETRIES = 2
+_DEFAULT_CONN_BACKOFF = 0.5
 
 
 class LLMClient:
@@ -75,6 +88,8 @@ class LLMClient:
         max_tokens: int = 16384,
         reasoning_effort: Optional[str] = None,
         disable_thinking: bool = True,
+        conn_retries: int = _DEFAULT_CONN_RETRIES,
+        conn_backoff: float = _DEFAULT_CONN_BACKOFF,
     ):
         self.model = model or CHAT_MODEL or "gpt-4o-mini"
         self.api_key = api_key or CHAT_API_KEY
@@ -89,6 +104,8 @@ class LLMClient:
         # opt out at the API boundary; callers that want reasoning
         # (proof-style audits) can pass ``disable_thinking=False``.
         self.disable_thinking = disable_thinking
+        self.conn_retries = conn_retries
+        self.conn_backoff = conn_backoff
 
         if not self.api_key:
             raise ValueError(
@@ -155,6 +172,33 @@ class LLMClient:
         )
         return round(usd_cost, 6)
 
+    def _post_with_conn_retry(self, **post_kwargs: Any) -> requests.Response:
+        """POST via the shared session, retrying only transient connection
+        drops (RemoteDisconnected / reset → ``requests.ConnectionError``).
+
+        ``read_retries=0`` on the session caps wall-clock on a hung relay but
+        also kills retries on instant drops; yunwu.ai-style relays close
+        pooled keep-alive connections often, so without this a single drop on
+        the final-answer call sinks the whole agent run. ``ReadTimeout`` and
+        ``ConnectTimeout`` (both ``Timeout`` subclasses of ``ConnectionError``)
+        are deliberately NOT retried here — the former would multiply the
+        wall-clock cap, the latter has already exhausted the urllib3 connect
+        retries and means the host is unreachable, not flaky.
+        """
+        attempts = self.conn_retries + 1
+        for i in range(attempts):
+            try:
+                return self._session.post(**post_kwargs)
+            except requests.exceptions.ConnectionError as e:
+                if isinstance(e, requests.exceptions.Timeout) or i == attempts - 1:
+                    raise
+                backoff = self.conn_backoff * (i + 1)
+                logger.warning(
+                    "chat POST connection drop (%s); retry %d/%d after %.1fs",
+                    type(e).__name__, i + 1, self.conn_retries, backoff,
+                )
+                time.sleep(backoff)
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -189,8 +233,8 @@ class LLMClient:
         # See preprocess() for the per-call timeout fallback that turns
         # a ReadTimeout into a usable {rewrite=query} so the pipeline
         # still produces an answer instead of dying on the first hang.
-        response = self._session.post(
-            url, headers=headers, json=payload, timeout=(10, 120),
+        response = self._post_with_conn_retry(
+            url=url, headers=headers, json=payload, timeout=(10, 120),
         )
         response.raise_for_status()
         result = response.json()
@@ -280,8 +324,8 @@ class LLMClient:
         # provider stalls between SSE chunks, ``iter_lines`` raises
         # rather than waiting out a full 5-min wall on a single-int
         # timeout.
-        with self._session.post(
-            url, headers=headers, json=payload, timeout=(10, 120), stream=True
+        with self._post_with_conn_retry(
+            url=url, headers=headers, json=payload, timeout=(10, 120), stream=True
         ) as response:
             response.raise_for_status()
             # Some relays send ``Content-Type: text/event-stream`` without an
