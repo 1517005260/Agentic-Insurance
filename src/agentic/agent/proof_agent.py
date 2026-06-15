@@ -67,7 +67,7 @@ class ProofAgent:
         inventory_store,
         *,
         system_prompt: Optional[str] = None,
-        max_loops: int = 16,
+        max_loops: int = 24,
         max_token_budget: int = 128_000,
         verbose: bool = False,
     ) -> None:

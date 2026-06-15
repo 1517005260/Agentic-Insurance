@@ -1,10 +1,9 @@
 """Regression tests for the entity normalisation + chain-split pipeline.
 
-The bracket-repair and chain-split additions came from inspecting the
-PaddleOCR'd 万通 product catalog where spaCy was producing fragments
-like ``"万通危疾加护保("`` and chained spans like
+Bracket-repair and chain-split handle OCR fragments like
+``"万通危疾加护保("`` and chained spans like
 ``"… (PHPS)、… (PHPJ)、… (BIS)"``. These tests pin the expected
-behaviour so a future tweak to the regex set or normalisation order
+behaviour so a tweak to the regex set or normalisation order
 can't silently regress the entity universe.
 """
 from ingestion.index.linear_rag.disambig import (
@@ -83,7 +82,7 @@ class TestSplitCatalogMentions:
 
     # ---- regression: conjunction words MUST NOT split ----
 
-    def test_conjunction_huo_does_NOT_split_anymore(self):
+    def test_conjunction_huo_does_NOT_split(self):
         # ``或`` is intentionally excluded from the split set:
         # conjunctions are real words that can appear inside legitimate
         # organisation names. The composite surface stays whole and is
@@ -122,8 +121,7 @@ class TestNormalizeForHashRegressions:
     entity instead of three near-duplicates)."""
 
     def test_dangling_open_collapses_to_canonical(self):
-        # All three of these were distinct entities in the live graph
-        # before the fix. After the fix they share one canonical key.
+        # These three surface forms must collapse to one canonical key.
         a = normalize_for_hash("万通危疾加护保(")
         b = normalize_for_hash("万通危疾加护保")
         assert a == b == "万通危疾加护保"
@@ -153,8 +151,8 @@ class TestSurfaceQualityScore:
     matter; what matters is the **ordering** between common shapes."""
 
     def test_clean_short_beats_chained_long(self):
-        # The exact bug we saw in clusters.json c_0000 — a multi-product
-        # chain was picked as canonical over the clean family name.
+        # A multi-product chain must not outrank the clean family name
+        # as the canonical surface.
         clean = "万通危疾加护保"
         chain = "万通危疾加护保(优越版)(phps)、万通危疾爱护保(phpj)、富饶万家储蓄保险计划(bis)"
         assert surface_quality_score(clean) > surface_quality_score(chain)
@@ -211,8 +209,7 @@ class TestComputeClustersCanonical:
     def test_picks_cleanest_surface_over_longest(self):
         from ingestion.index.linear_rag.disambig import compute_clusters
 
-        # Reproduces clusters.json c_0000 — clean family name should
-        # win over the long composite chain.
+        # The clean family name should win over the long composite chain.
         g = _alias_cluster_with_members([
             "万通危疾加护保",
             "万通危疾加护保(优越版)(phps)、万通危疾爱护保(phpj)、富饶万家储蓄保险计划(bis)",
@@ -260,8 +257,8 @@ class TestComputeClustersCanonical:
 
 class TestIsCompositeSurface:
     """Admission gate that excludes multi-mention spans from alias-edge
-    generation. Critical for preventing the garbage-bucket cluster
-    pollution we saw in clusters.json c_0000."""
+    generation. Critical for preventing garbage-bucket cluster
+    pollution."""
 
     # ---- positives: surfaces that MUST be flagged composite ----
 

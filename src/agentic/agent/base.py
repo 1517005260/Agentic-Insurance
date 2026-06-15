@@ -13,6 +13,12 @@ Budget exhaustion always produces a final-answer attempt rather than
 raising, so callers always get a result + trajectory even on stuck
 runs.
 
+Defaults (``max_loops=24`` / ``max_token_budget=128_000``) are generous
+so the agent can explore fully before being force-answered; the factory
+builders set the same. Small-context generators (e.g. vLLM-served
+Qwen3-8B, 40 960 ctx) must override ``max_token_budget`` down (~20 000)
+AND lower ``LLMClient(max_tokens=...)`` in lockstep at the call site.
+
 Pre-warm:
   Some tools (notably ``graph_explore`` via GLiNER NER) absorb a 10–15 s
   one-time load on first use. :meth:`warm_up` walks every registered
@@ -44,7 +50,7 @@ class BaseAgent:
         llm_client: LLMClient,
         tools: ToolRegistry,
         system_prompt: str = None,
-        max_loops: int = 10,
+        max_loops: int = 24,
         max_token_budget: int = 128000,
         verbose: bool = False,
     ):
@@ -104,6 +110,7 @@ class BaseAgent:
         total_cost: float,
         reason: str,
         session: Optional[TraceSession] = None,
+        final_budget: Optional[int] = None,
     ) -> tuple:
         # Force-final must succeed even when the in-loop chat call has
         # been failing (vLLM input-cap rejections, model context overflow,
@@ -118,17 +125,27 @@ class BaseAgent:
         # 2. Use a tighter ``max_tokens`` for the final response so the
         #    server has more input room.
         trim_stats: Dict[str, int] = {}
-        trimmed = self._trim_messages_for_final(messages, trim_stats=trim_stats)
+        # Let the final call see the full gathered context up to the agent's
+        # token budget (which is sized to the model's window); only trim if
+        # the transcript actually exceeds it. Evidence (read pages) is shed
+        # last — see _trim_messages_for_final.
+        trimmed = self._trim_messages_for_final(
+            messages,
+            target_tokens=final_budget if final_budget is not None else self.max_token_budget,
+            trim_stats=trim_stats,
+        )
         force_prompt = (
-            "You have reached the budget limit. Stop calling tools.\n\n"
-            "Based ONLY on the tool results above, give your final answer "
-            "in 1-2 sentences (or a single named entity / number for "
-            "factoid questions). Quote the most specific span verbatim "
-            "where possible.\n\n"
-            "After your answer, output one final line exactly:\n"
+            "You have reached the budget limit. Stop calling tools and "
+            "answer now from the tool results above.\n\n"
+            "Lead with the answer first — the shortest exact span / named "
+            "entity / number that resolves the question — then one short "
+            "line of support, quoting the most specific span verbatim. "
+            "Commit to the single best-supported answer even if the "
+            "evidence is only partial; do not restate the question.\n\n"
+            "End with one final line exactly:\n"
             "ANSWER: <shortest exact answer span verbatim, no extra words>\n\n"
-            "If the gathered evidence does not contain the answer, "
-            "write ANSWER: unanswerable."
+            "Write ANSWER: unanswerable ONLY if no tool result above "
+            "addresses the question at all."
         )
         trimmed.append({"role": "user", "content": force_prompt})
 
@@ -221,13 +238,28 @@ class BaseAgent:
                 blocks.append([msg])
                 i += 1
 
-        # Drop oldest blocks until budget fits; keep at least one.
+        # Evidence-preserving drop: shed blocks that carry no read-page
+        # evidence (graph / search "chatter") oldest-first; only sacrifice
+        # a block that contains a ``read`` result when nothing else is left
+        # to drop. Keeps the gold the agent actually read in the
+        # final-answer context (recency-blind dropping would discard a page
+        # read early in a long multi-hop chain).
+        def _has_read_evidence(blk: List[Dict[str, Any]]) -> bool:
+            asst = blk[0]
+            return any(
+                (tc.get("function") or {}).get("name") == "read"
+                for tc in (asst.get("tool_calls") or [])
+            )
+
         current = self._calculate_message_tokens(
             head + [m for blk in blocks for m in blk], system_prompt=sys_prompt
         )
         blocks_dropped = 0
         while current > target_tokens and len(blocks) > 1:
-            blocks.pop(0)
+            drop_idx = next(
+                (k for k, b in enumerate(blocks) if not _has_read_evidence(b)), 0
+            )
+            blocks.pop(drop_idx)
             blocks_dropped += 1
             current = self._calculate_message_tokens(
                 head + [m for blk in blocks for m in blk], system_prompt=sys_prompt
@@ -372,7 +404,7 @@ class BaseAgent:
         early_exit_reason: Optional[str] = None
         final_answer: str = ""
 
-        # While-loop (was for-loop) so tool-validation-error iterations
+        # Decoupled loop counter so tool-validation-error iterations
         # can be "free" — loop_count only advances when the iteration
         # actually used the LLM productively. raw_iter is the hard
         # outer cap (effective_max_loops + MAX_VALIDATION_FREEBIES).
@@ -408,7 +440,8 @@ class BaseAgent:
                     )
                 emit("status", {"phase": "force_final", "reason": "token_budget_exceeded"})
                 final_answer, total_cost = self._force_final_answer(
-                    messages, context, total_cost, "Token budget exceeded", session=session
+                    messages, context, total_cost, "Token budget exceeded",
+                    session=session, final_budget=effective_max_tokens,
                 )
                 early_exit_reason = "token_budget_exceeded"
                 break
@@ -434,8 +467,7 @@ class BaseAgent:
                 # The vLLM input cap (max_model_len − max_tokens) is the
                 # most common cause: a long tool result pushes the next
                 # request past the cap and the server 400s. Rather than
-                # returning empty (the historical bug — 263/1950 v6
-                # empties were from this path), fall through to
+                # returning empty, fall through to
                 # ``_force_final_answer`` which trims the transcript and
                 # asks the model to answer from what's already in
                 # context. The original exception is preserved in the
@@ -454,7 +486,7 @@ class BaseAgent:
                 final_answer, total_cost = self._force_final_answer(
                     messages, context, total_cost,
                     f"LLM error: {type(e).__name__}; answer from context already gathered",
-                    session=session,
+                    session=session, final_budget=effective_max_tokens,
                 )
                 early_exit_reason = "llm_error"
                 break
@@ -592,7 +624,8 @@ class BaseAgent:
                 print(f"Max loops reached ({effective_max_loops}), forcing answer...")
             emit("status", {"phase": "force_final", "reason": "max_loops_exceeded"})
             final_answer, total_cost = self._force_final_answer(
-                messages, context, total_cost, "Maximum loops exceeded", session=session
+                messages, context, total_cost, "Maximum loops exceeded",
+                session=session, final_budget=effective_max_tokens,
             )
             early_exit_reason = "max_loops_exceeded"
 

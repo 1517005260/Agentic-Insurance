@@ -411,7 +411,7 @@ def parse_and_index(
     )
     # Restore the wrapper-level total_seconds and source so existing
     # callers that printed ``result.total_seconds`` / ``result.source``
-    # see the same shape they did before the refactor.
+    # see the expected shape.
     return PipelineResult(
         parse=result.parse,
         pages=result.pages,

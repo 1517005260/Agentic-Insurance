@@ -295,7 +295,7 @@ async def test_materialize_reflects_patch(app_harness):
 
         # base / graph stay at their defaults (we only patched proof).
         base_kw = app.state.config.materialize_agent_kwargs("base")
-        assert base_kw["max_loops"] == 12
+        assert base_kw["max_loops"] == 24
 
 
 async def test_materialize_rag_config_preserves_non_admin_fields(app_harness):

@@ -224,8 +224,8 @@ class LinearRAGConfig:
 
     # Propagation policy. Decouples per-edge audit features
     # (cos_sim / reranker_score) from the PPR-propagation weight.
-    # ``cos`` matches the historical ``weight = cos_sim`` behaviour,
-    # so the default is bit-stable with pre-v0.5 ingest.
+    # ``cos`` uses the per-edge ``cos_sim`` directly as the propagation
+    # weight (the default).
     alias_propagation_policy: str = "cos"
     alias_prop_const: float = 1.0
     alias_prop_lo: float = 0.7

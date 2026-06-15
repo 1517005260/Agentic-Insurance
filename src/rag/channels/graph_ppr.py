@@ -217,8 +217,8 @@ class GraphPPRChannel(BaseChannel):
         #     (entity_hash, edge_weight), sorted desc. Used to surface
         #     "which entities/clusters dominate this page" per
         #     candidate page returned by PPR (provenance).
-        # Building both once costs O(E_entity_passage) ≈ 560 k iterations
-        # on v6; in-memory dicts then serve agent helpers in O(1).
+        # Building both once costs O(E_entity_passage); in-memory dicts
+        # then serve agent helpers in O(1).
         self._entity_passage_degree: Optional[Dict[str, float]] = None
         self._passage_entities: Optional[Dict[str, List[Tuple[str, float]]]] = None
 
@@ -597,8 +597,8 @@ class GraphPPRChannel(BaseChannel):
         graph-edge scan.  Used by agent-facing helpers (cluster top
         surface ranking, page-level provenance, cluster_inspect).
 
-        Cost: single O(E) walk over the entity_passage edges (~560 k
-        on v6). Dictionaries then serve agent calls in O(1).
+        Cost: single O(E) walk over the entity_passage edges.
+        Dictionaries then serve agent calls in O(1).
         """
         if self._entity_passage_degree is not None:
             return

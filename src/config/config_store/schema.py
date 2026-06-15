@@ -47,32 +47,39 @@ _RAG_DEFAULTS = RAGConfig()
 # ----------------------------- agent factory defaults (mirrored, see note above)
 
 # Mirror the kwarg defaults from ``agentic.agent.factory``:
-# * ``build_default_agent``: max_loops=12, max_token_budget=128_000
-# * ``build_proof_agent``:   max_loops=16, max_token_budget=128_000
-# * ``build_graph_agent``:   max_loops=16, max_token_budget=64_000
+# * ``build_default_agent``: max_loops=24, max_token_budget=128_000
+# * ``build_proof_agent``:   max_loops=24, max_token_budget=128_000
+# * ``build_graph_agent``:   max_loops=24, max_token_budget=128_000
+# * ``build_web_agent``:     max_loops=24, max_token_budget=128_000
 #
 # We use the factory defaults rather than the BaseAgent / ProofAgent
 # constructor defaults because the lifespan calls the factory, so the
 # factory ints are the values that actually take effect today.
-_BASE_AGENT_DEFAULT_MAX_LOOPS = 12
+#
+# Uniform generous caps: give every agent room to fully explore /
+# navigate (multi-hop, deep proofs) up to a large-context reader's
+# window, instead of terminating early against a tight loop / token
+# cap. A tight budget made the graph agent choke on deep questions
+# (force-answer on a half-built chain → abstain); widening it recovered
+# accuracy. The caps now exist only as a runaway backstop; the token
+# budget (≈ the model window) is the real guard.
+_BASE_AGENT_DEFAULT_MAX_LOOPS = 24
 _BASE_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
-_PROOF_AGENT_DEFAULT_MAX_LOOPS = 16
+_PROOF_AGENT_DEFAULT_MAX_LOOPS = 24
 _PROOF_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
-_GRAPH_AGENT_DEFAULT_MAX_LOOPS = 16
-# 64 k sized for large-context generators (Claude / GPT-5-class /
-# deepseek-v4-flash) so navigation rarely terminates against the token
-# cap rather than on a real stop condition. When the deployment runs
-# against a smaller-context generator like vLLM-served Qwen3-8B (40960
-# context − 16384 reserved output ≈ 24576 effective input), lower this
-# to ~20 000 via admin override.
-_GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 64_000
-# The web agent has only two tools (web_search / web_fetch); each
-# search returns ~5 hits and each fetch returns up to 8 KB of cleaned
-# text, so the loop converges fast — 8 loops is plenty and 64 K
-# tokens covers a typical multi-source synthesis without going past
-# the LLM's effective context.
-_WEB_AGENT_DEFAULT_MAX_LOOPS = 8
-_WEB_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 64_000
+_GRAPH_AGENT_DEFAULT_MAX_LOOPS = 24
+# 128 k = a large-context generator's window (Claude / GPT-5-class /
+# deepseek-v4-flash) so navigation terminates on a real stop condition,
+# not the token cap. When the deployment runs against a smaller-context
+# generator like vLLM-served Qwen3-8B (40960 context − 16384 reserved
+# output ≈ 24576 effective input), lower this to ~20 000 via admin
+# override.
+_GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
+# The web agent hits the Tavily API every loop and converges in 2-4
+# turns, so its caps are kept modest (unlike the corpus agents) to avoid
+# runaway external-API cost — large caps give no accuracy benefit here.
+_WEB_AGENT_DEFAULT_MAX_LOOPS = 12
+_WEB_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 96_000
 
 
 # --------------------------------------------------- citation preview default
@@ -164,7 +171,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         type="int",
         default=_GRAPH_AGENT_DEFAULT_MAX_LOOPS,
         min=4,
-        max=24,
+        max=32,
         group="agent.graph",
         description="Hard ceiling on tool-calling loops for the graph agent.",
     ),
@@ -173,11 +180,11 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         type="int",
         default=_GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET,
         min=12_000,
-        max=128_000,
+        max=256_000,
         group="agent.graph",
         description=(
             "Token-budget force-final threshold for the graph agent. "
-            "Default 64 000 sized for large-context generators. Lower "
+            "Default 128 000 sized for large-context generators. Lower "
             "to ~20 000 when running against vLLM-served Qwen3-8B "
             "(40960 context − 16384 reserved output ≈ 24576 effective "
             "input − 4 k headroom)."
@@ -514,8 +521,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         group="linear_rag",
         description=(
             "Per-edge propagation-weight policy. 'cos' "
-            "(default) reproduces the historical weight = cos_sim "
-            "behaviour. 'const' / 'clipped_cos' / 'threshold_gate' / "
+            "(default) uses the per-edge cos_sim as the propagation "
+            "weight. 'const' / 'clipped_cos' / 'threshold_gate' / "
             "'calibrated' decouple audit features from propagation "
             "strength so PPR mass control can be tuned without "
             "modifying admission."
@@ -599,7 +606,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         type="int",
         default=_WEB_AGENT_DEFAULT_MAX_LOOPS,
         min=4,
-        max=24,
+        max=32,
         group="agent.web",
         description="Hard ceiling on tool-calling loops for the web agent.",
     ),
@@ -608,7 +615,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         type="int",
         default=_WEB_AGENT_DEFAULT_MAX_TOKEN_BUDGET,
         min=32_000,
-        max=128_000,
+        max=256_000,
         group="agent.web",
         description="Token-budget force-final threshold for the web agent.",
     ),

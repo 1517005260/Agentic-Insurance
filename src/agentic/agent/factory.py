@@ -71,7 +71,7 @@ def build_default_agent(
     graph_channel: Optional[GraphPPRChannel] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 12,
+    max_loops: int = 24,
     max_token_budget: int = 128_000,
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
@@ -81,6 +81,12 @@ def build_default_agent(
     Any kwarg may be supplied to swap a backend (e.g. point to a
     different ``page_assets_dir`` for tests). Defaults pull from
     ``config.settings``.
+
+    ``max_loops=24`` / ``max_token_budget=128_000`` are deliberately
+    generous so the agent can fully explore before being force-answered.
+    Small-context generators (e.g. vLLM-served Qwen3-8B, 40 960 ctx):
+    override ``max_token_budget`` down to ~20 000 AND lower
+    ``LLMClient(max_tokens=...)`` in lockstep at the call site.
     """
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)
@@ -141,7 +147,7 @@ def build_proof_agent(
     graph_channel: Optional[GraphPPRChannel] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 16,
+    max_loops: int = 24,
     max_token_budget: int = 128_000,
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
@@ -211,8 +217,8 @@ def build_graph_agent(
     graph_channel: Optional[GraphPPRChannel] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 16,
-    max_token_budget: int = 64_000,
+    max_loops: int = 24,
+    max_token_budget: int = 128_000,
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> BaseAgent:
@@ -224,9 +230,12 @@ def build_graph_agent(
     Markdown so the LLM can quote and cite verbatim — this mirrors
     upstream LinearRAG's "PPR retrieve → reader" split.
 
-    ``max_loops=16`` / ``max_token_budget=64_000``: sized so navigation
-    rarely terminates against the loop or token cap rather than on a
-    real stop condition. Override per call site when running against a
+    ``max_loops=24`` / ``max_token_budget=128_000``: give navigation room
+    to fully traverse the graph on deep (3–4-hop) questions instead of
+    terminating against the loop / token cap mid-chain. A tight budget
+    starved deep-hop reasoning — the loop hit the cap, force-answered on a
+    half-built chain, and abstained; widening to a capable reader's
+    context restores deep-hop accuracy. Override DOWN per call site for a
     model whose context is smaller
     (e.g. a vLLM-served Qwen3-8B at 40 960 context − 16 384 reserved
     for output = 24 576 effective input — there ``max_token_budget``
@@ -273,8 +282,8 @@ def build_regex_agent(
     inventory: Optional[InventoryStore] = None,
     page_assets_dir: Optional[Path] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 14,
-    max_token_budget: int = 64_000,
+    max_loops: int = 24,
+    max_token_budget: int = 128_000,
     verbose: bool = False,
 ) -> BaseAgent:
     """Build a BaseAgent that locates evidence by regex alone.
@@ -285,9 +294,11 @@ def build_regex_agent(
     locator is the regex it writes, so prompt-engineering quality of
     those regexes is the dominant determinant of recall.
 
-    Defaults mirror :func:`build_graph_agent` (``max_loops=14``,
-    ``max_token_budget=64k``) so the comparison against the graph
-    baseline is at iso-budget.
+    Defaults mirror :func:`build_graph_agent` (``max_loops=24``,
+    ``max_token_budget=128k``) so the comparison against the graph
+    baseline is at iso-budget. Small-context generators (e.g. Qwen3-8B,
+    40 960 ctx): override ``max_token_budget`` down to ~20 000 and lower
+    ``LLMClient(max_tokens=...)`` in lockstep — same as the graph agent.
     """
     page_store = page_store or PageStore(page_assets_dir or page_assets_root())
     inventory = inventory or InventoryStore(page_store=page_store)
@@ -316,8 +327,8 @@ def build_web_agent(
     tavily_client: Optional["TavilyClient"] = None,
     config_store: Optional["ConfigStore"] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 8,
-    max_token_budget: int = 64_000,
+    max_loops: int = 12,
+    max_token_budget: int = 96_000,
     verbose: bool = False,
 ) -> BaseAgent:
     """Build a BaseAgent specialised for public-web research.
@@ -333,9 +344,13 @@ def build_web_agent(
     those rules visible in every turn. Splitting at factory level
     rather than at runner level keeps each agent's contract local.
 
-    Defaults match the graph agent: 8 loops / 64 k tokens. Tavily +
-    a single fetch returns enough text to answer most questions in
-    2-4 turns; the budget mostly guards against pathological loops.
+    Caps kept modest (12 loops / 96 k) on purpose: each loop hits the
+    Tavily web API, and a search + a single fetch answers most questions
+    in 2-4 turns — large caps would only risk runaway external-API cost
+    with no accuracy benefit (unlike the corpus agents, which need the
+    room to traverse the graph). Small-context generators (e.g. Qwen3-8B,
+    40 960 ctx): override ``max_token_budget`` down to ~20 000 and lower
+    ``LLMClient(max_tokens=...)`` in lockstep at the call site.
     """
     from model_client.web_search import TavilyClient
 
