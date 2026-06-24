@@ -246,7 +246,7 @@ def rewrite_regex_call(
 _PREPROCESS_PREVIEW_CHARS = 240
 
 # Wall-clock budget for the *parallel* HyDE + rewrite phase. The
-# upstream LLM client now uses a (10s, 120s) connect/read timeout,
+# upstream LLM client uses a (10s, 120s) connect/read timeout,
 # but a stalled relay that ships a single keep-alive byte every 119s
 # would still drag this stage out indefinitely. When the wall fires
 # we cancel any in-flight future, emit synthetic ``done`` events with

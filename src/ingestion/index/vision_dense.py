@@ -105,8 +105,8 @@ class VisionDenseIndexBuilder(IndexBuilder):
                 "image_path": [str(p) for p in new_paths],
             },
         )
-        # EmbeddingStore.add() no longer saves implicitly; persist now
-        # so the per-file builder contract holds.
+        # EmbeddingStore.add() does not save implicitly; persist
+        # explicitly so the per-file builder contract holds.
         store.save()
 
         return IndexBuildResult(

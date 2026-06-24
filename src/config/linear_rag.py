@@ -118,10 +118,10 @@ class LinearRAGConfig:
     adjacent_passage_edges_enabled: bool = True
 
     # Alias-edge RECALL stage (blocking) — dual-query top-k (bare-surface +
-    # mention centroid). Precision is NO LONGER decided here: it moves to the
-    # Stage-C gate below (IDF lexical overlap + co-occurrence veto). The recall
-    # floor is loosened from the old 0.85 so more true variants survive for the
-    # gate to judge; the gradient cutoff still trims the unrelated long tail.
+    # mention centroid). Precision is decided downstream at the Stage-C gate
+    # (IDF lexical overlap + co-occurrence veto), not here. The recall floor
+    # stays loose so more true variants survive for the gate to judge; the
+    # gradient cutoff trims the unrelated long tail.
     alias_top_k: int = 20
     alias_gradient: float = 0.3
     alias_min_sim: float = 0.80  # = er_recall_floor

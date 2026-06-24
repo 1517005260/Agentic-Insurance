@@ -242,11 +242,11 @@ def _rewrite_search_query(
     raw = raw.splitlines()[0].strip()
     if not raw:
         return query, "empty after one-line"
-    # Over-long output → treat as failure and fall back to original.
-    # Earlier we silently truncated to 400 chars, but that risks
-    # sending a chunk of explanatory prose (or worse, prompt-injection
-    # leakage) to the search engine. Failing soft preserves the
-    # user's intent at the cost of one missed coreference resolution.
+    # Over-long output → treat as failure and fall back to original,
+    # rather than truncating to a char cap: truncation risks sending a
+    # chunk of explanatory prose (or worse, prompt-injection leakage) to
+    # the search engine. Failing soft preserves the user's intent at the
+    # cost of one missed coreference resolution.
     if len(raw) > _REWRITE_MAX_QUERY_CHARS:
         return query, f"rewrite too long ({len(raw)}>{_REWRITE_MAX_QUERY_CHARS})"
     return raw, None

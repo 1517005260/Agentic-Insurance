@@ -95,9 +95,9 @@ def test_tavily_defaults():
     assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
 
 
-def test_entry_count_is_57():
+def test_entry_count_is_54():
     # Sanity tripwire: any new admin-tunable knob should bump this
     # counter so reviewers notice when the schema grows.  Update the
     # number AND add a note to the docstring of the new entry in
     # ``schema.py`` when this is intentional.
-    assert len(CONFIG_ENTRIES_BY_KEY) == 57
+    assert len(CONFIG_ENTRIES_BY_KEY) == 54

@@ -114,10 +114,10 @@ class EmbeddingStore:
         self._gen = 0
         self._cache: Dict[str, tuple] = {}
         # Dirty flag: True iff there are in-memory writes not yet persisted
-        # to disk. ``add()`` no longer saves implicitly (bulk-build writes
-        # were the dominant per-doc I/O cost: ~735 MB faiss+parquet rewrite
-        # per append × O(N) docs = O(N²) disk traffic). Caller is now
-        # responsible for calling ``save()`` on a cadence (the ingest
+        # to disk. ``add()`` does not save implicitly — an implicit save
+        # makes bulk-build writes the dominant per-doc I/O cost (~735 MB
+        # faiss+parquet rewrite per append × O(N) docs = O(N²) disk
+        # traffic). The caller drives ``save()`` on a cadence (the ingest
         # builder's flush hook). Initially False — a freshly-loaded store
         # is byte-identical to disk.
         self._dirty: bool = False

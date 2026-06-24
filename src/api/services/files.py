@@ -473,8 +473,8 @@ async def run_parse_index(
     # ``replay_buffered=True`` makes the bus multi-consumer with full
     # event replay on subscribe — required so a "minimized" upload
     # dialog can be reopened later via the FilesPage chip and still
-    # see the stage timeline. Disconnects no longer flip is_closed,
-    # so the bg task keeps running regardless of who is watching.
+    # see the stage timeline. Disconnects don't flip is_closed, so the
+    # bg task keeps running regardless of who is watching.
     bus = EventBus(loop=loop, replay_buffered=True)
     register_bus(job_id, bus)
     bus_closed = False
@@ -697,8 +697,8 @@ async def run_reingest(
     # ``replay_buffered=True`` makes the bus multi-consumer with full
     # event replay on subscribe — required so a "minimized" upload
     # dialog can be reopened later via the FilesPage chip and still
-    # see the stage timeline. Disconnects no longer flip is_closed,
-    # so the bg task keeps running regardless of who is watching.
+    # see the stage timeline. Disconnects don't flip is_closed, so the
+    # bg task keeps running regardless of who is watching.
     bus = EventBus(loop=loop, replay_buffered=True)
     register_bus(job_id, bus)
     bus_closed = False
