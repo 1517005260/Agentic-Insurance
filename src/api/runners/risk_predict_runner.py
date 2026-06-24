@@ -10,7 +10,7 @@ triple. The frontend renders the markdown answer + a 3-layer Sankey
 
 Why a wrapper instead of a fork of the agent runner:
 
-* GraphAgent already has the right tool budget (graph_explore + read);
+* GraphAgent already has the right tool budget (graph_ppr / graph_chain / entity_inspect + read);
   duplicating its loop just to inject a different system prompt would
   force every loop / token-budget tweak in two places.
 * The Sankey data model is independent of agent loop telemetry — it is
@@ -75,7 +75,7 @@ async def stream_risk_predict(
       2. Project the PPR result into the Sankey ``risk_subgraph`` shape.
       3. Drive :func:`stream_agent` with ``system_prompt_override`` set
          to ``prompt.risk_predict`` and a structured query carrying the
-         file_id + profile so the GraphAgent's first ``graph_explore``
+         file_id + profile so the GraphAgent's first graph-tool
          call has enough context to mirror the same neighborhood.
       4. Pass every SSE frame through unchanged except the final
          ``final`` event, whose data dict is augmented with

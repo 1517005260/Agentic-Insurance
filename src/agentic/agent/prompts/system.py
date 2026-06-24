@@ -31,7 +31,9 @@ TOOL_OVERVIEW = """\
 - ``semantic_search`` — paraphrased, conceptual, or cross-lingual queries.
 - ``bm25_search`` — exact terms, numbers, codes, abbreviations, proper nouns.
 - ``pattern_search`` — regex; returns which pages do and don't contain a pattern.
-- ``graph_explore`` — entity-graph retrieval (modes: ppr / chain_entity).
+- ``graph_ppr`` — entity-graph associative retrieval; returns top pages with a query-relevant ``window`` excerpt (``evidence``) plus a one-line menu (``more_candidates``); ``read`` for full text.
+- ``graph_chain`` — entity-graph relational / multi-hop retrieval.
+- ``entity_inspect`` — look up / disambiguate / expand an entity.
 - ``read`` — verbatim page Markdown by unit_ids.
 - ``code_run`` — sandboxed Python for arithmetic over verified values."""
 
@@ -39,8 +41,8 @@ TOOL_OVERVIEW = """\
 SCOPE_CONVENTIONS = """\
 ## Scope
 ``semantic_search`` / ``bm25_search`` / ``pattern_search`` /
-``graph_explore`` accept three orthogonal scope arguments that
-intersect (AND): ``file_ids`` (allow-list), ``page_range``
+``graph_ppr`` / ``graph_chain`` accept three orthogonal scope arguments
+that intersect (AND): ``file_ids`` (allow-list), ``page_range``
 (inclusive, 1-based), ``section_ids`` (from ``toc``). Omit any to
 leave unfiltered."""
 

@@ -351,7 +351,7 @@ class GraphPPRChannel(BaseChannel):
     def retrieve(self, ctx: QueryContext) -> List[ChannelHit]:
         # Hold ``_call_lock`` for the whole body so a downstream caller
         # that reads ``self.last_debug`` after our return (the agent's
-        # GraphExploreTool does) cannot observe another concurrent
+        # graph tools do) cannot observe another concurrent
         # query's debug payload. See :meth:`retrieve_with_debug` for the
         # atomic (hits, debug) variant — agents should prefer it; the
         # 4-channel RAG pipeline ignores last_debug, so plain

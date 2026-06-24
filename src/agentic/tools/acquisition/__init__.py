@@ -2,7 +2,11 @@
 
 from agentic.tools.acquisition.bm25_search import Bm25SearchTool
 from agentic.tools.acquisition.code_run import CodeRunTool
-from agentic.tools.acquisition.graph_explore import GraphExploreTool
+from agentic.tools.acquisition.graph_explore import (
+    EntityInspectTool,
+    GraphChainTool,
+    GraphPprTool,
+)
 from agentic.tools.acquisition.list_files import ListFilesTool
 from agentic.tools.acquisition.pattern_search import PatternSearchTool
 from agentic.tools.acquisition.read import ReadTool
@@ -14,7 +18,9 @@ from agentic.tools.acquisition.web_search import WebSearchTool
 __all__ = [
     "Bm25SearchTool",
     "CodeRunTool",
-    "GraphExploreTool",
+    "EntityInspectTool",
+    "GraphChainTool",
+    "GraphPprTool",
     "ListFilesTool",
     "PatternSearchTool",
     "ReadTool",

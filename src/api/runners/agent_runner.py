@@ -3,7 +3,7 @@
 Same EventBus pattern as :mod:`api.runners.rag_runner`. Adds:
 
 * per-tool ``is_evidence`` tag on ``tool_result`` events (so the
-  frontend can render read_page / proof_scan / graph_explore-neighbors
+  frontend can render read_page / proof_scan / graph-tool neighbors
   as inline citation cards instead of generic explore steps);
 * tracer attachment so the assistant message can persist a relative
   ``trace_path`` for later detail lookup;
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # Tools whose ``tool_result`` payload should carry ``is_evidence=True``.
 # Updated after reviewing the actual tool catalog: only the two tools
 # that return verbatim page / atom content count. Everything else
-# (semantic / bm25 / pattern / graph_explore in any mode) is discovery
+# (semantic / bm25 / pattern / graph_ppr / graph_chain / entity_inspect) is discovery
 # — the model still needs to call ``read`` to commit to a page as
 # evidence. ``read`` is the single name registered by ReadTool
 # (`agentic/tools/acquisition/read.py:74`); ``proof_scan`` is the
@@ -256,19 +256,21 @@ async def stream_agent(
                 _accumulate_read_citations(
                     full_result, local_cited_units, local_seen_keys, preview_chars
                 )
-            # Graph kind: pull a canvas-shaped projection out of the
-            # graph_explore envelope and emit it on a side channel. The
-            # GraphPage subscribes to GRAPH_SUBGRAPH frames to keep its
-            # canvas in sync with what the agent actually discovered;
-            # without this passthrough the frontend would have to re-
-            # query /graph/expand and might surface a different subgraph
-            # (PPR vs. BFS routes diverge slightly).
+            # Graph kind: pull a canvas-shaped projection out of the graph
+            # tool envelope and emit it on a side channel. The GraphPage
+            # subscribes to GRAPH_SUBGRAPH frames to keep its canvas in
+            # sync with what the agent actually discovered; without this
+            # passthrough the frontend would have to re-query /graph/expand
+            # and might surface a different subgraph (PPR vs. BFS routes
+            # diverge slightly).
             if (
                 kind == "graph"
-                and tool_name == "graph_explore"
+                and tool_name in ("graph_ppr", "graph_chain", "entity_inspect")
                 and isinstance(full_result, str)
             ):
-                projected = _project_graph_explore(full_result, data.get("loop"))
+                projected = _project_graph_explore(
+                    tool_name, full_result, data.get("loop")
+                )
                 if projected is not None:
                     bus.push(EventType.GRAPH_SUBGRAPH, projected)
 
@@ -629,26 +631,28 @@ def _parse_sources_legend(answer: str) -> List[Tuple[int, str, str]]:
 _NEXT_HEADING = re.compile(r"\n\s*#{1,6}\s+", re.MULTILINE)
 
 
-# --------------------------------------------- graph_explore projection ----
+# --------------------------------------------- graph-tool projection ----
 
 
 def _project_graph_explore(
-    full_result: str, loop: Optional[int]
+    tool_name: str, full_result: str, loop: Optional[int]
 ) -> Optional[Dict[str, Any]]:
-    """Extract a canvas-shaped projection from a graph_explore envelope.
+    """Extract a canvas-shaped projection from a graph-tool envelope.
 
-    Returned shape (one per agent-visible mode, plus a no-op for non-ok
+    Returned shape (one per graph tool, plus a no-op for non-ok
     envelopes):
 
       ``{loop, mode: "ppr", question, seed_surfaces: [...], seed_ids: [...],
          page_refs: [{file_id, page_id}]}``
       ``{loop, mode: "chain_entity", question, focus: [...], seed_ids: [...],
          entity_ids: [...], page_refs: [...]}``
+      ``{loop, mode: "entity_inspect", focus: [...], entity_ids: [...]}``
 
     All ``*_ids`` are vertex hash_ids the frontend can pass straight to
-    /graph/expand or use to highlight existing nodes on the canvas.
-    Returns ``None`` for unparseable / errored envelopes — the side
-    channel stays silent rather than emit a noisy "no data" frame.
+    /graph/expand or use to highlight existing nodes on the canvas. Page
+    refs come from the ``evidence`` rows (the only candidates carrying a
+    ``page_id``). Returns ``None`` for unparseable / errored envelopes —
+    the side channel stays silent rather than emit a noisy "no data" frame.
     """
     try:
         payload = json.loads(full_result)
@@ -656,19 +660,18 @@ def _project_graph_explore(
         return None
     if not isinstance(payload, dict) or not payload.get("ok"):
         return None
-    mode = payload.get("mode")
 
     def _page_refs():
         return [
             {"file_id": p.get("file_id"), "page_id": p.get("page_id")}
-            for p in (payload.get("candidate_pages") or [])
+            for p in (payload.get("evidence") or [])
             if p.get("file_id") and p.get("page_id")
         ]
 
     def _seed_ids():
         return [s.get("hash_id") for s in (payload.get("seeds") or []) if s.get("hash_id")]
 
-    if mode == "ppr":
+    if tool_name == "graph_ppr":
         seed_surfaces = [
             s.get("surface") for s in (payload.get("seeds") or []) if s.get("surface")
         ]
@@ -680,9 +683,9 @@ def _project_graph_explore(
             "seed_ids": _seed_ids(),
             "page_refs": _page_refs(),
         }
-    if mode == "chain_entity":
+    if tool_name == "graph_chain":
         # Bridge entities the walk traversed (path nodes) drive /graph/expand
-        # and canvas highlights; candidate_pages → page_refs for read targets.
+        # and canvas highlights; evidence pages → page_refs for read targets.
         entity_ids: List[str] = []
         for p in (payload.get("paths") or []):
             for n in (p.get("nodes") or []):
@@ -697,6 +700,19 @@ def _project_graph_explore(
             "seed_ids": _seed_ids(),
             "entity_ids": entity_ids,
             "page_refs": _page_refs(),
+        }
+    if tool_name == "entity_inspect":
+        # Inspected clusters drive /graph/expand + canvas highlights.
+        entity_ids = [
+            e.get("cluster_id")
+            for e in (payload.get("entity_audit") or [])
+            if e.get("cluster_id")
+        ]
+        return {
+            "loop": loop,
+            "mode": "entity_inspect",
+            "focus": payload.get("focus") or [],
+            "entity_ids": entity_ids,
         }
     return None
 

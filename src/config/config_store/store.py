@@ -286,10 +286,11 @@ class ConfigStore:
         )
 
     def graph_explore_kwargs(self) -> Dict[str, Any]:
-        """``{entity_lookup_min_sim, entity_lookup_gradient}`` for GraphExploreTool.
+        """``{entity_lookup_min_sim, entity_lookup_gradient}`` for the graph tools.
 
-        Pass straight as ``**kwargs`` to ``GraphExploreTool(...)`` from
-        the agent factory; the tool's constructor accepts these as
+        Pass straight as ``**kwargs`` to each ``_GraphToolBase`` subclass
+        (``GraphPprTool`` / ``GraphChainTool`` / ``EntityInspectTool``)
+        from the agent factory; the tools' constructor accepts these as
         kw-only and falls back to its built-in defaults so direct
         instantiations (experiment scripts) keep working unchanged.
         """

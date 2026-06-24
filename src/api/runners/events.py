@@ -68,7 +68,7 @@ class EventType:
     GAP = "gap"                   # proof
 
     # Graph-agent live replay — emitted by agent_runner.py when a graph
-    # kind agent's graph_explore tool returns. Carries enough metadata
+    # kind agent's graph tool returns. Carries enough metadata
     # for GraphPage to re-render the canvas around what the agent just
     # discovered (extracted from the tool envelope so the frontend
     # sees the agent's actual hits, not a separate /graph/expand call).

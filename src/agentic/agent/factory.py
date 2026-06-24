@@ -34,7 +34,9 @@ from agentic.agent.proof_agent import ProofAgent
 from agentic.tools.acquisition import (
     Bm25SearchTool,
     CodeRunTool,
-    GraphExploreTool,
+    EntityInspectTool,
+    GraphChainTool,
+    GraphPprTool,
     ListFilesTool,
     PatternSearchTool,
     ReadTool,
@@ -76,7 +78,7 @@ def build_default_agent(
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> BaseAgent:
-    """Build a BaseAgent with the eight acquisition tools pre-registered.
+    """Build a BaseAgent with the acquisition tools pre-registered.
 
     Any kwarg may be supplied to swap a backend (e.g. point to a
     different ``page_assets_dir`` for tests). Defaults pull from
@@ -114,13 +116,14 @@ def build_default_agent(
     )
     registry.register(Bm25SearchTool(page_store=page_store, inventory=inventory))
     registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
-    registry.register(
-        GraphExploreTool(
-            channel=graph_channel,
-            inventory=inventory,
-            **(graph_explore_kwargs or {}),
+    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
+        registry.register(
+            graph_tool(
+                channel=graph_channel,
+                inventory=inventory,
+                **(graph_explore_kwargs or {}),
+            )
         )
-    )
     registry.register(
         ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
     )
@@ -152,7 +155,7 @@ def build_proof_agent(
     verbose: bool = False,
     graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> ProofAgent:
-    """Build a ProofAgent with the eight acquisition tools wired in.
+    """Build a ProofAgent with the acquisition tools wired in.
 
     The proof tools (plan_init, gap_propose, claim_ingest, finalize)
     are registered fresh per ``ProofAgent.run`` call against the
@@ -183,13 +186,14 @@ def build_proof_agent(
     )
     acquisition.register(Bm25SearchTool(page_store=page_store, inventory=inventory_store))
     acquisition.register(PatternSearchTool(page_store=page_store, inventory=inventory_store))
-    acquisition.register(
-        GraphExploreTool(
-            channel=graph_channel,
-            inventory=inventory_store,
-            **(graph_explore_kwargs or {}),
+    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
+        acquisition.register(
+            graph_tool(
+                channel=graph_channel,
+                inventory=inventory_store,
+                **(graph_explore_kwargs or {}),
+            )
         )
-    )
     acquisition.register(
         ReadTool(page_store=page_store, inventory=inventory_store, graph_channel=graph_channel)
     )
@@ -224,11 +228,13 @@ def build_graph_agent(
 ) -> BaseAgent:
     """Build a BaseAgent specialised for knowledge-graph navigation.
 
-    Tools registered: ``graph_explore`` (LinearRAG entity / passage
-    graph) and ``read_page`` (full-text page reader). The graph tool
-    surfaces *which* pages are relevant; the reader pulls the actual
-    Markdown so the LLM can quote and cite verbatim — this mirrors
-    upstream LinearRAG's "PPR retrieve → reader" split.
+    Tools registered: ``graph_ppr`` (associative page retrieval),
+    ``graph_chain`` (relational multi-hop), ``entity_inspect`` (entity
+    disambiguation / neighborhood) over the LinearRAG entity / passage
+    graph, plus ``read`` (full-text page reader). The graph tools surface
+    *which* pages are relevant; the reader pulls the actual Markdown so
+    the LLM can quote and cite verbatim — this mirrors upstream
+    LinearRAG's "PPR retrieve → reader" split.
 
     ``max_loops=24`` / ``max_token_budget=128_000``: give navigation room
     to fully traverse the graph on deep (3–4-hop) questions instead of
@@ -254,13 +260,14 @@ def build_graph_agent(
     )
 
     registry = ToolRegistry()
-    registry.register(
-        GraphExploreTool(
-            channel=graph_channel,
-            inventory=inventory,
-            **(graph_explore_kwargs or {}),
+    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
+        registry.register(
+            graph_tool(
+                channel=graph_channel,
+                inventory=inventory,
+                **(graph_explore_kwargs or {}),
+            )
         )
-    )
     registry.register(
         ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
     )

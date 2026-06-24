@@ -1,10 +1,9 @@
 """Graph-only agent system prompt.
 
-Tools: ``graph_explore`` (entity / passage / sentence Tri-Graph; two
-declarative modes ``ppr`` / ``chain_entity``) and ``read`` (verbatim page
-Markdown). Per-tool detail
-lives in each tool's ``get_schema`` description — this prompt only
-states the role, the loop shape, and the answer contract.
+Tools: ``graph_ppr`` / ``graph_chain`` / ``entity_inspect`` (entity /
+passage / sentence Tri-Graph) and ``read`` (verbatim page Markdown).
+Per-tool detail lives in each tool's ``get_schema`` description — this
+prompt only states the role, the loop shape, and the answer contract.
 
 Style note: this prompt is intentionally minimal. Prescriptive
 *strategy* rules ("trust the ranking", "read N-M pages per call",
@@ -26,11 +25,14 @@ GRAPH_SYSTEM_PROMPT = """\
 You answer questions over a document corpus by navigating an entity knowledge graph and reading source pages.
 
 ## Available Tools
-- graph_explore: navigate the entity graph. mode=ppr for a topical question ("which pages discuss X"); mode=chain_entity for a relational/multi-hop question (the system follows the relations and returns the bridge + answer pages itself) — for a comparison, put both entities in `focus`; or give `focus` alone to look up what one entity is and where it appears.
+- graph_ppr: associative retrieval for a topical question ("which pages discuss X"). Returns `evidence` (top pages with a query-relevant `window` excerpt), `more_candidates` (a one-line menu of further pages), and `relations` — explicit `A —[evidence sentence]→ B` hops ranked by relevance; use them to bridge multi-hop questions, quoting the evidence sentence.
+- graph_chain: relational / multi-hop question. The system follows the relations and returns the bridge + answer pages itself; add `focus` to anchor on a known entity, or list two entities in `focus` to compare them.
+- entity_inspect: look up an entity — canonical name, alias members, where it appears, and its neighbors. Use to disambiguate ("which John Smith") or to expand a found entity.
 - read: read full page Markdown by unit_ids.
 
 ## Strategy
-Work iteratively: explore -> read -> evaluate -> explore -> read -> ... -> answer. For multi-hop questions, decompose into sub-questions.
+Work iteratively: explore -> read -> evaluate -> ... -> answer. For multi-hop questions, decompose into sub-questions.
+Each candidate shows a `window` (the query-relevant excerpt, ~3 sentences) or, for lower-ranked pages, a one-line `preview`, plus `cost_tokens` (what a full `read` would add). Answer from the `window` when it suffices; otherwise `read` the file_id for the full text. A `more_candidates` `preview` alone is not enough to answer — `read` (or `entity_inspect`) first. A candidate marked `"seen": true` was already shown above — scroll up, don't re-request it.
 
 ## When Answering
 {answer_style}

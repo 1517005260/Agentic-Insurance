@@ -16,7 +16,7 @@ order below mirrors the runner files:
 * :class:`FraudPPRRequest` — single PPR + LLM call surfacing
   semantically adjacent passages (no agent loop).
 * :class:`RiskPredictRequest` — proactive pre-issuance risk
-  prediction (GraphAgent driving graph_explore + read).
+  prediction (GraphAgent driving graph_ppr / graph_chain / entity_inspect + read).
 
 All endpoints share the same SSE protocol the chat surface uses;
 request schemas only define the request body. Final-payload shapes

@@ -4,8 +4,8 @@ Reuses the lifespan-built ``GraphPPRChannel`` singleton so the igraph
 graph + three faiss stores are mmap'd exactly once per process. We do
 NOT rebuild any of those resources here — the channel already carries
 ``passage_store`` / ``entity_store`` / ``sentence_store`` / ``graph``
-references, and the LLM-side ``GraphExploreTool`` (the agent path)
-shares the same instance.
+references, and the LLM-side graph tools (the agent path) share the
+same instance.
 
 Shape contract: every endpoint that returns subgraph data uses the
 G6 v5 ``{nodes:[{id,label,vertex_type,...}], edges:[{source,target,
@@ -16,8 +16,8 @@ frontend use cases:
 * ppr_subgraph                                  — RAG PPR drawer
 
 GraphAgent live replay (use case C) does NOT need a method here:
-the agent's ``graph_explore`` tool already emits ``candidate_*`` /
-``paths`` directly into the SSE ``tool_result`` payload.
+the agent's graph tools already emit ``evidence`` / ``more_candidates``
+/ ``paths`` directly into the SSE ``tool_result`` payload.
 """
 import logging
 import threading
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 _OVERVIEW_TOP_CENTRAL = 10
 _SEED_DEFAULT_TOP_K = 10
-_SEED_MIN_SIM = 0.4               # matches GraphExploreTool.entity_lookup floor
+_SEED_MIN_SIM = 0.4               # matches the graph tools' entity_lookup floor
 _EXPAND_DEFAULT_TOP_K = 50
 _EXPAND_MAX_HOPS = 3
 _NODE_DETAIL_NEIGHBOR_FILES = 5

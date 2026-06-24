@@ -9,19 +9,13 @@ read and mutate the session through narrow, audited helpers.
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agentic.agent.evidence_bank import EvidenceBank, Observation
 from agentic.closure.budget import Budget
 from agentic.closure.candidate_gap import CandidateGap
 from agentic.closure.claims import Claim
 from agentic.closure.inventory import Inventory
 from agentic.closure.obligation import Obligation
 from agentic.closure.plant import Plant
-
-
-@dataclass
-class Observation:
-    id: str
-    tool_name: str
-    text: str  # the raw tool-result string; citations are checked as substrings of this
 
 
 @dataclass
@@ -32,20 +26,26 @@ class ProofSession:
     obligations: list[Obligation] = field(default_factory=list)
     claims: list[Claim] = field(default_factory=list)
     candidate_gaps: list[CandidateGap] = field(default_factory=list)
-    observations: dict[str, Observation] = field(default_factory=dict)
+    # Observation storage delegates to the shared EvidenceBank so the proof
+    # path and the agent loop account for evidence the same way.
+    _bank: EvidenceBank = field(default_factory=EvidenceBank)
     promoted_count: int = 0
 
+    @property
+    def observations(self) -> dict[str, Observation]:
+        return self._bank._observations
+
     def append_observation(self, observation: Observation) -> None:
-        self.observations[observation.id] = observation
+        self._bank.ingest(
+            observation.id, observation.tool_name, observation.text, ()
+        )
 
     # ObservationStore Protocol — Plant calls this to verify citations.
     def get_text(self, observation_id: str) -> Optional[str]:
-        obs = self.observations.get(observation_id)
-        return obs.text if obs is not None else None
+        return self._bank.get_text(observation_id)
 
     def get_tool_name(self, observation_id: str) -> Optional[str]:
-        obs = self.observations.get(observation_id)
-        return obs.tool_name if obs is not None else None
+        return self._bank.get_tool_name(observation_id)
 
     def find_obligation(self, obligation_id: str) -> Optional[Obligation]:
         for o in self.obligations:

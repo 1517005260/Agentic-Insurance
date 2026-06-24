@@ -33,6 +33,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from config.shared import shared_tiktoken_encoder
 
+from agentic.agent.evidence_bank import EvidenceBank
 from agentic.agent.prompts import SYSTEM_PROMPT
 from agentic.core.context import AgentContext
 from agentic.tools.acquisition._common import err
@@ -42,6 +43,59 @@ from tracer import TraceSession, Tracer
 
 
 logger = logging.getLogger(__name__)
+
+
+# --- loop-guard: anti-thrash on searches that surface no new evidence -------
+# A stuck agent reformulates one failing SEARCH query many times instead of
+# progressing (observed on hard MuSiQue chains: ~16 variants of a single query
+# until max_loops). The reformulations differ in wording but keep returning the
+# SAME pages — query-text similarity misses this, evidence novelty catches it.
+# Each graph_ppr / graph_chain result's candidate page ids feed an EvidenceBank;
+# when the last ``_LOOPGUARD_WINDOW`` searches each brought in at most
+# ``_LOOPGUARD_NOVELTY_MIN`` new pages we append a one-line hint nudging the
+# model to pivot. Only graph_ppr / graph_chain count; read / entity_inspect are
+# legitimate deepening so they never trip it. A false positive only adds an
+# ignorable hint (not a hard stop).
+# TODO(admin-panel): expose _LOOPGUARD_WINDOW / _LOOPGUARD_NOVELTY_MIN as config.
+_SEARCH_TOOLS = frozenset({"graph_ppr", "graph_chain"})
+_LOOPGUARD_WINDOW = 3
+_LOOPGUARD_NOVELTY_MIN = 1
+_LOOPGUARD_HINT = (
+    "\n\n[loop-guard] Your last 3 searches repeated the same exploration. "
+    "Change your approach: search a DIFFERENT entity or a more specific "
+    "sub-question, or read a promising candidate you have not opened yet."
+)
+
+
+def _loopguard_evidence_ids(tool_result: str) -> set:
+    """Candidate-page file_ids in a graph search result envelope.
+
+    Reads ``evidence[].file_id`` and ``more_candidates[].file_id`` from the
+    JSON tool result (``relations`` carries no page ids, so it is skipped). A
+    non-JSON / unexpected payload yields an empty set — the loop-guard then
+    treats the call as zero-novelty, which is the conservative direction.
+    """
+    try:
+        payload = json.loads(tool_result)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    ids: set = set()
+    for field in ("evidence", "more_candidates"):
+        for row in (payload.get(field) or []):
+            if isinstance(row, dict) and row.get("file_id"):
+                ids.add(row["file_id"])
+    return ids
+
+
+def _loopguard_triggered(novelty_history: List[int]) -> bool:
+    """True when the last ``_LOOPGUARD_WINDOW`` searches each surfaced at most
+    ``_LOOPGUARD_NOVELTY_MIN`` new evidence ids."""
+    if len(novelty_history) < _LOOPGUARD_WINDOW:
+        return False
+    return all(
+        n <= _LOOPGUARD_NOVELTY_MIN
+        for n in novelty_history[-_LOOPGUARD_WINDOW:]
+    )
 
 
 class BaseAgent:
@@ -365,6 +419,11 @@ class BaseAgent:
         ]
 
         trajectory: List[Dict[str, Any]] = []
+        # loop-guard: per-run evidence accounting (auto-resets each run). The
+        # bank tracks every page id surfaced so far; ``novelty_history`` is the
+        # per-search count of NEW ids, which drives the no-progress nudge below.
+        bank = EvidenceBank()
+        novelty_history: List[int] = []
         total_cost = 0.0
         cached_tokens_total = 0
         input_tokens_total = 0
@@ -551,6 +610,19 @@ class BaseAgent:
                         tool=func_name,
                     )
                     tool_log = {"retrieved_tokens": 0, "error": "tool_dispatch_exception"}
+
+                # loop-guard: ingest the search's candidate page ids; if the
+                # last _LOOPGUARD_WINDOW searches each surfaced no new evidence,
+                # append a nudge so the model breaks the reformulation rut
+                # instead of burning loops re-retrieving the same pages.
+                if func_name in _SEARCH_TOOLS:
+                    n_new = bank.ingest(
+                        tc["id"], func_name, tool_result,
+                        _loopguard_evidence_ids(tool_result),
+                    )
+                    novelty_history.append(n_new)
+                    if _loopguard_triggered(novelty_history):
+                        tool_result = tool_result + _LOOPGUARD_HINT
 
                 if self.verbose:
                     output_preview = (

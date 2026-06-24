@@ -213,8 +213,8 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("RAG pipeline singleton constructed (shared graph channel)")
 
-    # graph_explore tool tunables (entity_lookup_min_sim / gradient)
-    # are baked at construction; admin changes require a backend restart.
+    # Graph tool tunables (entity_lookup_min_sim / gradient) are baked at
+    # construction; admin changes require a backend restart.
     # See ConfigStore.graph_explore_kwargs() and the entries' descriptions.
     shared_graph_explore_kwargs = _app.state.config.graph_explore_kwargs()
     _app.state.base_agent = build_default_agent(
@@ -276,7 +276,7 @@ async def lifespan(_app: FastAPI):
     # (lifespan runs before any PDF is uploaded). After every successful
     # ingest / reingest / delete the bg task calls this hook so the
     # in-memory state matches the on-disk artifacts. Without it
-    # toc / graph_explore / read_page / GraphService all silently see
+    # toc / graph tools / read_page / GraphService all silently see
     # the empty-boot state for any file uploaded after process start.
     #
     # The hook also doubles as the implementation of
@@ -293,10 +293,10 @@ async def lifespan(_app: FastAPI):
            GraphPPRChannel re-mmaps faiss + re-reads GraphML).
         2. Invalidate the wrappers that snapshot derived views from
            those sources (GraphService passage-meta / cluster /
-           sample caches, and each agent's GraphExploreTool
-           passage-meta / cluster caches). Without step 2 the wrappers
-           keep handing out hashes / clusters that no longer exist
-           in the underlying stores.
+           sample caches, and each agent's graph-tool passage-meta /
+           cluster caches). Without step 2 the wrappers keep handing
+           out hashes / clusters that no longer exist in the
+           underlying stores.
         """
         shared_page_store.reload()
         shared_inventory.reload()
@@ -344,24 +344,28 @@ async def lifespan(_app: FastAPI):
             agent = getattr(_app.state, agent_attr, None)
             if agent is None:
                 continue
-            tool = None
-            try:
-                tool = agent.tools.get("graph_explore")
-            except Exception:
+            # The graph subsystem registers three sibling tools, each its
+            # own instance with a private passage-meta cache; invalidate
+            # all of them.
+            for tool_name in ("graph_ppr", "graph_chain", "entity_inspect"):
                 tool = None
-            if tool is not None and hasattr(tool, "invalidate_caches"):
                 try:
-                    tool.invalidate_caches()
+                    tool = agent.tools.get(tool_name)
                 except Exception:
-                    logger.exception(
-                        "%s graph_explore.invalidate_caches raised", agent_attr
-                    )
+                    tool = None
+                if tool is not None and hasattr(tool, "invalidate_caches"):
+                    try:
+                        tool.invalidate_caches()
+                    except Exception:
+                        logger.exception(
+                            "%s %s.invalidate_caches raised", agent_attr, tool_name
+                        )
 
     _app.state.refresh_indexes = refresh_indexes
     register_refresh_hook(refresh_indexes)
     logger.info(
         "refresh_indexes hook registered (PageStore + InventoryStore + "
-        "GraphPPRChannel + GraphService caches + per-agent graph_explore caches)"
+        "GraphPPRChannel + GraphService caches + per-agent graph-tool caches)"
     )
     try:
         yield

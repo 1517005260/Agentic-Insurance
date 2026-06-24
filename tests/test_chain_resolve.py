@@ -8,14 +8,15 @@ minimal state each primitive reads):
   rare but query-relevant bridge survives, a high-count low-relevance hub is
   ranked below it, and a same-cluster (alias) partner is dropped.
 * ``reciprocal_rank_fusion`` — the only constant (k=60) in path/page scoring.
-* ``GraphExploreTool._rank_paths_rrf`` — a path connecting two focus clusters
-  ranks above an open-ended path (target-aware comparison).
+* ``GraphChainTool._rank_paths_rrf`` — a path connecting two focus clusters
+  ranks above an open-ended path (target-aware comparison). The method lives
+  on the shared ``_GraphToolBase``.
 """
 import numpy as np
 
 from rag.channels.base import reciprocal_rank_fusion
 from rag.channels.graph_ppr import GraphPPRChannel
-from agentic.tools.acquisition.graph_explore import GraphExploreTool
+from agentic.tools.acquisition.graph_explore import GraphChainTool
 
 
 def _make_channel():
@@ -92,7 +93,7 @@ def test_reciprocal_rank_fusion_basic():
 
 
 def test_rank_paths_rrf_prefers_two_focus_cluster_bridge():
-    tool = GraphExploreTool.__new__(GraphExploreTool)
+    tool = GraphChainTool.__new__(GraphChainTool)
 
     class _Stub:
         def cluster_passage_count(self, cid):  # specificity term; uniform here
