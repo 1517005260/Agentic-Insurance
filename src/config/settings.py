@@ -251,6 +251,16 @@ def relativize_trace_dir(absolute: Path) -> str:
 PADDLE_OCR_API_URL: str | None = _get("API_URL")
 PADDLE_OCR_TOKEN: str | None = _get("TOKEN")
 
+# Layout-parsing model served by the async jobs API. Overridable via env so a
+# deployment can pin a newer checkpoint without a code change.
+# TODO: surface in the web config center alongside the other tunables.
+PADDLE_OCR_MODEL: str = _get("PADDLE_OCR_MODEL") or "PaddleOCR-VL-1.6"
+
+# Job polling cadence and overall deadline (seconds). The jobs API is async:
+# submit returns a jobId, then we poll until the extraction reaches ``done``.
+PADDLE_OCR_POLL_INTERVAL: float = 5.0
+PADDLE_OCR_POLL_TIMEOUT: float = 1800.0
+
 # Hard cap from the PaddleOCR layout-parsing API. Files larger than this are
 # split into batches before submission.
 PADDLE_OCR_MAX_PAGES_PER_BATCH: int = 50
@@ -473,6 +483,9 @@ __all__ = [
     "WORKBENCH_AGENT_MAX_CONCURRENCY",
     "PADDLE_OCR_API_URL",
     "PADDLE_OCR_TOKEN",
+    "PADDLE_OCR_MODEL",
+    "PADDLE_OCR_POLL_INTERVAL",
+    "PADDLE_OCR_POLL_TIMEOUT",
     "PADDLE_OCR_MAX_PAGES_PER_BATCH",
     "PADDLE_OCR_BATCH_SEPARATOR",
     "PADDLE_OCR_FILE_TYPE_PDF",
