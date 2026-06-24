@@ -1315,7 +1315,14 @@ async def test_identical_upload_race_preserves_winner_blob(
             await asyncio.wait_for(both_at_insert.wait(), timeout=2.0)
         return await original_create_pending_record(*args, **kwargs)
 
-    async def fake_run_parse_index(file_id: str, source_path: Path, *, job_id: int) -> None:
+    async def fake_run_parse_index(
+        file_id: str,
+        source_path: Path,
+        *,
+        job_id: int,
+        linear_config: Any = None,
+        parse_workers: int = 1,
+    ) -> None:
         assert file_id == staged.file_id
         assert source_path.resolve() == staged.path.resolve()
         assert job_id > 0

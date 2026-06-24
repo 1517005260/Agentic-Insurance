@@ -64,6 +64,7 @@ class _StubBaseAgent(BaseAgent):
         max_loops: Optional[int] = None,
         max_token_budget: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         for event_name, data in self._scripted_events:
             if on_event is not None:
@@ -373,8 +374,8 @@ async def test_web_agent_ordering_is_citations_then_final_then_done():
         assert "_full_result" not in data, f"{name} leaked _full_result"
 
 
-async def test_chat_kind_base_does_not_emit_citations_and_forwards_final():
-    """Plain chat agent: no citations frame; agent-internal final is forwarded."""
+async def test_chat_kind_base_emits_read_citations_and_forwards_final():
+    """Plain chat agent: read units flush one citations frame before final."""
     read_envelope = _ok(
         "PageReadObservation",
         unit_type="page",
@@ -400,9 +401,9 @@ async def test_chat_kind_base_does_not_emit_citations_and_forwards_final():
         stream_agent(query="x", kind="base", agent=agent, config=config)
     )
     names = [n for n, _ in events]
-    assert "citations" not in names
-    # agent-internal final is forwarded for kind="base" (the chat
-    # surface latches onto it; runner doesn't re-emit one).
+    # Local kinds (base/proof/graph) flush read-unit citations once, before
+    # the single forwarded final.
+    assert names.index("citations") < names.index("final")
     assert names.count("final") == 1
     for name, data in events:
         assert "_full_result" not in data, f"{name} leaked _full_result"

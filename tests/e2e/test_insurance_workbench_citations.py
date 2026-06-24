@@ -77,6 +77,7 @@ class _StubBaseAgent(BaseAgent):
         max_loops: Optional[int] = None,
         max_token_budget: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         for event_name, data in self._scripted_events:
             if on_event is not None:
@@ -115,6 +116,7 @@ class _StubProofAgent(ProofAgent):
         max_loops: Optional[int] = None,
         max_token_budget: Optional[int] = None,
         system_prompt: Optional[str] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> ProofRunResult:
         for event_name, data in self._scripted_events:
             if on_event is not None:

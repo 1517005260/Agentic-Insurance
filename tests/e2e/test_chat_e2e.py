@@ -324,6 +324,7 @@ _STUB_FRAMES = [
 
 async def _stub_stream(
     *, query, file_ids, pipeline, config=None, tracer=None, result_future=None,
+    history=None,
 ):
     """Mimic stream_rag's contract: yield frames + set result_future."""
     for frame in _STUB_FRAMES:
