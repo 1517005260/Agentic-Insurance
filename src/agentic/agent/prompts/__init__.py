@@ -25,6 +25,11 @@ from agentic.agent.prompts.regex_system import (
     build_regex_system_prompt,
 )
 
+from agentic.agent.prompts.shell_system import (
+    SHELL_SYSTEM_PROMPT,
+    build_shell_system_prompt,
+)
+
 from agentic.agent.prompts.rag_business import RAG_BUSINESS_SYSTEM_PROMPT
 
 from agentic.agent.prompts.web_system import (
@@ -55,6 +60,8 @@ __all__ = [
     "build_graph_system_prompt",
     "REGEX_SYSTEM_PROMPT",
     "build_regex_system_prompt",
+    "SHELL_SYSTEM_PROMPT",
+    "build_shell_system_prompt",
     "RAG_BUSINESS_SYSTEM_PROMPT",
     "WEB_AGENT_SYSTEM_PROMPT",
     "WEB_RAG_SYSTEM_PROMPT",

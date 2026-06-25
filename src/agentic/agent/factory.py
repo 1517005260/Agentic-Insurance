@@ -27,10 +27,12 @@ from agentic.agent.prompts import (
     GRAPH_SYSTEM_PROMPT,
     PROOF_SYSTEM_PROMPT,
     REGEX_SYSTEM_PROMPT,
+    SHELL_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     WEB_AGENT_SYSTEM_PROMPT,
 )
 from agentic.agent.proof_agent import ProofAgent
+from agentic.tools.acquisition.shell import ShellTool
 from agentic.tools.acquisition import (
     Bm25SearchTool,
     CodeRunTool,
@@ -47,7 +49,7 @@ from agentic.tools.acquisition import (
 )
 from agentic.closure.inventory import InventoryAdapter
 from agentic.tools.registry import ToolRegistry
-from config.settings import page_assets_root
+from config.settings import page_assets_root, paddle_ocr_root
 from model_client import (
     EmbeddingClient,
     LLMClient,
@@ -322,6 +324,44 @@ def build_regex_agent(
         llm_client=llm_client,
         tools=registry,
         system_prompt=system_prompt or REGEX_SYSTEM_PROMPT,
+        max_loops=max_loops,
+        max_token_budget=max_token_budget,
+        verbose=verbose,
+    )
+
+
+def build_shell_agent(
+    *,
+    llm_client: Optional[LLMClient] = None,
+    corpus_root: Optional[Path] = None,
+    system_prompt: Optional[str] = None,
+    max_loops: int = 24,
+    max_token_budget: int = 128_000,
+    verbose: bool = False,
+) -> BaseAgent:
+    """Build a BaseAgent whose only locator is a sandboxed Unix shell over the
+    raw markdown corpus — the faithful Direct-Corpus-Interaction (DCI) baseline.
+
+    One tool, ``shell``: read-only bash inside ``corpus_root``
+    (grep/rg/find/sed/head/tail/cat …) — no embedding, no index, no graph, no
+    network, no writes (bubblewrap-isolated to the corpus when ``bwrap`` is
+    available, cwd-pinned + read-only denylist otherwise). ``cat`` is the
+    reader, so no ``read`` tool is registered. ``corpus_root`` defaults to
+    ``paddle_ocr_root()`` (the per-document ``combined.md`` tree). Defaults
+    mirror the other agents for iso-budget comparison; lower
+    ``max_token_budget`` for a small-context model in lockstep with
+    ``LLMClient(max_tokens=…)``.
+    """
+    corpus_root = corpus_root or paddle_ocr_root()
+    llm_client = llm_client or LLMClient()
+
+    registry = ToolRegistry()
+    registry.register(ShellTool(corpus_root=corpus_root))
+
+    return BaseAgent(
+        llm_client=llm_client,
+        tools=registry,
+        system_prompt=system_prompt or SHELL_SYSTEM_PROMPT,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,
