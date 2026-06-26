@@ -24,6 +24,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 
 import regex
 
+from config import settings
 from config.shared import shared_gliner
 from ingestion.index._sentence import split_sentences
 from ingestion.index.linear_rag.stopword_filter import StopwordFilter
@@ -264,22 +265,12 @@ def split_catalog_mentions(text: str) -> List[str]:
     return out or [stripped]
 
 
-# Default open-set label list. Chosen to give a good mix of recall and
-# precision: domain-specific surfaces (product names, codes, regulatory
-# terms) AND noise-control labels (currency, person role) so we don't
-# accidentally absorb pronouns / measurements / dates into the entity
-# universe. English wording is intentional — GLiNER's mT5 backbone
-# tokenises English label tokens more stably than Chinese ones.
-DEFAULT_LABELS: Tuple[str, ...] = (
-    "product",
-    "term",
-    "concept",
-    "organization",
-    "code",
-    "law",
-    "regulation",
-    "person role",
-)
+# No-args fallback label list. Sourced from the centralized, env-overridable
+# ``settings.GLINER_LABELS`` (a GENERIC universal palette by default) so the
+# bare ``GLiNERAdapter(model_id)`` path matches the configured prompt rather
+# than a stale domain literal. Frozen into a tuple at import so it stays a
+# read-only module-level value.
+DEFAULT_LABELS: Tuple[str, ...] = tuple(settings.GLINER_LABELS)
 
 
 class GLiNERAdapter:
@@ -360,19 +351,27 @@ class GLiNERAdapter:
         self,
         hash_id_to_passage: Dict[str, str],
         max_workers: int,  # unused; GLiNER batches on a single device
-    ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]], Dict[str, List[str]]]:
-        """Run NER over a passage dict; return three maps GLM consumers want.
+    ) -> Tuple[
+        Dict[str, List[str]],
+        Dict[str, List[str]],
+        Dict[str, List[str]],
+        Dict[str, str],
+    ]:
+        """Run NER over a passage dict; return four maps GLM consumers want.
 
         Returns ``(passage_hash_id_to_entities, sentence_to_entities,
-        passage_hash_id_to_sentences)``. Entity surfaces are deduplicated
-        per passage and per sentence (preserving first-occurrence order).
-        The third map ``passage_hash_id_to_sentences`` records the
-        ordered sentence-text list that ``split_sentences`` produced for
-        each passage; persisted alongside the entity maps in
-        ``ner_results.json`` so query-time consumers (e.g. the
-        question-conditioned PPR preview snippet) can look up "which
-        sentences live on this page" without re-splitting passages at
-        query time.
+        passage_hash_id_to_sentences, entity_to_label)``. Entity surfaces
+        are deduplicated per passage and per sentence (preserving
+        first-occurrence order). The third map
+        ``passage_hash_id_to_sentences`` records the ordered sentence-text
+        list that ``split_sentences`` produced for each passage; persisted
+        alongside the entity maps in ``ner_results.json`` so query-time
+        consumers (e.g. the question-conditioned PPR preview snippet) can
+        look up "which sentences live on this page" without re-splitting
+        passages at query time. The fourth map ``entity_to_label`` records,
+        per RAW surface piece (pre-normalization), the GLiNER label of its
+        first occurrence — threaded to EvidenceFS so ``surfaces.tsv`` can
+        carry ``ner_label``.
 
         Sentence segmentation runs first across all passages so we can
         feed one large batched forward to the model rather than one call
@@ -401,6 +400,7 @@ class GLiNERAdapter:
                 {h: [] for h in hash_id_to_passage},
                 {},
                 passage_hash_id_to_sentences,
+                {},
             )
 
         all_sentences = [s for _, s in sentence_index]
@@ -463,12 +463,17 @@ class GLiNERAdapter:
         passage_to_seen: Dict[str, set] = {h: set() for h in hash_id_to_passage}
         sentence_to_entities: Dict[str, List[str]] = defaultdict(list)
         sentence_seen: Dict[str, set] = defaultdict(set)
+        # RAW surface piece → GLiNER label (first occurrence wins). Keyed by
+        # the pre-normalization piece string so the caller can re-normalize
+        # the keys with the same surface canonicaliser it applies elsewhere.
+        entity_to_label: Dict[str, str] = {}
 
         for (hash_id, sent_text), spans in zip(sentence_index, all_results):
             if not spans:
                 continue
             for span in spans:
-                if span.get("label") in self.noise_labels:
+                span_label = span.get("label")
+                if span_label in self.noise_labels:
                     continue
                 raw = span.get("text") or ""
                 if not raw:
@@ -478,6 +483,8 @@ class GLiNERAdapter:
                 if self._stopword_filter.is_blocked(raw, span.get("score", 0.0)):
                     continue
                 for piece in split_catalog_mentions(raw):
+                    if span_label and piece not in entity_to_label:
+                        entity_to_label[piece] = span_label
                     if piece not in sentence_seen[sent_text]:
                         sentence_seen[sent_text].add(piece)
                         sentence_to_entities[sent_text].append(piece)
@@ -489,6 +496,7 @@ class GLiNERAdapter:
             passage_to_entities,
             dict(sentence_to_entities),
             passage_hash_id_to_sentences,
+            entity_to_label,
         )
 
     # ----------------------------------------------- query-side NER ----
@@ -547,11 +555,11 @@ class GLiNERAdapter:
 
         Returns ``({passage_hash_id: [entities]}, {sent_text: [entities]})``.
         Internally just routes through :meth:`batch_ner`. The third
-        ``passage_hash_id_to_sentences`` return value is discarded by
-        this thin shim — the single-passage callers are debug paths
-        that don't drive the preview index.
+        ``passage_hash_id_to_sentences`` and fourth ``entity_to_label``
+        return values are discarded by this thin shim — the single-passage
+        callers are debug paths that don't drive the preview index.
         """
-        passage_map, sentence_map, _passage_to_sentences = self.batch_ner(
-            {passage_hash_id: text}, 1
+        passage_map, sentence_map, _passage_to_sentences, _entity_to_label = (
+            self.batch_ner({passage_hash_id: text}, 1)
         )
         return passage_map, sentence_map

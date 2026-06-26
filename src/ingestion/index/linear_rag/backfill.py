@@ -1,4 +1,4 @@
-"""Literal-substring entity-mention backfill (KAG-style "domain mount").
+"""Literal-substring entity-mention gazetteer (KAG-style "domain mount").
 
 Why this exists
 ---------------
@@ -6,14 +6,14 @@ Why this exists
 NER decides per-context whether a token span is an entity, so the
 same surface (e.g. "Heritage Protector Option") can be tagged on the
 page that introduces it but missed on later pages that merely refer
-back to it. This leaves a gap between (entity, page) pairs where the
-surface literally appears and the entity↔passage edges actually written
-into the LinearRAG graph.
+back to it. The query-time PPR channel (``GraphPPRChannel``) closes
+that recall gap by compiling every entity surface NER ever produced
+into an Aho-Corasick gazetteer and sweeping the question's candidate
+passages for literal misses.
 
-This module closes that gap by treating every entity surface NER ever
-produced anywhere in the corpus as an authoritative gazetteer, then
-sweeping every passage with an Aho-Corasick automaton and emitting
-``entity_passage`` edges for the literal misses.
+This module provides the gazetteer primitives the channel uses:
+:func:`build_gazetteer_automaton` and :func:`find_literal_matches`
+(plus :func:`_passage_canon`, a per-passage canonical-text memo).
 
 Why this is safe
 ----------------
@@ -35,18 +35,13 @@ pattern we mirror for closed corpora; HippoRAG 2 query-side fallback
 for the same recall problem on questions.
 """
 
-import logging
-import math
 from collections import defaultdict
-from typing import Dict, List, Mapping, Tuple
+from typing import Dict, Mapping, Tuple
 
 import ahocorasick
-import igraph as ig
 import regex
 
 from ingestion.index.linear_rag.normalize import canonical_form
-
-logger = logging.getLogger(__name__)
 
 
 _HAS_HAN_RE = regex.compile(r"\p{Han}")
@@ -165,84 +160,3 @@ def find_literal_matches(
                 continue
         counts[hash_id] += 1
     return counts
-
-
-def literal_backfill_graph(
-    graph: ig.Graph,
-    entity_surfaces_by_hash: Mapping[str, str],
-    passage_text_by_hash: Mapping[str, str],
-    *,
-    min_surface_chars: int = 4,
-    multi_word_only: bool = True,
-    fold_traditional: bool = True,
-) -> int:
-    """In-place backfill: add missing entity↔passage edges from literal hits.
-
-    Returns the number of edges added. Caller is responsible for
-    persisting (``graph.write_graphml(...)``).
-    """
-    automaton, n_kept = build_gazetteer_automaton(
-        entity_surfaces_by_hash,
-        min_surface_chars=min_surface_chars,
-        multi_word_only=multi_word_only,
-    )
-    if n_kept == 0:
-        logger.info("literal_backfill: gazetteer empty after filters; skipped")
-        return 0
-
-    name_to_vidx = {v["name"]: v.index for v in graph.vs}
-
-    # Snapshot existing entity_passage pairs so we never double-add. We
-    # use frozenset(pair) because the graph is undirected — edge
-    # direction is irrelevant.
-    existing = set()
-    if "edge_type" in graph.es.attributes():
-        for e in graph.es:
-            if e["edge_type"] != "entity_passage":
-                continue
-            a = graph.vs[e.source]["name"]
-            b = graph.vs[e.target]["name"]
-            existing.add(frozenset((a, b)))
-
-    new_edge_pairs: List[Tuple[int, int]] = []
-    new_edge_weights: List[float] = []
-    n_skipped_existing = 0
-
-    for phash, ptext in passage_text_by_hash.items():
-        if phash not in name_to_vidx:
-            continue
-        pvidx = name_to_vidx[phash]
-        canon = _passage_canon(phash, ptext or "", fold_traditional)
-        counts = find_literal_matches(
-            canon, automaton, fold_traditional=fold_traditional,
-            precanonicalized=True,
-        )
-        for ehash, count in counts.items():
-            if ehash not in name_to_vidx:
-                continue
-            if frozenset((ehash, phash)) in existing:
-                n_skipped_existing += 1
-                continue
-            evidx = name_to_vidx[ehash]
-            new_edge_pairs.append((evidx, pvidx))
-            new_edge_weights.append(math.log(1 + count))
-            existing.add(frozenset((ehash, phash)))
-
-    if not new_edge_pairs:
-        logger.info(
-            "literal_backfill: no new edges (gazetteer=%d, all literal hits already covered, skipped=%d)",
-            n_kept, n_skipped_existing,
-        )
-        return 0
-
-    start_eidx = graph.ecount()
-    graph.add_edges(new_edge_pairs)
-    for offset, weight in enumerate(new_edge_weights):
-        graph.es[start_eidx + offset]["weight"] = weight
-        graph.es[start_eidx + offset]["edge_type"] = "entity_passage"
-
-    logger.info(
-        "literal_backfill: gazetteer=%d added=%d edges (skipped_existing=%d)",
-        n_kept, len(new_edge_pairs), n_skipped_existing,
-    )
-    return len(new_edge_pairs)

@@ -43,9 +43,9 @@ class GraphIndexBuilder(IndexBuilder):
         # read+write per doc, which would be O(N²). Opt-in only.
         self.reuse_graph = reuse_graph
         self._lr = None
-        # Carries the admin-tuned literal-backfill flags + GLiNER knobs.
+        # Carries the admin-tuned GLiNER knobs + query-time gazetteer filters.
         # The embedding_client / max_workers fields here will be overwritten
-        # in _build() with the per-call values; the backfill / NER knobs
+        # in _build() with the per-call values; the NER / gazetteer knobs
         # survive from config-store hydration. ``None`` keeps the built-in
         # defaults so experiment scripts that construct the builder
         # directly need no changes.
@@ -58,11 +58,24 @@ class GraphIndexBuilder(IndexBuilder):
     def _build(self, file_id: str, pages: List[PageAsset]) -> IndexBuildResult:
         from dataclasses import replace as _replace
 
-        eligible = [p for p in pages if p.text_markdown.strip()]
-        passages = [p.text_markdown for p in eligible]
-        page_numbers = [
-            p.page_number if p.page_number is not None else 0 for p in eligible
-        ]
+        from config.settings import paddle_ocr_root
+        from ingestion.index.linear_rag.segment import segment_combined_md
+
+        # Prefer the canonical, agent-readable combined.md: segment it into
+        # paragraph passages so NER + stores + graph are paragraph-level and the
+        # passage hashes match what EvidenceFS addresses. Fall back to the
+        # per-PageAsset path when combined.md is absent (legacy / partial OCR).
+        combined_md = paddle_ocr_root() / file_id / "combined.md"
+        if combined_md.exists():
+            spans = segment_combined_md(combined_md.read_text("utf-8"))
+            passages = [s.text for s in spans]
+            page_numbers = [s.page_number for s in spans]
+        else:
+            eligible = [p for p in pages if p.text_markdown.strip()]
+            passages = [p.text_markdown for p in eligible]
+            page_numbers = [
+                p.page_number if p.page_number is not None else 0 for p in eligible
+            ]
 
         # Compose: take the admin-provided knobs (literal-backfill + GLiNER
         # labels / threshold / model id) from self.linear_config when
@@ -140,14 +153,18 @@ class GraphIndexBuilder(IndexBuilder):
         )
 
     def flush(self) -> None:
-        """Force-persist the reused graph + all deferred writes.
+        """Force-persist the reused graph + all deferred writes, and emit
+        EvidenceFS once for the whole corpus.
 
         Bulk driver: call at the end and before any checkpoint that
-        reads the on-disk graphml / faiss / parquet artifacts. No-op
-        unless ``reuse_graph`` and a graph has been built.
+        reads the on-disk graphml / faiss / parquet artifacts.
 
-        Drains the cadence-deferred work (3 embedding stores, NER JSON,
-        literal backfill, graphml) via ``LinearRAG.flush_all``.
+        **No-op unless ``reuse_graph=True``** — only then does ``_build``
+        accumulate into the persistent ``self._lr``. The per-file API path
+        (``reuse_graph=False``) builds a throwaway ``LinearRAG`` per ``_build``
+        and persists/EvidenceFS-emits nothing here; an EvidenceFS corpus build
+        must therefore run with ``reuse_graph=True`` (or via ``bulk_build``,
+        whose ``final_flush`` emits EvidenceFS itself).
         """
         if self._lr is not None:
-            self._lr.flush_all()
+            self._lr.flush_all(emit_evidence_fs=True)

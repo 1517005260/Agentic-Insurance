@@ -62,16 +62,11 @@ WIKI_GLINER_LABELS: List[str] = [
 
 # Build-stage knobs for cross-document wiki corpora, passed to the build driver
 # as ``LinearRAGConfig(gliner_labels=WIKI_GLINER_LABELS, **WIKI_BUILD_KNOBS)``.
-# Wikipedia entity surfaces are clean (exact shared surfaces already hash to one
-# node), so alias ER is both the build's dominant cost and a false-bridge risk →
-# off. Each passage is its own single-page file_id, so adjacent-passage edges
-# would only link arbitrary corpus neighbours → off. Literal backfill off keeps
-# the PPR baseline simple (titles are already in the passage text); flip it on
-# (it runs once at final flush) if a later ablation wants it.
+# Each passage is its own single-page file_id, so adjacent-passage edges would
+# only link arbitrary corpus neighbours → off. The KG is otherwise built
+# physical-only (no alias edges, no literal backfill) by construction.
 WIKI_BUILD_KNOBS = {
-    "alias_edges_enabled": False,
     "adjacent_passage_edges_enabled": False,
-    "literal_backfill_enabled": False,
 }
 
 

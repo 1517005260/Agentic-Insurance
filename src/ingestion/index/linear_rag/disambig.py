@@ -25,7 +25,7 @@ import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import igraph as ig
 import numpy as np
@@ -48,11 +48,6 @@ DEFAULT_MIN_SIM = 0.85
 # changes so each edge's ``features_json["admission_rule_version"]`` records
 # which gate set accepted it. Audit and rule-regression depend on this string.
 ADMISSION_RULE_VERSION = "D4-idf+mutualknn+cooccur-v1"
-
-# Reasonable propagation policy names (A–E variants of decoupled
-# audit-vs-propagation weighting).
-PROPAGATION_POLICIES = {"const", "cos", "clipped_cos", "threshold_gate", "calibrated"}
-
 
 @dataclass
 class AliasCandidate:
@@ -199,26 +194,6 @@ def idf_weighted_overlap(
     return num / denom
 
 
-def mutual_knn_pairs(neighbors: Dict[str, Set[str]]) -> Set[frozenset]:
-    """Reciprocal-kNN edge set: ``frozenset({e, c})`` for every pair where
-    ``c ∈ neighbors[e]`` AND ``e ∈ neighbors[c]``.
-
-    ``neighbors[e]`` = the entity hash_ids recalled for ``e`` (union of recall
-    arms). O(Σ|neighbors|). Single-linkage chaining through a one-directional
-    hub pull is impossible once edges must be reciprocal (Maier/Hein/von
-    Luxburg).
-    """
-    out: Set[frozenset] = set()
-    for e, nbrs in neighbors.items():
-        for c in nbrs:
-            if c == e:
-                continue
-            other = neighbors.get(c)
-            if other is not None and e in other:
-                out.add(frozenset((e, c)))
-    return out
-
-
 def add_alias_edges(
     graph: ig.Graph,
     new_hash_id: str,
@@ -295,83 +270,6 @@ def add_alias_edges(
         # features is meaningful (e.g. when policy != cos).
         graph.es[start + offset]["w_prop"] = w
     return len(pairs)
-
-
-# ---------------------------------------------------------- propagation policy
-
-def _sigmoid(x: float) -> float:
-    # Numerically stable sigmoid — avoids overflow on large negative x.
-    if x >= 0:
-        z = math.exp(-x)
-        return 1.0 / (1.0 + z)
-    z = math.exp(x)
-    return z / (1.0 + z)
-
-
-def _zscore(x: float, mean: float, std: float) -> float:
-    if std <= 0:
-        return 0.0
-    return (x - mean) / std
-
-
-def propagation_policy(features: Dict[str, Any], cfg: Any) -> float:
-    """Map per-edge features → propagation weight ``w_prop``.
-
-    Reads policy name + parameters from ``cfg`` (a ``LinearRAGConfig`` or any
-    object with the same attribute surface). Five policies:
-
-    * ``const``          — constant ``cfg.alias_prop_const``.
-    * ``cos``            — raw cos_sim. Default; equivalent to old
-                           ``weight = score`` behaviour.
-    * ``clipped_cos``    — cos clipped to ``[alias_prop_lo, alias_prop_hi]``.
-    * ``threshold_gate`` — 1.0 iff cos >= τ_c and (rerank None or
-                           rerank >= τ_r) else 0.
-    * ``calibrated``     — sigmoid(a·z(cos) + b·z(rerank or 0) + c).
-
-    Unknown policy names raise ``ValueError`` — callers should never
-    silently fall back to a different policy.
-    """
-    policy = getattr(cfg, "alias_propagation_policy", "cos")
-    if policy not in PROPAGATION_POLICIES:
-        raise ValueError(f"propagation_policy: unknown policy {policy!r}")
-    cos = float(features.get("cos_sim") or 0.0)
-    rerank = features.get("reranker_score")
-    rerank_val = float(rerank) if rerank is not None else None
-
-    if policy == "const":
-        return float(getattr(cfg, "alias_prop_const", 1.0))
-    if policy == "cos":
-        return cos
-    if policy == "clipped_cos":
-        lo = float(getattr(cfg, "alias_prop_lo", 0.7))
-        hi = float(getattr(cfg, "alias_prop_hi", 1.0))
-        if lo > hi:
-            # Swapped bounds → would otherwise collapse to a constant ``lo``.
-            # Treat as a misconfiguration and surface it rather than
-            # silently degrading propagation to a constant.
-            raise ValueError(
-                f"propagation_policy(clipped_cos): alias_prop_lo={lo} > alias_prop_hi={hi}"
-            )
-        return max(lo, min(hi, cos))
-    if policy == "threshold_gate":
-        tau_c = float(getattr(cfg, "alias_prop_tau_cos", 0.85))
-        tau_r = float(getattr(cfg, "alias_prop_tau_rerank", 0.7))
-        if cos < tau_c:
-            return 0.0
-        if rerank_val is not None and rerank_val < tau_r:
-            return 0.0
-        return 1.0
-    # calibrated
-    a = float(getattr(cfg, "alias_prop_calib_a", 1.0))
-    b = float(getattr(cfg, "alias_prop_calib_b", 1.0))
-    c = float(getattr(cfg, "alias_prop_calib_c", 0.0))
-    cos_mu = float(getattr(cfg, "alias_prop_calib_cos_mean", 0.9))
-    cos_sd = float(getattr(cfg, "alias_prop_calib_cos_std", 0.05))
-    rk_mu = float(getattr(cfg, "alias_prop_calib_rerank_mean", 0.8))
-    rk_sd = float(getattr(cfg, "alias_prop_calib_rerank_std", 0.1))
-    z_cos = _zscore(cos, cos_mu, cos_sd)
-    z_rk = _zscore(rerank_val if rerank_val is not None else 0.0, rk_mu, rk_sd)
-    return _sigmoid(a * z_cos + b * z_rk + c)
 
 
 # Surface-quality scoring — used to pick a cluster's ``canonical``
@@ -694,12 +592,6 @@ def load_reverse_map(path: Path) -> Dict[str, str]:
     if not isinstance(mapping, dict):
         return {}
     return {str(k): str(v) for k, v in mapping.items()}
-
-
-def save_reverse_map(path: Path, mapping: Dict[str, str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": REVERSE_MAP_VERSION, "map": mapping}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def follow_reverse_map(hash_id: str, reverse_map: Dict[str, str]) -> str:
@@ -1089,207 +981,3 @@ def aggregate_by_cluster(
         if h not in seen_members:
             out[h] = float(s)
     return out
-
-
-# ============================================================================
-# Cluster shape metrics
-# ============================================================================
-
-
-def _pairwise_intra_cluster_cos_min(
-    members: Sequence[str], store: EmbeddingStore, max_pairs_per_cluster: int = 32
-) -> Optional[float]:
-    """Return the minimum pairwise cos sim across ``members`` or None.
-
-    For clusters with > ``max_pairs_per_cluster`` members we sub-sample
-    ``max_pairs_per_cluster`` distinct members deterministically (sorted
-    order) and run pairwise on the sample. The min cos sim is a
-    sensible "cluster tightness" probe and survives sub-sampling.
-    """
-    if len(members) < 2:
-        return None
-    if len(members) > max_pairs_per_cluster:
-        members = sorted(members)[:max_pairs_per_cluster]
-    try:
-        embs = np.stack([store.get_embedding(m) for m in members], axis=0)
-    except Exception:
-        return None
-    # Cosine sim assumes L2-normalized inputs (entity store is normalized).
-    sims = embs @ embs.T
-    n = sims.shape[0]
-    if n < 2:
-        return None
-    # Mask the diagonal.
-    iu = np.triu_indices(n, k=1)
-    pair_sims = sims[iu]
-    if pair_sims.size == 0:
-        return None
-    return float(pair_sims.min())
-
-
-def cluster_shape_metrics(
-    graph: ig.Graph,
-    clusters: Sequence[Dict[str, Any]],
-    entity_store: Optional[EmbeddingStore] = None,
-    *,
-    is_collapse: bool = False,
-    cheap: bool = False,
-) -> Dict[str, Any]:
-    """Return shape statistics on the alias-cluster partition.
-
-    Metrics:
-
-    * ``cluster_count``
-    * ``cluster_size_p50 / p95 / max``
-    * ``largest_component_size`` (largest cluster's member count)
-    * ``total_entities`` (entity-typed non-hidden vertices)
-    * ``largest_cc_ratio`` (paper G5 gate input)
-    * ``cluster_diameter_p95`` (diameter of each cluster's induced
-      alias subgraph; p95 across clusters)
-    * ``intra_cluster_cos_sim_min_median`` (median across clusters of
-      the min pairwise cos sim within each cluster; requires
-      ``entity_store``)
-
-    In ``is_collapse=True`` mode the alias subgraph is empty; metrics
-    are reported on the reverse-map-derived clusters with ``diameter``
-    fixed at 0 (no walk needed, everything was folded into canonical).
-    """
-    sizes = [len(c.get("members") or []) for c in clusters]
-    cluster_count = len(clusters)
-    total_entities = 0
-    if "vertex_type" in graph.vs.attributes():
-        for v in graph.vs:
-            if v["vertex_type"] != "entity":
-                continue
-            if v.attributes().get("hidden") is True:
-                continue
-            total_entities += 1
-    else:
-        total_entities = graph.vcount()
-
-    def _percentile(values: List[int], q: float) -> int:
-        if not values:
-            return 0
-        return int(np.percentile(np.asarray(values), q))
-
-    largest = max(sizes) if sizes else 0
-    metrics: Dict[str, Any] = {
-        "cluster_count": cluster_count,
-        "cluster_size_p50": _percentile(sizes, 50),
-        "cluster_size_p95": _percentile(sizes, 95),
-        "cluster_size_max": largest,
-        "largest_component_size": largest,
-        "total_entities": total_entities,
-        "largest_cc_ratio": (largest / total_entities) if total_entities > 0 else 0.0,
-    }
-
-    if is_collapse:
-        metrics["cluster_diameter_p95"] = 0
-        metrics["intra_cluster_cos_sim_min_median"] = None
-        return metrics
-
-    if cheap:
-        # Per-doc ingest path: skip the O(V·E) giant-CC diameter walk and
-        # the O(Σ|c|²) intra-cluster pairwise probe. The O(V) shape
-        # fields above (counts / sizes / largest_cc_ratio) stay as the
-        # per-doc percolation tripwire; the full metrics are computed on
-        # a checkpoint cadence by the caller.
-        metrics["cluster_diameter_p95"] = None
-        metrics["intra_cluster_cos_sim_min_median"] = None
-        return metrics
-
-    # Diameter — per cluster, on the alias subgraph induced by its members.
-    diameters: List[int] = []
-    name_to_idx = {v["name"]: v.index for v in graph.vs if "name" in v.attributes()}
-    alias_edge_ids = (
-        [e.index for e in graph.es if e["edge_type"] == ALIAS_EDGE_TYPE]
-        if "edge_type" in graph.es.attributes()
-        else []
-    )
-    if alias_edge_ids:
-        for c in clusters:
-            members = c.get("members") or []
-            if len(members) < 2:
-                diameters.append(0)
-                continue
-            member_idx = [name_to_idx[m] for m in members if m in name_to_idx]
-            if len(member_idx) < 2:
-                diameters.append(0)
-                continue
-            sub = graph.subgraph(member_idx)
-            # Only alias edges should be in the cluster subgraph; the
-            # cluster definition guarantees this, but defensively filter.
-            if "edge_type" in sub.es.attributes():
-                non_alias = [e.index for e in sub.es if e["edge_type"] != ALIAS_EDGE_TYPE]
-                if non_alias:
-                    sub.delete_edges(non_alias)
-            try:
-                d = sub.diameter(directed=False)
-            except Exception:
-                d = 0
-            diameters.append(int(d))
-    metrics["cluster_diameter_p95"] = _percentile(diameters, 95)
-
-    if entity_store is not None and clusters:
-        mins: List[float] = []
-        for c in clusters:
-            members = c.get("members") or []
-            mn = _pairwise_intra_cluster_cos_min(members, entity_store)
-            if mn is not None:
-                mins.append(mn)
-        if mins:
-            metrics["intra_cluster_cos_sim_min_median"] = float(np.median(mins))
-        else:
-            metrics["intra_cluster_cos_sim_min_median"] = None
-    else:
-        metrics["intra_cluster_cos_sim_min_median"] = None
-    return metrics
-
-
-# ============================================================================
-# Admin / CLI hook
-# ============================================================================
-
-
-def _print_cluster_shape() -> None:
-    """``python -m ingestion.index.linear_rag.disambig --cluster-shape``.
-
-    Prints cluster_shape_metrics for the live graph at ``faiss_graph_dir()``.
-    """
-    from config.settings import faiss_graph_dir, faiss_graph_entity_dir
-    from storage.embedding_store import get_or_create_store
-
-    graphml = faiss_graph_dir() / "LinearRAG.graphml"
-    if not graphml.exists():
-        print(json.dumps({"error": "LinearRAG.graphml not found"}))
-        return
-    graph = ig.Graph.Read_GraphML(str(graphml))
-    cache = faiss_graph_dir() / "clusters.json"
-    reverse_path = faiss_graph_dir() / "reverse_map.json"
-    reverse_map = load_reverse_map(reverse_path)
-    is_collapse = bool(reverse_map)
-    if is_collapse:
-        clusters = compute_clusters_for_collapse(graph, reverse_map)
-    else:
-        clusters = get_clusters(graph, cache)
-    entity_store = get_or_create_store(faiss_graph_entity_dir(), namespace="entity")
-    metrics = cluster_shape_metrics(
-        graph, clusters, entity_store=entity_store, is_collapse=is_collapse
-    )
-    print(json.dumps(metrics, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="LinearRAG disambig utilities.")
-    parser.add_argument(
-        "--cluster-shape",
-        action="store_true",
-        help="Print cluster-shape metrics for the live graph as JSON.",
-    )
-    args = parser.parse_args()
-    if args.cluster_shape:
-        _print_cluster_shape()
-    else:
-        parser.print_help()

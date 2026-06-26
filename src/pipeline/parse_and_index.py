@@ -88,7 +88,7 @@ OnEvent = Callable[[str, Mapping[str, Any]], None]
 def _safe_emit(on_event: Optional[OnEvent], event: str, data: Mapping[str, Any]) -> None:
     """Fire ``on_event`` swallowing any exception.
 
-    Same pattern BaseAgent / ProofAgent use — the algorithm pipeline
+    Same pattern BaseAgent uses — the algorithm pipeline
     must never bubble a callback failure up the build chain. The
     callback is typically ``EventBus.push`` which uses
     ``call_soon_threadsafe`` to enqueue, so the worker thread fires
