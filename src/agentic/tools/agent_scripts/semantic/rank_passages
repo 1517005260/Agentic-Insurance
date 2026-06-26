@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""rank_passages --query "..." [--top-k N] [--file-ids id,id]
+
+Genuine semantic-augmented PPR over the corpus knowledge graph: reuses the real
+GraphPPRChannel (GLiNER-seeded random walk + embedding-API scoring on the
+entity/passage graph) with NO lexical approximation -- zero degradation.
+Graph/associative signal: starts from the query's entities and propagates over
+the graph, so it surfaces multi-hop / entity-anchored evidence that a flat
+similarity search misses. Pair it with `search_dense` (the direct-similarity
+signal). Output is candidate generation: READ the page to confirm.
+
+Columns: rank  doc_id  page  score  page_file  preview
+"""
+import argparse
+
+import _evfs_coords as C  # noqa: E402  (sibling module; bare-name exec puts this dir on sys.path[0])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="rank_passages")
+    ap.add_argument("--query", required=True, help="natural-language question")
+    ap.add_argument("--top-k", type=int, default=10)
+    ap.add_argument("--file-ids", default="", help="comma-separated source_path scope")
+    args = ap.parse_args()
+
+    scope = [s for s in args.file_ids.split(",") if s] or None
+    C.print_rows(C.call("ppr", query=args.query, top_k=args.top_k, file_ids=scope))
+
+
+if __name__ == "__main__":
+    main()

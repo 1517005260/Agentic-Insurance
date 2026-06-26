@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""semantic_bridge SID --query "..." [--top-k N]
+
+Query-weighted co-occurrence bridge from surface SID: the surfaces co-mentioned
+with it in the sentences most relevant to the query, each with the bridging
+sentence. Reuses the real channel's sentence-first co-occurrence -- zero
+degradation. The embedding counterpart of `bridge_surfaces`: lexical
+`bridge_surfaces` ranks bridges by raw shared-sentence count; this ranks them by
+how the query relates to the shared sentence, so it surfaces the multi-hop path
+(the rare but query-relevant bridge) that a count would bury. A bridge is NOT a
+relation -- read the via sentence (`show_sentence`) to recover it.
+
+Columns: rank  surface_b  surface_raw  score  via_sentence
+"""
+import argparse
+
+import _evfs_coords as C  # noqa: E402  (sibling module; bare-name exec puts this dir on sys.path[0])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="semantic_bridge")
+    ap.add_argument("surface_id", help="the tail surface, e.g. sf_000046")
+    ap.add_argument("--query", required=True, help="ranks the bridge by query relevance")
+    ap.add_argument("--top-k", type=int, default=10)
+    args = ap.parse_args()
+
+    C.print_rows(C.call("bridge", surface_id=args.surface_id, query=args.query, top_k=args.top_k))
+
+
+if __name__ == "__main__":
+    main()

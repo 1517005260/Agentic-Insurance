@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# show_passage PID [--context N] — original-text window for a passage (+/- N lines).
+# Equivalent bare shell: read doc+line range from passages.tsv, then
+#   sed -n 'START,ENDp' documents/<doc>/combined.md
+set -euo pipefail
+pid=${1:?usage: show_passage <passage_id> [--context N]}; shift || true
+ctx=0; [ "${1:-}" = "--context" ] && ctx=${2:-0}
+doc=""; read -r doc s e < <(awk -F'\t' -v p="$pid" '$1==p{print $2, $6, $7; exit}' nodes/passages.tsv) || true
+[ -z "${doc:-}" ] && { echo "no such passage: $pid" >&2; exit 1; }
+a=$(( s > ctx ? s - ctx : 1 )); b=$(( e + ctx ))
+echo "# $pid  $doc  lines ${a}-${b}"
+sed -n "${a},${b}p" "documents/$doc/combined.md"

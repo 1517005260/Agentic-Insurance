@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# show_sentence SID — a sentence's text + its passage/doc + a small source window.
+set -euo pipefail
+sid=${1:?usage: show_sentence <sentence_id>}
+row=$(awk -F'\t' -v s="$sid" '$1==s{print; exit}' nodes/sentences.tsv)
+[ -z "$row" ] && { echo "no such sentence: $sid" >&2; exit 1; }
+printf '%s\n' "$row" | awk -F'\t' \
+  '{printf "sentence_id\t%s\npassage_id\t%s\ndoc_id\t%s\nlines\t%s-%s\ntext\t%s\n", $1,$2,$3,$5,$6,$9}'
+read -r doc s e < <(printf '%s\n' "$row" | awk -F'\t' '{print $3, $5, $6}')
+ctx=2; a=$(( s > ctx ? s - ctx : 1 )); b=$(( e + ctx ))
+echo "--- window lines ${a}-${b} ---"
+sed -n "${a},${b}p" "documents/$doc/combined.md"

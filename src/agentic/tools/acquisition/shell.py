@@ -43,6 +43,11 @@ _MAX_OUTPUT_CHARS = 8000
 # /home, /root, /autodl-*, and the project tree so the sandbox sees only the
 # corpus + the binaries to read it.
 _SYSTEM_BINDS = ("/usr", "/bin", "/lib", "/lib64", "/etc")
+_SYSTEM_PATH = "/usr/local/bin:/usr/bin:/bin"
+# Where the semantic sidecar's unix socket is bound inside the sandbox. AF_UNIX
+# works across the bwrap mount namespace WITHOUT the network namespace, so the
+# scripts reach the host-side channels while the sandbox stays hermetic.
+_SIDECAR_MOUNT = "/run/evfs_sidecar.sock"
 # Fallback-only guard (bwrap makes these harmless, so it is not applied there).
 _DENY = re.compile(
     r"(?:^|[\s;&|`$(])\s*(?:rm|rmdir|mv|cp|dd|mkfs|chmod|chown|chgrp|ln|truncate|"
@@ -56,9 +61,32 @@ _DENY = re.compile(
 
 
 class ShellTool(BaseTool):
-    def __init__(self, corpus_root: Path):
+    def __init__(self, corpus_root: Path, extra_ro_binds=None, scripts_dirs=None,
+                 socket_path=None, timeout_s=_TIMEOUT_S):
         self.corpus_root = Path(corpus_root).resolve()
         self._bwrap = shutil.which("bwrap")
+        # Per-command wall clock. The lexical/base shells are sub-second
+        # (grep/awk/sed), so the tight default protects against a runaway
+        # pattern; the semantic tier's first call may wait on the sidecar's
+        # one-time channel load, so it passes a longer ceiling.
+        self._timeout_s = int(timeout_s)
+        # The semantic sidecar's unix socket on the HOST. When set, it is bound
+        # rw into the sandbox at ``_SIDECAR_MOUNT`` and exported as
+        # ``EVFS_SIDECAR_SOCK`` — the only channel the otherwise-hermetic
+        # semantic scripts have to the host-side retrieval channels.
+        self.socket_path = Path(socket_path).resolve() if socket_path else None
+        # Extra read-only trees bound at their REAL host path so absolute
+        # symlinks inside the corpus resolve (e.g. EvidenceFS
+        # ``documents/<doc>/combined.md`` → ``paddle_ocr/<doc>/combined.md``).
+        # Without this, bwrap mounts only the corpus and the symlink dangles.
+        self.extra_ro_binds = [Path(p).resolve() for p in (extra_ro_binds or [])]
+        # The EvidenceFS shell ABI, one dir per capability tier (``lexical`` /
+        # ``semantic``). Each is bound read-only at ``/scripts/<tier>`` and
+        # prepended to PATH, so the agent invokes the programs by bare name from
+        # the FS root exactly as the emitted README/EXAMPLES describe. Empty →
+        # a pure DCI shell (no scripts). Listing multiple dirs composes tiers,
+        # which is what lets the agent be ablated (lexical-only vs lexical+semantic).
+        self.scripts_dirs = [Path(p).resolve() for p in (scripts_dirs or [])]
 
     @property
     def name(self) -> str:
@@ -110,13 +138,27 @@ class ShellTool(BaseTool):
                 remediation="Use read-only locators: rg/grep/find/sed -n/head/tail/cat with pipes.",
             ), {"error": "blocked"}
 
+        # In bwrap mode PATH / EVFS_SIDECAR_SOCK are set via --setenv; in the
+        # fallback the child inherits this env, so prepend the scripts dirs at
+        # their real host path and point the socket var at the host socket.
+        env = None
+        present = [d for d in self.scripts_dirs if d.exists()]
+        if not self._bwrap and (present or self.socket_path):
+            env = dict(os.environ)
+            if present:
+                extra = ":".join(str(d) for d in present)
+                env["PATH"] = f"{extra}:{env.get('PATH', '')}"
+            if self.socket_path:
+                env["EVFS_SIDECAR_SOCK"] = str(self.socket_path)
+
         try:
             proc = subprocess.run(
                 argv,
                 capture_output=True,
                 text=True,
-                timeout=_TIMEOUT_S,
+                timeout=self._timeout_s,
                 cwd=str(self.corpus_root),
+                env=env,
             )
             out = proc.stdout or ""
             stderr = proc.stderr or ""
@@ -124,7 +166,7 @@ class ShellTool(BaseTool):
         except subprocess.TimeoutExpired:
             return err(
                 "timeout",
-                f"Command exceeded {_TIMEOUT_S}s. Narrow the search (add literal "
+                f"Command exceeded {self._timeout_s}s. Narrow the search (add literal "
                 "anchors, --max-count, or a file/dir scope).",
             ), {"error": "timeout"}
         except Exception as exc:  # noqa: BLE001
@@ -164,14 +206,39 @@ class ShellTool(BaseTool):
             for p in _SYSTEM_BINDS:
                 if os.path.exists(p):
                     argv += ["--ro-bind", p, p]
+            for p in self.extra_ro_binds:
+                if p.exists():
+                    argv += ["--ro-bind", str(p), str(p)]
             argv += [
                 # mount the corpus at a neutral /corpus so the host path
                 # (/home/<user>/…) is never revealed and no skeleton dirs leak.
                 "--ro-bind", str(self.corpus_root), "/corpus",
+            ]
+            # Each tier mounted at /scripts/<tier>, prepended to PATH, so the
+            # agent runs `find_surface …` by bare name from /corpus.
+            present = [d for d in self.scripts_dirs if d.exists()]
+            script_mounts = [f"/scripts/{d.name}" for d in present]
+            for d, mount in zip(present, script_mounts):
+                argv += ["--ro-bind", str(d), mount]
+            # Bind the sidecar socket rw (a client needs write access to
+            # connect); AF_UNIX needs no net namespace, so the sandbox below
+            # can still --unshare-all and stay hermetic.
+            if self.socket_path:
+                argv += ["--bind", str(self.socket_path), _SIDECAR_MOUNT]
+
+            # Clear the env entirely — the stdlib scripts need nothing but the
+            # socket, so no host cred is ever visible. Then set the minimal env.
+            argv += ["--clearenv"]
+            argv += ["--setenv", "PATH", ":".join(script_mounts + [_SYSTEM_PATH])]
+            argv += ["--setenv", "HOME", "/tmp"]
+            argv += ["--setenv", "LANG", "C.UTF-8"]
+            if self.socket_path:
+                argv += ["--setenv", "EVFS_SIDECAR_SOCK", _SIDECAR_MOUNT]
+            argv += [
                 "--tmpfs", "/tmp",
                 "--proc", "/proc",
                 "--dev", "/dev",
-                "--unshare-all",        # no network / pid / ipc / etc.
+                "--unshare-all",        # no pid / ipc / net / … namespace
                 "--die-with-parent",
                 "--chdir", "/corpus",
                 "/bin/bash", "-c", command,

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# find_surface REGEX — surface anchors whose name matches REGEX (case-insensitive).
+# Equivalent bare shell:
+#   head -1 views/surface_index.tsv; grep -iE 'REGEX' views/surface_index.tsv
+# Columns: surface_norm  surface_id  surface_raw  ner_label  mention_count  passage_df
+set -euo pipefail
+q=${1:?usage: find_surface <regex>}
+head -1 views/surface_index.tsv
+tail -n +2 views/surface_index.tsv | grep -iE -- "$q" || true

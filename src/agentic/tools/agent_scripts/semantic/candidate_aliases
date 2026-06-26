@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""candidate_aliases SID [--top-k N]
+
+Suggest surfaces whose embedding is nearest to surface SID — possible synonyms
+or co-references. EvidenceFS does NO entity merge, so this is a runtime
+SUGGESTION, not a stored fact: you decide whether they are the same entity
+(then `expand_surface` each). Reuses the real entity-embedding store (the
+NORMALIZED surface form is embedded, so casing / CJK / markup noise can't shift
+the result).
+
+Columns: rank  surface_id  surface_raw  ner_label  sim
+"""
+import argparse
+
+import _evfs_coords as C  # noqa: E402  (sibling module; bare-name exec puts this dir on sys.path[0])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="candidate_aliases")
+    ap.add_argument("surface_id", help="a surface id, e.g. sf_000046")
+    ap.add_argument("--top-k", type=int, default=10)
+    args = ap.parse_args()
+
+    C.print_rows(C.call("aliases", surface_id=args.surface_id, top_k=args.top_k))
+
+
+if __name__ == "__main__":
+    main()

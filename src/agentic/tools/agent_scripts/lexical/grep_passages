@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# grep_passages PATTERN PID [PID ...] — grep PATTERN only inside the line windows
+# of the given passages (avoids a full-corpus scan). Output lines are prefixed
+# with their passage id.
+set -euo pipefail
+pat=${1:?usage: grep_passages <pattern> <passage_id> [passage_id ...]}; shift
+for pid in "$@"; do
+  doc=""; read -r doc s e < <(awk -F'\t' -v p="$pid" '$1==p{print $2, $6, $7; exit}' nodes/passages.tsv) || true
+  [ -z "${doc:-}" ] && continue
+  sed -n "${s},${e}p" "documents/$doc/combined.md" \
+    | grep -niE -- "$pat" | sed "s#^#${pid}:#" || true
+done

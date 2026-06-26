@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# bridge_surfaces SID — surfaces co-occurring with SID in some sentence,
+# ranked by #shared sentences, with one example sentence id.
+# A bridge is co-occurrence, NOT a relation: read the example sentence
+# (show_sentence) to recover what the two surfaces actually have to do with
+# each other.
+# Columns: surface_b  surface_raw  shared_sentences  example_sentence_id
+set -euo pipefail
+sid=${1:?usage: bridge_surfaces <surface_id>}
+printf 'surface_b\tsurface_raw\tshared_sentences\texample_sentence_id\n'
+awk -F'\t' -v s="$sid" '
+  $1==s { c[$2]++; ex[$2]=$3 }
+  $2==s { c[$1]++; ex[$1]=$3 }
+  END   { for (k in c) printf "%s\t%d\t%s\n", k, c[k], ex[k] }
+' edges/surface_surface_sentence.tsv \
+| sort -t $'\t' -k1,1 \
+| join -t $'\t' -1 1 -2 1 - <(tail -n +2 nodes/surfaces.tsv | cut -f1,2 | sort -t $'\t' -k1,1) \
+| awk -F'\t' '{printf "%s\t%s\t%s\t%s\n", $1, $4, $2, $3}' \
+| sort -t $'\t' -k3,3nr

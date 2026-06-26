@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""search_dense --query "..." [--top-k N] [--file-ids id,id]
+
+Genuine dense (embedding) passage recall: reuses the real SemanticChannel
+(embed the query via the API, faiss kNN over passage embeddings) -- zero
+degradation. Direct-similarity signal: it has NO entity dependency, so it
+finds the passage nearest in meaning even when the query has no extractable
+entity or the answer is poorly graph-connected -- exactly the cases
+`rank_passages` (graph/PPR) can miss. The two are complementary (the same split
+the underlying RAG fuses). Output is candidate generation: READ the page to
+confirm.
+
+Columns: rank  doc_id  page  score  page_file  preview
+"""
+import argparse
+
+import _evfs_coords as C  # noqa: E402  (sibling module; bare-name exec puts this dir on sys.path[0])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="search_dense")
+    ap.add_argument("--query", required=True, help="natural-language question")
+    ap.add_argument("--top-k", type=int, default=10)
+    ap.add_argument("--file-ids", default="", help="comma-separated source_path scope")
+    args = ap.parse_args()
+
+    scope = [s for s in args.file_ids.split(",") if s] or None
+    C.print_rows(C.call("dense", query=args.query, top_k=args.top_k, file_ids=scope))
+
+
+if __name__ == "__main__":
+    main()

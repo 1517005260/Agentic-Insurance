@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# expand_surface SID — passages where surface SID appears, joined to doc + line range.
+# Equivalent bare shell: take SID's rows from the (passage-key) view and join to passages.tsv.
+# Columns: passage_id  mention_count  weight_in_passage  doc_id  start_line  end_line
+set -euo pipefail
+sid=${1:?usage: expand_surface <surface_id>}
+printf 'passage_id\tmention_count\tweight_in_passage\tdoc_id\tstart_line\tend_line\n'
+join -t $'\t' -1 1 -2 1 \
+  <(awk -F'\t' -v s="$sid" '$1==s{print $2"\t"$3"\t"$4}' views/surface_passages.sorted.tsv | sort -t $'\t' -k1,1) \
+  <(tail -n +2 nodes/passages.tsv | cut -f1,2,6,7 | sort -t $'\t' -k1,1)

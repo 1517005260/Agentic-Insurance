@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+"""seed_surfaces --query "..." [--top-k N]
+
+Embedding seeding: the surface anchors (sf_*) nearest in meaning to the query.
+Reuses the real entity-embedding store (the same vectors PPR seeds from) -- zero
+degradation. The embedding counterpart of `find_surface`: use it when the exact
+term is not in the query (a synonym / vaguer phrasing), then `expand_surface` /
+`bridge_surfaces` the surfaces it returns.
+
+Columns: rank  surface_id  surface_raw  ner_label  sim
+"""
+import argparse
+
+import _evfs_coords as C  # noqa: E402  (sibling module; bare-name exec puts this dir on sys.path[0])
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="seed_surfaces")
+    ap.add_argument("--query", required=True, help="natural-language question")
+    ap.add_argument("--top-k", type=int, default=10)
+    args = ap.parse_args()
+
+    C.print_rows(C.call("seed", query=args.query, top_k=args.top_k))
+
+
+if __name__ == "__main__":
+    main()
