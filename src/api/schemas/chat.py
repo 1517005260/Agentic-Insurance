@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # ----------------------------------------------------------- session ----
 
 ModeLiteral = Literal["rag", "agent"]
-AgentKindLiteral = Literal["base", "proof", "graph"]
+AgentKindLiteral = Literal["base", "graph"]
 
 
 class SessionCreate(BaseModel):
@@ -33,14 +33,14 @@ class SessionCreate(BaseModel):
             raise ValueError("agent_kind is required when mode='agent'")
         if self.mode == "rag" and self.agent_kind is not None:
             raise ValueError("agent_kind must be omitted when mode='rag'")
-        # web=1 forbidden with proof/graph; chat UI never offers them
+        # web=1 forbidden with graph; chat UI never offers it
         # alongside the web toggle, so a request like that is almost
         # certainly a buggy client.
-        if self.web and self.mode == "agent" and self.agent_kind in ("proof", "graph"):
+        if self.web and self.mode == "agent" and self.agent_kind == "graph":
             raise ValueError(
                 "web=true is only valid with mode='rag' or "
-                "(mode='agent' AND agent_kind='base'); proof / graph "
-                "agents do not have a web variant"
+                "(mode='agent' AND agent_kind='base'); the graph "
+                "agent does not have a web variant"
             )
         return self
 
@@ -127,10 +127,10 @@ class AgentStreamRequest(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_web_compat(self) -> "AgentStreamRequest":
-        if self.web and self.kind in ("proof", "graph"):
+        if self.web and self.kind == "graph":
             raise ValueError(
-                "web=true is only valid with kind='base'; proof / graph "
-                "agents do not have a web variant"
+                "web=true is only valid with kind='base'; the graph "
+                "agent does not have a web variant"
             )
         return self
 

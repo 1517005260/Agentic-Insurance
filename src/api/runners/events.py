@@ -1,6 +1,6 @@
 """Sync→async event bridge for streaming runners.
 
-The algorithm layer (RAGPipeline, BaseAgent, ProofAgent) is synchronous
+The algorithm layer (RAGPipeline, BaseAgent) is synchronous
 and runs inside ``loop.run_in_executor(...)``. SSE consumers (FastAPI
 routes) are async generators yielding bytes. ``EventBus`` is the seam:
 
@@ -63,9 +63,6 @@ class EventType:
     THOUGHT = "thought"           # intermediate LLM content (reasoning / plan), not the final answer
     TOOL_CALL = "tool_call"
     TOOL_RESULT = "tool_result"
-    OBLIGATION = "obligation"     # proof
-    CLAIM = "claim"               # proof
-    GAP = "gap"                   # proof
 
     # Graph-agent live replay — emitted by agent_runner.py when a graph
     # kind agent's graph tool returns. Carries enough metadata

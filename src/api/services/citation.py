@@ -35,7 +35,7 @@ class CitationItem:
     opens ``file_id`` at ``page_number``. ``page_preview`` is a short
     excerpt to show in the drawer header before the PDF render kicks
     in. ``observation_id`` is populated for agent paths (links the
-    citation to the proof observation), None for RAG.
+    citation to the read observation), None for RAG.
     """
 
     sup: int

@@ -237,7 +237,7 @@ def _split_event_frame(frame: bytes) -> Optional[Tuple[str, bytes]]:
 def _format_profile(p: CustomerProfile) -> str:
     """Pretty-print the customer profile as a labelled block.
 
-    Mirrors ``exclusion_runner._format_profile`` so the two workbenches'
+    Mirrors ``recommend_runner._format_profile`` so the two workbenches'
     user prompts present customer data the same way; copied rather than
     imported because keeping each runner's prompt-build path independent
     is the established convention here.

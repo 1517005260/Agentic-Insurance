@@ -287,7 +287,7 @@ async def _persist_after_stream(
         # mode='agent'. web=True forces the dedicated web agent
         # singleton (ChatSchema already enforces kind='base' here).
         if session.web:
-            agent = request.app.state.web_agent
+            agent = request.app.state.base_agent
             stream_kind = "web"
         else:
             agent = _resolve_agent(request, session.agent_kind or "")
@@ -396,9 +396,9 @@ async def _persist_assistant_when_ready(
         # The worker completed but the client never saw the tail. Mark
         # so audit can distinguish a clean reply from one nobody read.
         # Each runner uses its own success vocabulary (RAG: "ok";
-        # base/graph: "natural"/"max_loops_exceeded"; proof:
-        # "finalized"/...) — flatten any non-error to client_disconnect
-        # but stash the original for diagnostics.
+        # base/graph: "natural"/"max_loops_exceeded") — flatten any
+        # non-error to client_disconnect but stash the original for
+        # diagnostics.
         original = payload.get("exit_reason")
         payload = {**payload, "exit_reason": "client_disconnect"}
         if original is not None:
@@ -468,8 +468,6 @@ def _resolve_agent(request: Request, kind: str):
     state = request.app.state
     if kind == "base":
         return state.base_agent
-    if kind == "proof":
-        return state.proof_agent
     if kind == "graph":
         return state.graph_agent
     raise HTTPException(
@@ -506,14 +504,14 @@ async def agent_stream(
     request: Request,
     _user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    """Smoke endpoint: streams a base/proof/graph/web agent run, no persistence.
+    """Smoke endpoint: streams a base/graph/web agent run, no persistence.
 
     ``body.web=True`` swaps in the dedicated web agent singleton with
     its own kwargs map. Schema validation already rejected the
-    forbidden combos (web=True + proof/graph).
+    forbidden combos (web=True + graph).
     """
     if body.web:
-        agent = request.app.state.web_agent
+        agent = request.app.state.base_agent
         kind = "web"
     else:
         agent = _resolve_agent(request, body.kind)

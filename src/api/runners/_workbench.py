@@ -1,8 +1,7 @@
 """Shared scaffolding for the insurance workbench runners.
 
-The five workbenches differ only in:
+The workbenches differ only in:
   * which prompt key they pull from admin config,
-  * which agent singleton they call (base / proof),
   * how they format the user prompt from structured input,
   * what extra fields they fold into the ``final`` SSE payload.
 
@@ -16,9 +15,7 @@ tool envelopes as they stream past, mints a :class:`CitationItem`
 for every distinct ``(file_id, page_id)`` pair in first-seen order,
 and pushes one ``citations`` SSE event before the runner's ``final``
 frame so the frontend's CitationDrawer can resolve every sup the
-answer cites. ``proof_scan`` envelopes are skipped — they carry
-unit_ids only, and the agent must call ``read`` to ground any
-ScanClaim into verbatim text anyway.
+answer cites.
 """
 import asyncio
 import json
@@ -26,7 +23,6 @@ import logging
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners._tracing import CapturingTracer
 from api.runners.events import EventBus, EventType
 from api.services.citation import CitationItem
@@ -39,7 +35,7 @@ from tracer import Tracer
 logger = logging.getLogger(__name__)
 
 
-_EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset({"read", "proof_scan"})
+_EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset({"read"})
 
 
 def _is_evidence(name: Optional[str]) -> bool:
@@ -72,10 +68,10 @@ async def stream_workbench_agent(
     *,
     user_prompt: str,
     agent: Any,
-    kind: str,                 # "base" | "proof"
+    kind: str,                 # "base"
     config: ConfigStore,
     prompt_key: str,           # admin config key for the SYSTEM prompt
-    flavor: str,               # tracer subdir: "compare", "exclusion", ...
+    flavor: str,               # tracer subdir: "compare", "recommend", ...
     final_extras: Optional[Dict[str, Any]] = None,
     tracer: Optional[Tracer] = None,
     result_future: Optional["asyncio.Future[Dict[str, Any]]"] = None,
@@ -86,7 +82,7 @@ async def stream_workbench_agent(
     Why not reuse :func:`api.runners.agent_runner.stream_agent`? The
     workbench needs:
       * a *workbench-specific* system prompt pulled from a separate
-        admin key (not ``prompt.base_agent`` / ``prompt.proof_agent``);
+        admin key (not ``prompt.base_agent``);
       * a structured user prompt assembled from the request body, not
         the raw ``query`` field;
       * extra final-payload fields the chat surface doesn't carry.
@@ -94,10 +90,10 @@ async def stream_workbench_agent(
     tool_result evidence enrichment, trace_path) are factored here so
     every workbench gets them for free.
     """
-    if kind not in ("base", "proof"):
+    if kind != "base":
         raise ValueError(f"unsupported workbench kind: {kind!r}")
-    if not isinstance(agent, (BaseAgent, ProofAgent)):
-        raise TypeError("agent must be BaseAgent or ProofAgent")
+    if not isinstance(agent, BaseAgent):
+        raise TypeError("agent must be BaseAgent")
 
     loop = asyncio.get_running_loop()
     bus = EventBus(loop=loop)
@@ -106,8 +102,8 @@ async def stream_workbench_agent(
     # Snapshot config once — concurrent admin PATCH cannot half-apply mid-run.
     system_prompt = str(config.get(prompt_key))
     # Workbenches inherit the per-kind ``max_loops`` / ``max_token_budget``
-    # from the corresponding agent kind so admin tuning of the base /
-    # proof agent flows through. The system prompt comes from the
+    # from the corresponding agent kind so admin tuning of the base
+    # agent flows through. The system prompt comes from the
     # workbench-specific key above.
     agent_overrides = config.materialize_agent_kwargs(kind)
     agent_overrides["system_prompt"] = system_prompt
@@ -115,10 +111,7 @@ async def stream_workbench_agent(
 
     # Citation accumulator. Populated as ``read`` tool results flow
     # past; one CitationItem per distinct ``(file_id, page_id)`` pair
-    # in first-seen order. ``proof_scan`` is ignored — its envelope
-    # carries unit_ids only, which would require an inventory lookup
-    # to resolve to (file_id, page_number); the ``read`` calls the
-    # agent makes to ground a ScanClaim cover the same evidence.
+    # in first-seen order.
     cited_units: List[CitationItem] = []
     seen_keys: Set[Tuple[str, str]] = set()
 
@@ -144,38 +137,22 @@ async def stream_workbench_agent(
     def run_in_thread() -> None:
         result_payload: Dict[str, Any] = {}
         try:
-            if kind == "proof":
-                proof_result: ProofRunResult = agent.run(
-                    user_prompt,
-                    tracer=capturing,
-                    on_event=wrapped_on_event,
-                    cancel_check=lambda: bus.is_closed,
-                    **agent_overrides,
-                )
-                result_payload = {
-                    "answer": proof_result.answer,
-                    "decision": proof_result.decision,
-                    "exit_reason": proof_result.exit_reason,
-                    "loops": proof_result.loops,
-                    "total_cost": proof_result.total_cost,
-                }
-            else:
-                base_result: Dict[str, Any] = agent.run(
-                    user_prompt,
-                    tracer=capturing,
-                    on_event=wrapped_on_event,
-                    cancel_check=lambda: bus.is_closed,
-                    **agent_overrides,
-                )
-                result_payload = {
-                    "answer": base_result.get("answer", ""),
-                    "exit_reason": base_result.get("exit_reason"),
-                    "loops": base_result.get("loops"),
-                    "total_cost": base_result.get("total_cost"),
-                    "input_tokens_total": base_result.get("input_tokens_total"),
-                    "cached_tokens_total": base_result.get("cached_tokens_total"),
-                    "output_tokens_total": base_result.get("output_tokens_total"),
-                }
+            base_result: Dict[str, Any] = agent.run(
+                user_prompt,
+                tracer=capturing,
+                on_event=wrapped_on_event,
+                cancel_check=lambda: bus.is_closed,
+                **agent_overrides,
+            )
+            result_payload = {
+                "answer": base_result.get("answer", ""),
+                "exit_reason": base_result.get("exit_reason"),
+                "loops": base_result.get("loops"),
+                "total_cost": base_result.get("total_cost"),
+                "input_tokens_total": base_result.get("input_tokens_total"),
+                "cached_tokens_total": base_result.get("cached_tokens_total"),
+                "output_tokens_total": base_result.get("output_tokens_total"),
+            }
 
             if final_extras:
                 result_payload.update(final_extras)

@@ -23,7 +23,7 @@ PYTHONPATH=src ALLOW_INSECURE_JWT=1 uv run uvicorn api.main:app --port 8000
 ### Lifespan 启动顺序（看 log 能确认）
 
 1. **`_validate_jwt_secret`** — 占位符 + 没 `ALLOW_INSECURE_JWT=1` 直接拒启
-2. **`init_db`** — Alembic stamp / upgrade head（pre-Phase-6 dev DB stamp，全新 DB upgrade，已 head no-op）
+2. **`init_db`** — Alembic stamp / upgrade head（已有 dev DB stamp，全新 DB upgrade，已 head no-op）
 3. **`_seed_admin`** — `users` 空时建 `admin / admin123`（强警告）
 4. **`reconcile_after_restart`** — 把上次崩在 `parsing/indexing/deleting` 的 files / `pending/running` 的 jobs 翻 `failed`
 5. **`sweep_orphan_uploads`** — 删 `uploads/<id>.<suffix>` 但 `files` 表没行的崩残 blob（跳 `.part`）
@@ -69,7 +69,7 @@ src/api/
 │   ├── _tracing.py          # CapturingTracer（包 Tracer 抓 last_run_dir）
 │   ├── _workbench.py        # 5 workbench 共享脚手架（read 累计 → CitationItem dedup → sup → final 之前 emit）
 │   ├── rag_runner.py        # /chat/sessions/.. mode=rag → RAGPipeline.run + token 流 + CitationBuilder
-│   ├── agent_runner.py      # /agent/stream + /chat/sessions/.. mode=agent (base/proof/graph/web) — Phase 6 _compose_query_with_history 拼多轮
+│   ├── agent_runner.py      # /agent/stream + /chat/sessions/.. mode=agent (base/proof/graph/web) — _compose_query_with_history 拼多轮
 │   ├── web_rag_runner.py    # /web-rag/stream → web_rag_svc.stream_chat
 │   ├── ingestion_runner.py  # /files/{id}/jobs/stream 用的 EventBus 注册表 + claim_stream 单消费者守卫
 │   ├── compare_runner.py    # 多产品对比矩阵
@@ -83,7 +83,7 @@ src/api/
 │   ├── files.py             # ingest 状态机 + INGEST_LOCK + bg task（run_parse_index / run_reingest / run_delete）+ orphan sweep
 │   ├── chat.py              # session/message CRUD + metadata 编码 + 1500-char 标题截断
 │   ├── citation.py          # CitationBuilder：sup 编号 + 页头内联 [^k] + parse_response 抽 [^k] 列表
-│   ├── history.py           # Phase 6 多轮 load_recent_turns：从 chat_messages.user.content + final.json.answer 拼 (q, a) pair
+│   ├── history.py           # 多轮 load_recent_turns：从 chat_messages.user.content + final.json.answer 拼 (q, a) pair
 │   ├── graph_service.py     # /graph/* 端点的 service（overview/seed_search/expand/node_detail/ppr_subgraph/sample）
 │   ├── search.py            # /search 端点的 service（任选通道 + post-filter overfetch + n_pre_filter 遥测）
 │   └── web_rag.py           # Tavily 检索 + LLM 总结 + sup 标号；驱动 chat web mode SSE

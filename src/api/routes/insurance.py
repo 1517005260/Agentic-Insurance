@@ -1,11 +1,10 @@
 """Insurance workbench routes.
 
-Seven SSE endpoints powering the user-facing workbenches; the
-frontend's Risk-Prediction page tabs four of them so they share a UI
-shell while keeping their backend contracts independent:
+Six SSE endpoints powering the user-facing workbenches; the
+frontend's Risk-Prediction page tabs several of them so they share a
+UI shell while keeping their backend contracts independent:
 
 * ``POST /insurance/compare/stream``          — SSE (BaseAgent)
-* ``POST /insurance/exclusion-audit/stream``  — SSE (ProofAgent)
 * ``POST /insurance/recommend/stream``        — SSE (BaseAgent)
 * ``POST /insurance/claim-check/stream``      — SSE (BaseAgent)
 * ``POST /insurance/policy-calc/stream``      — SSE (BaseAgent + code_run)
@@ -25,7 +24,6 @@ from api.deps import get_current_user
 from api.models import User
 from api.runners.claim_runner import stream_claim_check
 from api.runners.compare_runner import stream_compare
-from api.runners.exclusion_runner import stream_exclusion_audit
 from api.runners.fraud_ppr_runner import stream_fraud_ppr
 from api.runners.policy_calc_runner import stream_policy_calc
 from api.runners.recommend_runner import stream_recommend
@@ -33,7 +31,6 @@ from api.runners.risk_predict_runner import stream_risk_predict
 from api.schemas.insurance import (
     ClaimCheckRequest,
     CompareRequest,
-    ExclusionAuditRequest,
     FraudPPRRequest,
     PolicyCalcRequest,
     RecommendRequest,
@@ -72,27 +69,6 @@ async def compare_stream(
             file_ids=body.file_ids,
             properties=body.properties,
             agent=request.app.state.base_agent,
-            config=request.app.state.config,
-        ),
-        media_type="text/event-stream",
-        headers=_SSE_HEADERS,
-    )
-
-
-# ---------------------------------------------------------- exclusion audit
-
-
-@router.post("/exclusion-audit/stream")
-async def exclusion_audit_stream(
-    body: ExclusionAuditRequest,
-    request: Request,
-    _user: User = Depends(get_current_user),
-) -> StreamingResponse:
-    return StreamingResponse(
-        stream_exclusion_audit(
-            file_id=body.file_id,
-            customer=body.customer,
-            agent=request.app.state.proof_agent,
             config=request.app.state.config,
         ),
         media_type="text/event-stream",

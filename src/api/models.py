@@ -153,7 +153,7 @@ class IngestJob(Base):
 # --------------------------------------------------------- chat sessions
 
 CHAT_MODES = ("rag", "agent")
-AGENT_KINDS = ("base", "proof", "graph")
+AGENT_KINDS = ("base", "graph")
 
 
 class ChatSession(Base):
@@ -169,10 +169,10 @@ class ChatSession(Base):
     # ``web`` is an orthogonal toggle on top of (mode, agent_kind):
     #   mode=rag,   web=0 → local RAG
     #   mode=rag,   web=1 → Tavily-based web RAG (single LLM call)
-    #   mode=agent, web=0 → BaseAgent / ProofAgent / GraphAgent (per agent_kind)
+    #   mode=agent, web=0 → BaseAgent / GraphAgent (per agent_kind)
     #   mode=agent, web=1 → WebAgent (only valid when agent_kind='base')
     # Forbidden combos:
-    #   mode=agent + agent_kind in {proof,graph} + web=1
+    #   mode=agent + agent_kind='graph' + web=1
     web: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
@@ -194,7 +194,7 @@ class ChatSession(Base):
     __table_args__ = (
         CheckConstraint("mode IN ('rag','agent')", name="ck_sessions_mode"),
         CheckConstraint(
-            "agent_kind IS NULL OR agent_kind IN ('base','proof','graph')",
+            "agent_kind IS NULL OR agent_kind IN ('base','graph')",
             name="ck_sessions_agent_kind",
         ),
         # `mode='agent'` requires `agent_kind`; `mode='rag'` forbids it.

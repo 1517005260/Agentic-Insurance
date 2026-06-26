@@ -37,10 +37,8 @@ from api.services.files import (
 )
 from api.services.graph_service import GraphService
 from agentic.agent.factory import (
-    build_default_agent,
+    build_base_agent,
     build_graph_agent,
-    build_proof_agent,
-    build_web_agent,
 )
 from config.config_store import ConfigStore
 from model_client.web_search import TavilyClient
@@ -138,13 +136,12 @@ async def lifespan(_app: FastAPI):
         "config store loaded (%d keys)", len(_app.state.config.snapshot())
     )
 
-    # Three agent singletons, one per chat session ``agent_kind``.
-    # Each instance is per-process state-free (``run()`` builds fresh
-    # AgentContext / ProofSession internally), so sharing across
-    # requests is safe.
+    # Agent singletons, one per chat session ``agent_kind``.
+    # Each instance is per-process state-free (``run()`` builds a fresh
+    # AgentContext internally), so sharing across requests is safe.
     #
     # Heavy resources (PageStore, embedding/visual clients,
-    # GraphPPRChannel) are built ONCE here and threaded into the three
+    # GraphPPRChannel) are built ONCE here and threaded into the
     # agent factories AND the RAG pipeline — the per-component defaults
     # would otherwise duplicate those loads (PageStore scans
     # local_storage/page_assets, GraphPPRChannel mmaps faiss + reads
@@ -213,57 +210,30 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("RAG pipeline singleton constructed (shared graph channel)")
 
-    # Graph tool tunables (entity_lookup_min_sim / gradient) are baked at
-    # construction; admin changes require a backend restart.
-    # See ConfigStore.graph_explore_kwargs() and the entries' descriptions.
-    shared_graph_explore_kwargs = _app.state.config.graph_explore_kwargs()
-    _app.state.base_agent = build_default_agent(
-        llm_client=shared_llm,
-        embedding_client=shared_embedding,
-        visual_client=shared_visual,
-        page_store=shared_page_store,
-        inventory=shared_inventory,
-        graph_channel=shared_graph_channel,
-        graph_explore_kwargs=shared_graph_explore_kwargs,
-    )
-    _app.state.proof_agent = build_proof_agent(
-        llm_client=shared_llm,
-        embedding_client=shared_embedding,
-        visual_client=shared_visual,
-        page_store=shared_page_store,
-        inventory=shared_inventory,
-        graph_channel=shared_graph_channel,
-        graph_explore_kwargs=shared_graph_explore_kwargs,
-    )
-    _app.state.graph_agent = build_graph_agent(
-        llm_client=shared_llm,
-        embedding_client=shared_embedding,
-        page_store=shared_page_store,
-        inventory=shared_inventory,
-        graph_channel=shared_graph_channel,
-        graph_explore_kwargs=shared_graph_explore_kwargs,
-    )
-
-    # Tavily client + web agent. The Tavily client is fail-soft when
-    # TAVILY_API_KEY is missing — :meth:`available` lets routes / the
-    # tool short-circuit, so the lifespan still boots cleanly without
-    # a key (the web-rag / web-agent chat surfaces will then respond
-    # "unavailable" envelopes until the key is set).
+    # Tavily client shared by the web tools both agents register. Fail-soft
+    # when TAVILY_API_KEY is missing — :meth:`available` lets routes / the
+    # tool short-circuit, so the lifespan still boots cleanly without a key
+    # (web surfaces respond "unavailable" envelopes until the key is set).
     shared_tavily = TavilyClient()
     _app.state.tavily_client = shared_tavily
     if not shared_tavily.available():
         logger.warning(
-            "TAVILY_API_KEY missing — chat web mode + web agent will surface "
+            "TAVILY_API_KEY missing — chat web mode + web tools will surface "
             "'tavily unavailable' until the key is provided in the env"
         )
 
-    _app.state.web_agent = build_web_agent(
+    _app.state.base_agent = build_base_agent(
+        llm_client=shared_llm,
+        tavily_client=shared_tavily,
+        config_store=_app.state.config,
+    )
+    _app.state.graph_agent = build_graph_agent(
         llm_client=shared_llm,
         tavily_client=shared_tavily,
         config_store=_app.state.config,
     )
     logger.info(
-        "base / proof / graph / web agent singletons constructed (shared PageStore + GraphPPRChannel + Tavily)"
+        "base / graph agent singletons constructed (shared Tavily web tools)"
     )
 
     # Web-side facade over the same GraphPPRChannel — no extra mmap;
@@ -340,7 +310,7 @@ async def lifespan(_app: FastAPI):
             _app.state.graph_service.invalidate_caches()
         except Exception:
             logger.exception("graph_service.invalidate_caches raised")
-        for agent_attr in ("base_agent", "proof_agent", "graph_agent"):
+        for agent_attr in ("base_agent", "graph_agent"):
             agent = getattr(_app.state, agent_attr, None)
             if agent is None:
                 continue

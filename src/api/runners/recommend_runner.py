@@ -11,9 +11,30 @@ from typing import AsyncIterator, List, Optional
 
 from agentic.agent.base import BaseAgent
 from api.runners._workbench import stream_workbench_agent
-from api.runners.exclusion_runner import _format_profile
 from api.schemas.insurance import CustomerProfile
 from config.config_store import ConfigStore
+
+
+def _format_profile(p: CustomerProfile) -> str:
+    """Pretty-print the customer profile as a labeled block."""
+    parts: List[str] = [
+        f"- 年龄: {p.age}",
+        f"- 性别: {p.gender}",
+        f"- 职业: {p.occupation}",
+    ]
+    if p.occupation_risk:
+        parts.append(f"- 职业风险: {p.occupation_risk}")
+    if p.health_history:
+        parts.append(f"- 病史: {', '.join(p.health_history)}")
+    if p.family_history:
+        parts.append(f"- 家族史: {', '.join(p.family_history)}")
+    if p.budget_annual is not None:
+        parts.append(f"- 年预算: {p.budget_annual}")
+    if p.goal:
+        parts.append(f"- 主诉求: {p.goal}")
+    if p.notes:
+        parts.append(f"- 补充说明: {p.notes}")
+    return "\n".join(parts)
 
 
 def _build_user_prompt(

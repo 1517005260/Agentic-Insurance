@@ -226,7 +226,7 @@ def build_agent_assistant_metadata(
     original_exit_reason: Optional[str] = None,
     citations: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Compose the metadata dict for any agent assistant message (base/proof/graph/web).
+    """Compose the metadata dict for any agent assistant message (base/graph/web).
 
     ``citations`` is populated for web-agent runs (kind="web"); other
     kinds leave it None so the stored JSON stays compact.

@@ -1,7 +1,7 @@
 """Runners: long-running per-request work that streams events back via SSE.
 
 A runner is the bridge between (a) the synchronous, pre-existing algorithm
-layer (``RAGPipeline``, ``BaseAgent``, ``ProofAgent``) and (b) the async
+layer (``RAGPipeline``, ``BaseAgent``) and (b) the async
 FastAPI route that needs to stream incremental progress to the browser.
 
 The pattern is::

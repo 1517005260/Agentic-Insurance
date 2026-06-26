@@ -5,8 +5,6 @@ tiny and forking per-workbench would just multiply imports. The
 order below mirrors the runner files:
 
 * :class:`CompareRequest` — N×M product comparison (BaseAgent SSE).
-* :class:`ExclusionAuditRequest` — single-product underwriting audit
-  (ProofAgent SSE).
 * :class:`RecommendRequest` — customer-profile product recommendation
   with optional held-policy gap analysis (BaseAgent SSE).
 * :class:`ClaimCheckRequest` — multi-product claim-coverage analysis
@@ -59,11 +57,11 @@ class CompareRequest(BaseModel):
         return self
 
 
-# ---------------------------------------------------------------- exclusion audit
+# ---------------------------------------------------------------- customer profile
 
 
 class CustomerProfile(BaseModel):
-    """Shared customer-profile payload (exclusion audit + recommend)."""
+    """Shared customer-profile payload (recommend + risk-predict)."""
 
     age: int = Field(..., ge=0, le=120)
     gender: Literal["M", "F", "X"]
@@ -74,13 +72,6 @@ class CustomerProfile(BaseModel):
     budget_annual: Optional[int] = Field(default=None, ge=0, le=10_000_000)
     goal: Optional[str] = Field(default=None, max_length=80)
     notes: Optional[str] = Field(default=None, max_length=500)
-
-
-class ExclusionAuditRequest(BaseModel):
-    """``POST /insurance/exclusion-audit/stream`` body."""
-
-    file_id: str = Field(..., min_length=1, max_length=128)
-    customer: CustomerProfile
 
 
 # ---------------------------------------------------------------- recommend

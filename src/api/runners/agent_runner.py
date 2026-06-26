@@ -1,10 +1,10 @@
-"""Agent runner — base / proof / graph / web behind one streaming entry point.
+"""Agent runner — base / graph / web behind one streaming entry point.
 
 Same EventBus pattern as :mod:`api.runners.rag_runner`. Adds:
 
 * per-tool ``is_evidence`` tag on ``tool_result`` events (so the
-  frontend can render read_page / proof_scan / graph-tool neighbors
-  as inline citation cards instead of generic explore steps);
+  frontend can render read_page / graph-tool neighbors as inline
+  citation cards instead of generic explore steps);
 * tracer attachment so the assistant message can persist a relative
   ``trace_path`` for later detail lookup;
 * result accumulation surfaced via an ``asyncio.Future`` so the route
@@ -16,7 +16,7 @@ Same EventBus pattern as :mod:`api.runners.rag_runner`. Adds:
   ``citations`` SSE event before the runner's own ``final`` (the
   agent-internal ``final`` is swallowed to keep ``citations → final
   → done`` ordering, mirroring :mod:`api.runners._workbench`).
-* for ``kind in {base, proof, graph}``: same ``_accumulate_read_citations``
+* for ``kind in {base, graph}``: same ``_accumulate_read_citations``
   pattern as :mod:`api.runners._workbench` — every ``read`` envelope
   contributes its ``units`` to a deduped sup-numbered list emitted as
   one ``citations`` event before ``final``. The default chat prompts
@@ -33,7 +33,6 @@ import re
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners._tracing import CapturingTracer
 from api.runners._workbench import _accumulate_read_citations
 from api.runners.events import EventBus, EventType
@@ -49,16 +48,13 @@ logger = logging.getLogger(__name__)
 # ----------------------------------------------------------- evidence ----
 
 # Tools whose ``tool_result`` payload should carry ``is_evidence=True``.
-# Updated after reviewing the actual tool catalog: only the two tools
-# that return verbatim page / atom content count. Everything else
-# (semantic / bm25 / pattern / graph_ppr / graph_chain / entity_inspect) is discovery
-# — the model still needs to call ``read`` to commit to a page as
-# evidence. ``read`` is the single name registered by ReadTool
-# (`agentic/tools/acquisition/read.py:74`); ``proof_scan`` is the
-# proof-side atom reader.
+# Only ``read`` returns verbatim page content; everything else
+# (semantic / bm25 / graph_ppr / graph_chain / entity_inspect) is
+# discovery — the model still needs to call ``read`` to commit to a
+# page as evidence. ``read`` is the single name registered by ReadTool
+# (`agentic/tools/acquisition/read.py:74`).
 _EVIDENCE_TOOL_NAMES: frozenset[str] = frozenset({
     "read",
-    "proof_scan",
 })
 
 
@@ -82,16 +78,6 @@ def _is_evidence(name: Optional[str], args: Optional[Dict[str, Any]]) -> bool:
 # --------------------------------------------------------- main entry ----
 
 
-def _make_proof_final_payload(result: ProofRunResult) -> Dict[str, Any]:
-    return {
-        "answer": result.answer,
-        "decision": result.decision,
-        "exit_reason": result.exit_reason,
-        "loops": result.loops,
-        "total_cost": result.total_cost,
-    }
-
-
 def _make_base_final_payload(result: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "answer": result.get("answer", ""),
@@ -110,7 +96,7 @@ def _compose_query_with_history(
     """Stitch prior (query, answer) pairs in front of ``current_query``.
 
     Agent runs are message-list-driven (``[system, user(query)]`` →
-    iterate); rather than reach into BaseAgent / ProofAgent and rebuild
+    iterate); rather than reach into BaseAgent and rebuild
     a multi-turn message list with role=assistant turns (which would
     drag tool_call / tool_result accounting along), we keep each agent
     invocation as a self-contained "long internal conversation" and
@@ -133,8 +119,8 @@ def _compose_query_with_history(
 async def stream_agent(
     *,
     query: str,
-    kind: str,                                    # "base" | "proof" | "graph"
-    agent: Any,                                   # BaseAgent or ProofAgent singleton
+    kind: str,                                    # "base" | "graph" | "web"
+    agent: Any,                                   # BaseAgent singleton
     config: Optional[ConfigStore] = None,
     tracer: Optional[Tracer] = None,
     result_future: Optional["asyncio.Future[Dict[str, Any]]"] = None,
@@ -150,7 +136,7 @@ async def stream_agent(
     payload so the route can persist it.
 
     ``result_future`` (when provided) is set with a dict carrying
-    ``answer`` / ``exit_reason`` / ``loops`` / ``decision``? /
+    ``answer`` / ``exit_reason`` / ``loops`` /
     ``total_cost`` / ``trace_path``? once the agent returns. The route
     handler awaits it after the bus drains to write the assistant
     message inside the request's async DB session.
@@ -162,7 +148,7 @@ async def stream_agent(
     but want a workbench-specific instruction set without registering a
     new agent kind.
     """
-    if kind not in ("base", "proof", "graph", "web"):
+    if kind not in ("base", "graph", "web"):
         raise ValueError(f"unsupported agent kind: {kind!r}")
 
     loop = asyncio.get_running_loop()
@@ -193,7 +179,7 @@ async def stream_agent(
     # differ from the envelope's ``final_url`` (HTTP redirect). When
     # the result lands we union the two so the LLM can cite either.
     pending_fetch_url: Optional[str] = None
-    # Local-agent (base / proof / graph) citation pool: same shape as
+    # Local-agent (base / graph) citation pool: same shape as
     # the workbench accumulator — each ``read`` envelope contributes
     # its ``units`` deduped by (file_id, page_id), sup is first-seen
     # order. Emitted once before ``final`` so the chat ``citations``
@@ -220,9 +206,9 @@ async def stream_agent(
 
         # Enrich tool_result frames with is_evidence so the frontend
         # can split inline citation cards from generic explore steps.
-        # Drop ``_full_result`` (BaseAgent / ProofAgent pass the raw
-        # tool envelope under that key for runner-side consumers); the
-        # chat surface only needs the 300-char preview.
+        # Drop ``_full_result`` (BaseAgent passes the raw tool envelope
+        # under that key for runner-side consumers); the chat surface
+        # only needs the 300-char preview.
         if event_name == EventType.TOOL_RESULT:
             full_result = data.get("_full_result")
             tool_name = data.get("name")
@@ -249,7 +235,7 @@ async def stream_agent(
             # gets a sup-numbered legend regardless of whether the
             # admin-tuned prompt actually emits ``[^k]`` markers.
             if (
-                kind in ("base", "proof", "graph")
+                kind in ("base", "graph")
                 and tool_name == "read"
                 and isinstance(full_result, str)
             ):
@@ -280,7 +266,7 @@ async def stream_agent(
         # Forwarding the agent's final would put it BEFORE citations
         # and break the ``citations → final → done`` ordering the
         # frontend latches onto.
-        if event_name == EventType.FINAL and kind in ("web", "base", "proof", "graph"):
+        if event_name == EventType.FINAL and kind in ("web", "base", "graph"):
             return
 
         bus.push(event_name, data)
@@ -288,28 +274,16 @@ async def stream_agent(
     def run_in_thread() -> None:
         result_payload: Dict[str, Any] = {}
         try:
-            if kind == "proof":
-                if not isinstance(agent, ProofAgent):
-                    raise TypeError("proof kind requires ProofAgent instance")
-                proof_result = agent.run(
-                    composed_query,
-                    tracer=capturing,
-                    on_event=wrapped_on_event,
-                    cancel_check=lambda: bus.is_closed,
-                    **agent_overrides,
-                )
-                result_payload = _make_proof_final_payload(proof_result)
-            else:
-                if not isinstance(agent, BaseAgent):
-                    raise TypeError(f"{kind!r} kind requires BaseAgent instance")
-                base_result = agent.run(
-                    composed_query,
-                    tracer=capturing,
-                    on_event=wrapped_on_event,
-                    cancel_check=lambda: bus.is_closed,
-                    **agent_overrides,
-                )
-                result_payload = _make_base_final_payload(base_result)
+            if not isinstance(agent, BaseAgent):
+                raise TypeError(f"{kind!r} kind requires BaseAgent instance")
+            base_result = agent.run(
+                composed_query,
+                tracer=capturing,
+                on_event=wrapped_on_event,
+                cancel_check=lambda: bus.is_closed,
+                **agent_overrides,
+            )
+            result_payload = _make_base_final_payload(base_result)
 
             if capturing is not None and capturing.last_run_dir is not None:
                 try:
@@ -337,7 +311,7 @@ async def stream_agent(
                 bus.push(EventType.CITATIONS, {"items": citation_items})
                 result_payload["citations"] = citation_items
                 bus.push(EventType.FINAL, dict(result_payload))
-            elif kind in ("base", "proof", "graph"):
+            elif kind in ("base", "graph"):
                 citation_items = [c.to_dict() for c in local_cited_units]
                 bus.push(EventType.CITATIONS, {"items": citation_items})
                 result_payload["citations"] = citation_items
@@ -353,7 +327,7 @@ async def stream_agent(
                         "", url_pool, pool_order
                     )
                     bus.push(EventType.CITATIONS, {"items": fallback_items})
-                elif kind in ("base", "proof", "graph"):
+                elif kind in ("base", "graph"):
                     bus.push(
                         EventType.CITATIONS,
                         {"items": [c.to_dict() for c in local_cited_units]},
