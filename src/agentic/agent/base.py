@@ -26,15 +26,18 @@ Pre-warm:
   per-query latency stays comparable across runs.
 """
 
+import base64
 import json
 import logging
+import mimetypes
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from config.shared import shared_tiktoken_encoder
 
 from agentic.agent.evidence_bank import EvidenceBank
-from agentic.agent.prompts import SYSTEM_PROMPT
+from agentic.agent.prompts import BASE_SYSTEM_PROMPT
 from agentic.core.context import AgentContext
 from agentic.tools.acquisition._common import err
 from agentic.tools.registry import ToolRegistry
@@ -43,6 +46,27 @@ from tracer import TraceSession, Tracer
 
 
 logger = logging.getLogger(__name__)
+
+
+def _image_user_message(image_paths: List[str], labels: List[str]) -> Optional[Dict[str, Any]]:
+    """Build a ``role=user`` message carrying page images as ``image_url`` blocks.
+
+    A tool that surfaces a page image (``view_page``) returns its path in the
+    tool log rather than the bytes; the loop reads the file here and injects it.
+    Images go in a user message, not the tool result, because OpenAI-compatible
+    endpoints reject images in tool/assistant messages (they 400 with "image URLs
+    are only allowed for messages with role 'user'")."""
+    content: List[Dict[str, Any]] = []
+    for path, label in zip(image_paths, labels):
+        try:
+            raw = Path(path).read_bytes()
+        except OSError:
+            continue
+        mime = mimetypes.guess_type(path)[0] or "image/jpeg"
+        uri = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+        content.append({"type": "text", "text": f"Page image — {label}:"})
+        content.append({"type": "image_url", "image_url": {"url": uri}})
+    return {"role": "user", "content": content} if content else None
 
 
 # --- loop-guard: anti-thrash on searches that surface no new evidence -------
@@ -110,7 +134,7 @@ class BaseAgent:
     ):
         self.llm = llm_client
         self.tools = tools
-        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        self.system_prompt = system_prompt or BASE_SYSTEM_PROMPT
         self.max_loops = max_loops
         self.max_token_budget = max_token_budget
         self.verbose = verbose
@@ -475,6 +499,11 @@ class BaseAgent:
             # loop below; used at the end to decide whether to refund
             # this loop_count (validation-error iterations only).
             iter_tool_logs: List[Dict[str, Any]] = []
+            # Page images surfaced by view_page this iteration. Injected as
+            # user messages AFTER every tool reply is appended, so the tool
+            # messages stay contiguous under the assistant's tool_calls (the
+            # API rejects a non-tool message wedged between them).
+            pending_images: List[tuple] = []
 
             # Cancellation gate. Polled at the loop boundary so the
             # in-flight tool-call / LLM round-trip is allowed to finish
@@ -651,6 +680,10 @@ class BaseAgent:
                 }
                 trajectory.append(turn_record)
                 iter_tool_logs.append(tool_log)
+                if tool_log.get("image_paths"):
+                    pending_images.append(
+                        (tool_log["image_paths"], tool_log.get("image_labels") or [])
+                    )
                 if session is not None:
                     session.event("trajectory", turn_record)
                 emit(
@@ -671,6 +704,14 @@ class BaseAgent:
                         "_full_result": tool_result,
                     },
                 )
+
+            # Inject page images surfaced by view_page this iteration as user
+            # messages — after every tool reply, so tool messages stay
+            # contiguous under the assistant turn (image-in-tool-message 400s).
+            for img_paths, img_labels in pending_images:
+                image_msg = _image_user_message(img_paths, img_labels)
+                if image_msg is not None:
+                    messages.append(image_msg)
 
             # End-of-iteration: refund this loop if every tool call
             # failed input validation (the LLM gets a free retry to

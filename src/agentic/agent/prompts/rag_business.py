@@ -17,7 +17,7 @@ Differences from ``rag/answer.py:_SYSTEM`` (the algorithm-side default):
   on real money, not browsing a brochure.
 
 Lives in the algorithm-layer ``prompts/`` tree (alongside the base /
-proof / graph system prompts) so the config-center schema can import
+graph system prompts) so the config-center schema can import
 it without dragging the web layer into the algorithm-side import graph.
 """
 

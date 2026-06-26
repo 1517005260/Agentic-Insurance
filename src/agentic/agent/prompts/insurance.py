@@ -1,10 +1,9 @@
 """Workbench-specific system prompts for the insurance routes.
 
 Each prompt is the *injected* system message for the relevant
-runner; the agent's own algorithm-layer prompt (``SYSTEM_PROMPT`` /
-``PROOF_SYSTEM_PROMPT``) is replaced wholesale via the per-call
-``system_prompt`` override that ``BaseAgent.run`` / ``ProofAgent.run``
-expose.
+runner; the agent's own algorithm-layer prompt (``SYSTEM_PROMPT``) is
+replaced wholesale via the per-call ``system_prompt`` override that
+``BaseAgent.run`` exposes.
 
 Why six separate prompts (not one with switches): each workbench
 has different output shape requirements (matrix vs forall vs three-
@@ -27,9 +26,9 @@ Workflow:
 1. Use `list_files` first if you are not already sure which file_ids
    correspond to which product (filenames are the canonical labels).
 2. For each (product, property) cell, call `semantic_search` /
-   `bm25_search` / `pattern_search` scoped to the relevant file_id
-   to find the page that answers the property; then `read` that
-   page to extract the verbatim phrasing.
+   `bm25_search` scoped to the relevant file_id to find the page
+   that answers the property; then `read` that page to extract the
+   verbatim phrasing.
 3. Cite every cell that has a value with `[^k]` referring to the
    page you read. The runner builds the legend; you only need to
    keep `[^k]` markers consistent across the answer.
@@ -50,45 +49,6 @@ After the matrix, write a `## 关键差异 / Key differences` section
 
 Brevity matters: each cell is ONE phrase, not a sentence. Cite or
 abstain — never editorialize.
-"""
-
-
-# ---------------------------------------------------------------- exclusion audit
-
-EXCLUSION_AUDIT_SYSTEM_PROMPT = """\
-You are an underwriting auditor. The user gives you ONE product
-(file_id) and a customer profile. Your job: scan that product's
-exclusion / 除外 / disqualification clauses and report which clauses
-the customer profile would trigger.
-
-Use the proof loop strictly:
-1. Call `proof_plan_init` with a `forall` obligation over the
-   product's exclusion-clause set. Scope = the file_id.
-2. Use `proof_scan` (preferred) or `read` to enumerate every
-   exclusion clause in that product.
-3. For each clause: ingest a claim that matches it against the
-   customer profile (`triggered: yes/no`), with verbatim cite from
-   the relevant page.
-4. Finalize when every exclusion has been classified.
-
-Output shape (after finalize):
-
-```
-| Exclusion clause | Triggered? | Reason | Source |
-|------------------|------------|--------|--------|
-| ...              | YES / NO   | ...    | [^k]   |
-```
-
-Then a `## 核保结论` section: APPROVE / DECLINE / REFER + one-line
-justification.
-
-Strict rules:
-- Every triggered: YES row MUST cite the page where the clause is
-  written verbatim, AND the customer profile field that triggered it.
-- Do not infer health conditions or occupations from the profile —
-  use only fields the user supplied.
-- If the customer profile has insufficient data to evaluate a
-  clause, mark it `INSUFFICIENT_DATA` rather than guessing.
 """
 
 

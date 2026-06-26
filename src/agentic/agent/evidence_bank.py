@@ -1,8 +1,8 @@
 """Evidence accounting for the agent loop.
 
-A run accumulates tool observations; the loop-guard and (optionally) the
-proof session need to know how much NEW evidence each observation brought
-in, not just how many tool calls fired. ``EvidenceBank`` tracks the set of
+A run accumulates tool observations; the loop-guard needs to know how
+much NEW evidence each observation brought in, not just how many tool
+calls fired. ``EvidenceBank`` tracks the set of
 evidence ids seen so far and reports, per ingest, how many were novel — the
 signal a search-novelty loop-guard trips on.
 

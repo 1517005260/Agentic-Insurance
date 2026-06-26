@@ -1,13 +1,10 @@
 """Agent loops and factories."""
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.factory import build_default_agent, build_proof_agent
-from agentic.agent.proof_agent import ProofAgent, ProofRunResult
+from agentic.agent.factory import build_base_agent, build_graph_agent
 
 __all__ = [
     "BaseAgent",
-    "ProofAgent",
-    "ProofRunResult",
-    "build_default_agent",
-    "build_proof_agent",
+    "build_base_agent",
+    "build_graph_agent",
 ]

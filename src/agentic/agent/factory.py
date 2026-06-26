@@ -1,22 +1,15 @@
-"""Wire the default acquisition agent.
+"""Wire the two EvidenceFS agents.
 
-Centralizing construction here keeps three properties straight:
-
-1. **Shared resources.** ``PageStore`` and the LinearRAG ``GraphPPRChannel``
-   are heavy to load. The factory builds one of each and threads them
-   into every tool that needs them, so we don't double-load nor have
-   tools accidentally read stale snapshots.
-2. **Warm-up correctness.** ``BaseAgent.warm_up()`` walks tools by
-   registry order. The graph tool's NER warmer is the slowest, so we
-   register it last to maximise overlap once warm-up parallelises.
-3. **Single entry point.** Tests, the CLI, and notebook scripts import
-   :func:`build_default_agent` instead of constructing the parts
-   themselves; the construction order is the contract.
+Both register a single ``ShellTool`` over the compiled Tri-Graph
+filesystem plus the shared web tools; the only capability difference is
+what the sandbox binds. :func:`build_base_agent` sees only the documents
+tree (the faithful raw-corpus DCI baseline); :func:`build_graph_agent`
+roots at the whole ``evidence_fs/`` and mounts the shell ABI on PATH.
 """
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, TYPE_CHECKING, Optional
+from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from config.config_store import ConfigStore
@@ -24,190 +17,118 @@ if TYPE_CHECKING:
 
 from agentic.agent.base import BaseAgent
 from agentic.agent.prompts import (
-    GRAPH_SYSTEM_PROMPT,
-    PROOF_SYSTEM_PROMPT,
-    REGEX_SYSTEM_PROMPT,
-    SHELL_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
-    WEB_AGENT_SYSTEM_PROMPT,
+    BASE_SYSTEM_PROMPT,
+    EVIDENCE_FS_SYSTEM_PROMPT,
+    EVIDENCE_FS_SEMANTIC_SUFFIX,
+    EVIDENCE_FS_MULTIMODAL_SUFFIX,
 )
-from agentic.agent.proof_agent import ProofAgent
 from agentic.tools.acquisition.shell import ShellTool
 from agentic.tools.acquisition import (
-    Bm25SearchTool,
-    CodeRunTool,
-    EntityInspectTool,
-    GraphChainTool,
-    GraphPprTool,
-    ListFilesTool,
-    PatternSearchTool,
-    ReadTool,
-    SemanticSearchTool,
-    TocTool,
+    ViewPageTool,
     WebFetchTool,
     WebSearchTool,
 )
-from agentic.closure.inventory import InventoryAdapter
 from agentic.tools.registry import ToolRegistry
-from config.settings import page_assets_root, paddle_ocr_root
-from model_client import (
-    EmbeddingClient,
-    LLMClient,
-    VisualEmbeddingClient,
-    get_cached_embedding_client,
-    get_cached_visual_embedding_client,
-)
-from rag.channels.graph_ppr import GraphPPRChannel
-from storage.inventory_store import InventoryStore
-from storage.page_store import PageStore
+from config.settings import evidence_fs_root, evfs_sidecar_socket
+from model_client import LLMClient
 
 
 logger = logging.getLogger(__name__)
 
 
-def build_default_agent(
+# Chat models that accept image input. Used only to DEFAULT the ``multimodal``
+# switch — an unknown model is treated as text-only so a non-vision relay is
+# never sent an image (it 400s). Callers override with ``multimodal=...``.
+_VLM_MARKERS = (
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-5", "o3", "o4",
+    "claude", "gemini", "-vl", "vl-", "llava", "pixtral", "vision",
+)
+
+
+def _is_vlm(model: Optional[str]) -> bool:
+    m = (model or "").lower()
+    return any(k in m for k in _VLM_MARKERS)
+
+
+# ===================================================================
+# EvidenceFS agents (the only two that survive cleanup): a hermetic
+# shell over the compiled Tri-Graph filesystem + web. ``base`` sees only
+# the documents (faithful DCI baseline); ``graph`` (= our method) sees
+# the whole FS plus the shell ABI on PATH. Web stays a shared registered
+# tool — it needs the network + an API key, which the no-network shell
+# sandbox deliberately cannot provide.
+# ===================================================================
+
+# The EvidenceFS shell ABI lives in the repo, version-controlled and
+# corpus-agnostic, so a corpus rebuild never overwrites the agent's tooling.
+# src/agentic/agent/factory.py -> parents[1] == src/agentic. Scripts are split
+# by capability tier so the graph agent can be ablated:
+#   ``lexical``  — string/graph-file ops (stdlib; hermetic sandbox).
+#   ``semantic`` — ranked retrieval reusing the real channels (PPR / dense /
+#                  bridging); composed ON TOP of lexical. The channels load once
+#                  in a host-side sidecar served over a unix socket, so the
+#                  sandbox stays hermetic.
+_SRC_DIR = Path(__file__).resolve().parents[2]            # <repo>/src
+_AGENT_SCRIPTS_DIR = _SRC_DIR / "agentic" / "tools" / "agent_scripts"
+_SCRIPT_TIERS = {
+    "lexical": [_AGENT_SCRIPTS_DIR / "lexical"],
+    "semantic": [_AGENT_SCRIPTS_DIR / "lexical", _AGENT_SCRIPTS_DIR / "semantic"],
+}
+
+
+def _web_tools(tavily_client=None, config_store: Optional["ConfigStore"] = None):
+    """The shared web affordance (search + fetch), built once per agent."""
+    from model_client.web_search import TavilyClient
+
+    tavily_client = tavily_client or TavilyClient()
+    return [
+        WebSearchTool(tavily_client=tavily_client, config_store=config_store),
+        WebFetchTool(),
+    ]
+
+
+def build_base_agent(
     *,
     llm_client: Optional[LLMClient] = None,
-    embedding_client: Optional[EmbeddingClient] = None,
-    visual_client: Optional[VisualEmbeddingClient] = None,
-    page_store: Optional[PageStore] = None,
-    inventory: Optional[InventoryStore] = None,
-    graph_channel: Optional[GraphPPRChannel] = None,
-    page_assets_dir: Optional[Path] = None,
+    corpus_root: Optional[Path] = None,
+    tavily_client: Optional["TavilyClient"] = None,
+    config_store: Optional["ConfigStore"] = None,
     system_prompt: Optional[str] = None,
+    multimodal: Optional[bool] = None,
     max_loops: int = 24,
     max_token_budget: int = 128_000,
     verbose: bool = False,
-    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
 ) -> BaseAgent:
-    """Build a BaseAgent with the acquisition tools pre-registered.
+    """Build the EvidenceFS **base** agent: a hermetic DCI shell over the
+    documents tree plus web — the faithful raw-corpus baseline for the v1 A/B
+    (shell + web, NO graph files, NO scripts).
 
-    Any kwarg may be supplied to swap a backend (e.g. point to a
-    different ``page_assets_dir`` for tests). Defaults pull from
-    ``config.settings``.
+    ``corpus_root`` defaults to ``evidence_fs/documents`` so the base and graph
+    agents read byte-identical source text (only the graph affordances differ).
 
-    ``max_loops=24`` / ``max_token_budget=128_000`` are deliberately
-    generous so the agent can fully explore before being force-answered.
-    Small-context generators (e.g. vLLM-served Qwen3-8B, 40 960 ctx):
-    override ``max_token_budget`` down to ~20 000 AND lower
-    ``LLMClient(max_tokens=...)`` in lockstep at the call site.
+    ``multimodal`` adds ``view_page`` so a vision model can read a page's
+    rendered image (defaults on for a VLM chat model, off otherwise). It is a
+    shared capability — kept identical on base and graph — so the A/B isolates
+    the graph affordances, not who can see images.
     """
-    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
-    inventory = inventory or InventoryStore(page_store=page_store)
-
-    embedding_client = embedding_client or get_cached_embedding_client()
-    visual_client = visual_client or get_cached_visual_embedding_client()
+    corpus_root = corpus_root or (evidence_fs_root() / "documents")
     llm_client = llm_client or LLMClient()
-
-    graph_channel = graph_channel or GraphPPRChannel(
-        embedding_client=embedding_client,
-    )
 
     registry = ToolRegistry()
-    # Order: navigation -> retrieval -> read -> compute. Mirrors the
-    # strategy the system prompt teaches the agent.
-    registry.register(ListFilesTool())
-    registry.register(TocTool(page_store=page_store, inventory=inventory))
-    registry.register(
-        SemanticSearchTool(
-            page_store=page_store,
-            embedding_client=embedding_client,
-            visual_client=visual_client,
-            inventory=inventory,
-        )
-    )
-    registry.register(Bm25SearchTool(page_store=page_store, inventory=inventory))
-    registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
-    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
-        registry.register(
-            graph_tool(
-                channel=graph_channel,
-                inventory=inventory,
-                **(graph_explore_kwargs or {}),
-            )
-        )
-    registry.register(
-        ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
-    )
-    registry.register(CodeRunTool())
+    registry.register(ShellTool(corpus_root=corpus_root))
+    for tool in _web_tools(tavily_client, config_store):
+        registry.register(tool)
 
-    agent = BaseAgent(
+    prompt = system_prompt or BASE_SYSTEM_PROMPT
+    if multimodal if multimodal is not None else _is_vlm(llm_client.model):
+        registry.register(ViewPageTool(corpus_root=corpus_root))
+        if system_prompt is None:
+            prompt += EVIDENCE_FS_MULTIMODAL_SUFFIX
+
+    return BaseAgent(
         llm_client=llm_client,
         tools=registry,
-        system_prompt=system_prompt or SYSTEM_PROMPT,
-        max_loops=max_loops,
-        max_token_budget=max_token_budget,
-        verbose=verbose,
-    )
-    return agent
-
-
-def build_proof_agent(
-    *,
-    llm_client: Optional[LLMClient] = None,
-    embedding_client: Optional[EmbeddingClient] = None,
-    visual_client: Optional[VisualEmbeddingClient] = None,
-    page_store: Optional[PageStore] = None,
-    inventory: Optional[InventoryStore] = None,
-    graph_channel: Optional[GraphPPRChannel] = None,
-    page_assets_dir: Optional[Path] = None,
-    system_prompt: Optional[str] = None,
-    max_loops: int = 24,
-    max_token_budget: int = 128_000,
-    verbose: bool = False,
-    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
-) -> ProofAgent:
-    """Build a ProofAgent with the acquisition tools wired in.
-
-    The proof tools (plan_init, gap_propose, claim_ingest, finalize)
-    are registered fresh per ``ProofAgent.run`` call against the
-    per-run ``ProofSession``, so they are not in the registry built
-    here.
-    """
-    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
-    inventory_store = inventory or InventoryStore(page_store=page_store)
-
-    embedding_client = embedding_client or get_cached_embedding_client()
-    visual_client = visual_client or get_cached_visual_embedding_client()
-    llm_client = llm_client or LLMClient()
-
-    graph_channel = graph_channel or GraphPPRChannel(
-        embedding_client=embedding_client,
-    )
-
-    acquisition = ToolRegistry()
-    acquisition.register(ListFilesTool())
-    acquisition.register(TocTool(page_store=page_store, inventory=inventory_store))
-    acquisition.register(
-        SemanticSearchTool(
-            page_store=page_store,
-            embedding_client=embedding_client,
-            visual_client=visual_client,
-            inventory=inventory_store,
-        )
-    )
-    acquisition.register(Bm25SearchTool(page_store=page_store, inventory=inventory_store))
-    acquisition.register(PatternSearchTool(page_store=page_store, inventory=inventory_store))
-    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
-        acquisition.register(
-            graph_tool(
-                channel=graph_channel,
-                inventory=inventory_store,
-                **(graph_explore_kwargs or {}),
-            )
-        )
-    acquisition.register(
-        ReadTool(page_store=page_store, inventory=inventory_store, graph_channel=graph_channel)
-    )
-    acquisition.register(CodeRunTool())
-
-    return ProofAgent(
-        llm_client=llm_client,
-        acquisition_tools=acquisition,
-        inventory=InventoryAdapter(inventory_store),
-        page_store=page_store,
-        inventory_store=inventory_store,
-        system_prompt=system_prompt or PROOF_SYSTEM_PROMPT,
+        system_prompt=prompt,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,
@@ -217,201 +138,81 @@ def build_proof_agent(
 def build_graph_agent(
     *,
     llm_client: Optional[LLMClient] = None,
-    embedding_client: Optional[EmbeddingClient] = None,
-    page_store: Optional[PageStore] = None,
-    inventory: Optional[InventoryStore] = None,
-    graph_channel: Optional[GraphPPRChannel] = None,
-    page_assets_dir: Optional[Path] = None,
-    system_prompt: Optional[str] = None,
-    max_loops: int = 24,
-    max_token_budget: int = 128_000,
-    verbose: bool = False,
-    graph_explore_kwargs: Optional[Dict[str, Any]] = None,
-) -> BaseAgent:
-    """Build a BaseAgent specialised for knowledge-graph navigation.
-
-    Tools registered: ``graph_ppr`` (associative page retrieval),
-    ``graph_chain`` (relational multi-hop), ``entity_inspect`` (entity
-    disambiguation / neighborhood) over the LinearRAG entity / passage
-    graph, plus ``read`` (full-text page reader). The graph tools surface
-    *which* pages are relevant; the reader pulls the actual Markdown so
-    the LLM can quote and cite verbatim — this mirrors upstream
-    LinearRAG's "PPR retrieve → reader" split.
-
-    ``max_loops=24`` / ``max_token_budget=128_000``: give navigation room
-    to fully traverse the graph on deep (3–4-hop) questions instead of
-    terminating against the loop / token cap mid-chain. A tight budget
-    starved deep-hop reasoning — the loop hit the cap, force-answered on a
-    half-built chain, and abstained; widening to a capable reader's
-    context restores deep-hop accuracy. Override DOWN per call site for a
-    model whose context is smaller
-    (e.g. a vLLM-served Qwen3-8B at 40 960 context − 16 384 reserved
-    for output = 24 576 effective input — there ``max_token_budget``
-    should be lowered to ~20 000 with ~4 k headroom AND
-    ``LLMClient(max_tokens=...)`` should be lowered in lockstep, since
-    the server's input cap is ``max_model_len − max_tokens``).
-    """
-    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
-    inventory = inventory or InventoryStore(page_store=page_store)
-
-    embedding_client = embedding_client or get_cached_embedding_client()
-    llm_client = llm_client or LLMClient()
-
-    graph_channel = graph_channel or GraphPPRChannel(
-        embedding_client=embedding_client,
-    )
-
-    registry = ToolRegistry()
-    for graph_tool in (GraphPprTool, GraphChainTool, EntityInspectTool):
-        registry.register(
-            graph_tool(
-                channel=graph_channel,
-                inventory=inventory,
-                **(graph_explore_kwargs or {}),
-            )
-        )
-    registry.register(
-        ReadTool(page_store=page_store, inventory=inventory, graph_channel=graph_channel)
-    )
-
-    return BaseAgent(
-        llm_client=llm_client,
-        tools=registry,
-        system_prompt=system_prompt or GRAPH_SYSTEM_PROMPT,
-        max_loops=max_loops,
-        max_token_budget=max_token_budget,
-        verbose=verbose,
-    )
-
-
-def build_regex_agent(
-    *,
-    llm_client: Optional[LLMClient] = None,
-    page_store: Optional[PageStore] = None,
-    inventory: Optional[InventoryStore] = None,
-    page_assets_dir: Optional[Path] = None,
-    system_prompt: Optional[str] = None,
-    max_loops: int = 24,
-    max_token_budget: int = 128_000,
-    verbose: bool = False,
-) -> BaseAgent:
-    """Build a BaseAgent that locates evidence by regex alone.
-
-    Tools registered: ``pattern_search`` (exhaustive regex scan over
-    pages / passages / table_rows) and ``read`` (full-text page reader).
-    No embedding retrieval, no graph navigation — the agent's only
-    locator is the regex it writes, so prompt-engineering quality of
-    those regexes is the dominant determinant of recall.
-
-    Defaults mirror :func:`build_graph_agent` (``max_loops=24``,
-    ``max_token_budget=128k``) so the comparison against the graph
-    baseline is at iso-budget. Small-context generators (e.g. Qwen3-8B,
-    40 960 ctx): override ``max_token_budget`` down to ~20 000 and lower
-    ``LLMClient(max_tokens=...)`` in lockstep — same as the graph agent.
-    """
-    page_store = page_store or PageStore(page_assets_dir or page_assets_root())
-    inventory = inventory or InventoryStore(page_store=page_store)
-    llm_client = llm_client or LLMClient()
-
-    registry = ToolRegistry()
-    registry.register(PatternSearchTool(page_store=page_store, inventory=inventory))
-    # No graph channel on the regex path — pillar-2 baseline contract
-    # is "regex + read only"; surfacing graph-derived entities/neighbour
-    # pages would confound the comparison.
-    registry.register(ReadTool(page_store=page_store, inventory=inventory))
-
-    return BaseAgent(
-        llm_client=llm_client,
-        tools=registry,
-        system_prompt=system_prompt or REGEX_SYSTEM_PROMPT,
-        max_loops=max_loops,
-        max_token_budget=max_token_budget,
-        verbose=verbose,
-    )
-
-
-def build_shell_agent(
-    *,
-    llm_client: Optional[LLMClient] = None,
     corpus_root: Optional[Path] = None,
-    system_prompt: Optional[str] = None,
-    max_loops: int = 24,
-    max_token_budget: int = 128_000,
-    verbose: bool = False,
-) -> BaseAgent:
-    """Build a BaseAgent whose only locator is a sandboxed Unix shell over the
-    raw markdown corpus — the faithful Direct-Corpus-Interaction (DCI) baseline.
-
-    One tool, ``shell``: read-only bash inside ``corpus_root``
-    (grep/rg/find/sed/head/tail/cat …) — no embedding, no index, no graph, no
-    network, no writes (bubblewrap-isolated to the corpus when ``bwrap`` is
-    available, cwd-pinned + read-only denylist otherwise). ``cat`` is the
-    reader, so no ``read`` tool is registered. ``corpus_root`` defaults to
-    ``paddle_ocr_root()`` (the per-document ``combined.md`` tree). Defaults
-    mirror the other agents for iso-budget comparison; lower
-    ``max_token_budget`` for a small-context model in lockstep with
-    ``LLMClient(max_tokens=…)``.
-    """
-    corpus_root = corpus_root or paddle_ocr_root()
-    llm_client = llm_client or LLMClient()
-
-    registry = ToolRegistry()
-    registry.register(ShellTool(corpus_root=corpus_root))
-
-    return BaseAgent(
-        llm_client=llm_client,
-        tools=registry,
-        system_prompt=system_prompt or SHELL_SYSTEM_PROMPT,
-        max_loops=max_loops,
-        max_token_budget=max_token_budget,
-        verbose=verbose,
-    )
-
-
-def build_web_agent(
-    *,
-    llm_client: Optional[LLMClient] = None,
+    tier: str = "lexical",
+    scripts_dirs: Optional[list] = None,
     tavily_client: Optional["TavilyClient"] = None,
     config_store: Optional["ConfigStore"] = None,
     system_prompt: Optional[str] = None,
-    max_loops: int = 12,
-    max_token_budget: int = 96_000,
+    multimodal: Optional[bool] = None,
+    max_loops: int = 24,
+    max_token_budget: int = 128_000,
     verbose: bool = False,
 ) -> BaseAgent:
-    """Build a BaseAgent specialised for public-web research.
+    """Build the EvidenceFS **graph** agent (our method): the same shell + web
+    as the base agent, but rooted at the whole ``evidence_fs/`` Tri-Graph
+    filesystem (documents + nodes + edges + views) with the shell ABI bound on
+    PATH at ``/scripts/<tier>``.
 
-    Toolset is intentionally narrow: ``web_search`` (Tavily) and
-    ``web_fetch`` (HTML stripper). No local-corpus or graph access —
-    the web agent must answer purely from public sources, cite URLs,
-    and abstain when the web doesn't cover the question.
+    ``tier`` selects which capability tiers of the ABI are exposed — the
+    ablation axis:
+      * ``"lexical"`` — string/graph-file ops only (find_surface /
+        expand_surface / bridge_surfaces / show_passage / show_sentence /
+        grep_passages), hermetic stdlib sandbox.
+      * ``"semantic"`` — lexical PLUS the ranked-retrieval programs that reuse
+        the real channels (genuine PPR / dense / bridging).
+    Pass ``scripts_dirs`` to override the tier→dirs mapping explicitly.
 
-    Why a separate agent (not a ``base_agent`` with extra tools): the
-    cite contract differs (URL vs file_id+page_id), the abstain rule
-    differs (no local fallback), and the system prompt needs to keep
-    those rules visible in every turn. Splitting at factory level
-    rather than at runner level keeps each agent's contract local.
-
-    Caps kept modest (12 loops / 96 k) on purpose: each loop hits the
-    Tavily web API, and a search + a single fetch answers most questions
-    in 2-4 turns — large caps would only risk runaway external-API cost
-    with no accuracy benefit (unlike the corpus agents, which need the
-    room to traverse the graph). Small-context generators (e.g. Qwen3-8B,
-    40 960 ctx): override ``max_token_budget`` down to ~20 000 and lower
-    ``LLMClient(max_tokens=...)`` in lockstep at the call site.
+    The only delta vs the base agent is graph access — so the A/B isolates
+    "does a shell-operable Tri-Graph help vs raw-DCI" with everything else held
+    fixed (same shell, same web, same budget, same model).
     """
-    from model_client.web_search import TavilyClient
-
+    corpus_root = corpus_root or evidence_fs_root()
+    if scripts_dirs is None:
+        scripts_dirs = _SCRIPT_TIERS.get(tier, _SCRIPT_TIERS["lexical"])
     llm_client = llm_client or LLMClient()
-    tavily_client = tavily_client or TavilyClient()
+
+    # The semantic tier's scripts reuse the real channels, served by a host-side
+    # sidecar that loads them once. Start it (idempotent; blocks until warm) and
+    # bind its socket into the otherwise-hermetic sandbox. Lexical-only needs
+    # neither, so it stays a pure hermetic shell with no socket.
+    needs_sidecar = any(Path(d).name == "semantic" for d in scripts_dirs)
+    socket_path = None
+    if needs_sidecar:
+        # Imported lazily so running the sidecar as ``python -m
+        # agentic.tools.evfs_sidecar`` doesn't double-import via the factory.
+        from agentic.tools import evfs_sidecar
+
+        socket_path = evfs_sidecar_socket()
+        evfs_sidecar.ensure_running(socket_path)
 
     registry = ToolRegistry()
-    registry.register(WebSearchTool(tavily_client=tavily_client, config_store=config_store))
-    registry.register(WebFetchTool())
+    registry.register(ShellTool(
+        corpus_root=corpus_root,
+        scripts_dirs=scripts_dirs,
+        socket_path=socket_path,
+        # The first semantic call may wait on the sidecar's one-time channel
+        # load, so the semantic tier gets a long ceiling; warm calls are fast.
+        timeout_s=240 if needs_sidecar else 30,
+    ))
+    for tool in _web_tools(tavily_client, config_store):
+        registry.register(tool)
+
+    # Teach the agent the semantic ABI only when that tier is actually mounted.
+    default_prompt = EVIDENCE_FS_SYSTEM_PROMPT
+    if needs_sidecar:
+        default_prompt += EVIDENCE_FS_SEMANTIC_SUFFIX
+
+    # view_page is a shared capability (same as on the base agent), so the A/B
+    # stays about the graph affordances, not who can see page images.
+    if multimodal if multimodal is not None else _is_vlm(llm_client.model):
+        registry.register(ViewPageTool(corpus_root=corpus_root))
+        default_prompt += EVIDENCE_FS_MULTIMODAL_SUFFIX
 
     return BaseAgent(
         llm_client=llm_client,
         tools=registry,
-        system_prompt=system_prompt or WEB_AGENT_SYSTEM_PROMPT,
+        system_prompt=system_prompt or default_prompt,
         max_loops=max_loops,
         max_token_budget=max_token_budget,
         verbose=verbose,
