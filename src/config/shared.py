@@ -430,7 +430,7 @@ def _tiktoken_cached(model_or_encoding: str) -> "tiktoken.Encoding":
 def shared_tiktoken_encoder(model_or_encoding: str) -> "tiktoken.Encoding":
     """Return the cached tiktoken ``Encoding`` for a model or encoding name.
 
-    Many callsites (``LLMClient``, ``BaseAgent``, ``ProofAgent``,
+    Many callsites (``LLMClient``, ``BaseAgent``,
     ``SemanticSearchTool``, ``ReadTool``, ``BM25SearchTool``) need an
     encoder; one instance is ~50-150 MB resident, so we share. Safe
     because ``tiktoken.Encoding`` is read-only at use time.

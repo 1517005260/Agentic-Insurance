@@ -56,20 +56,17 @@ _AGENT_KEY_TABLE: Dict[str, Dict[str, str]] = {
         "max_token_budget": "agent.base.max_token_budget",
         "system_prompt": "prompt.base_agent",
     },
-    "proof": {
-        "max_loops": "agent.proof.max_loops",
-        "max_token_budget": "agent.proof.max_token_budget",
-        "system_prompt": "prompt.proof_agent",
-    },
     "graph": {
         "max_loops": "agent.graph.max_loops",
         "max_token_budget": "agent.graph.max_token_budget",
         "system_prompt": "prompt.graph_agent",
     },
+    # The dedicated web agent was retired; the chat web path now runs on the
+    # base agent, so "web" runs resolve their budgets / prompt from base.
     "web": {
-        "max_loops": "agent.web.max_loops",
-        "max_token_budget": "agent.web.max_token_budget",
-        "system_prompt": "prompt.web_agent",
+        "max_loops": "agent.base.max_loops",
+        "max_token_budget": "agent.base.max_token_budget",
+        "system_prompt": "prompt.base_agent",
     },
 }
 
@@ -245,18 +242,17 @@ class ConfigStore:
         """``LinearRAGConfig`` with admin-managed knobs swapped in.
 
         Same pattern as :meth:`materialize_rag_config` — preserve any
-        constructor-time tuning of non-admin fields (embedding client,
-        alias thresholds) and only overwrite the literal-backfill +
-        GLiNER knobs that the admin UI exposes. The backfill defaults
-        double as the query-time PPR gazetteer defaults inside
+        constructor-time tuning of non-admin fields (embedding client) and
+        only overwrite the GLiNER + query-time PPR gazetteer knobs that the
+        admin UI exposes. The two ``literal_backfill_*`` defaults double as
+        the query-time PPR gazetteer surface filters inside
         :class:`GraphPPRChannel`, so flipping them here propagates to
-        both ingest and retrieval.
+        retrieval.
         """
         from config.linear_rag import LinearRAGConfig
         starting = base if base is not None else LinearRAGConfig()
         return replace(
             starting,
-            literal_backfill_enabled=bool(self._values["linear_rag.literal_backfill_enabled"]),
             literal_backfill_min_chars=int(self._values["linear_rag.literal_backfill_min_chars"]),
             literal_backfill_multi_word_only=bool(
                 self._values["linear_rag.literal_backfill_multi_word_only"]
@@ -267,22 +263,8 @@ class ConfigStore:
             gliner_threshold=float(self._values["linear_rag.gliner_threshold"]),
             junk_max_han_chars=int(self._values["linear_rag.junk_max_han_chars"]),
             ner_max_span_chars=int(self._values["linear_rag.ner_max_span_chars"]),
-            acceptance_handler=str(self._values["linear_rag.acceptance_handler"]),
             graphml_flush_every=int(self._values["linear_rag.graphml_flush_every"]),
-            cluster_shape_every=int(self._values["linear_rag.cluster_shape_every"]),
-            cluster_algorithm=str(self._values["linear_rag.cluster_algorithm"]),
-            cluster_leiden_resolution=float(
-                self._values["linear_rag.cluster_leiden_resolution"]
-            ),
-            cluster_leiden_weighted=bool(
-                self._values["linear_rag.cluster_leiden_weighted"]
-            ),
-            alias_propagation_policy=str(self._values["linear_rag.alias_propagation_policy"]),
-            alias_prop_const=float(self._values["linear_rag.alias_prop_const"]),
-            alias_prop_lo=float(self._values["linear_rag.alias_prop_lo"]),
-            alias_prop_hi=float(self._values["linear_rag.alias_prop_hi"]),
-            alias_prop_tau_cos=float(self._values["linear_rag.alias_prop_tau_cos"]),
-            alias_prop_tau_rerank=float(self._values["linear_rag.alias_prop_tau_rerank"]),
+            evidence_fs_enabled=bool(self._values["linear_rag.evidence_fs_enabled"]),
         )
 
     def graph_explore_kwargs(self) -> Dict[str, Any]:

@@ -20,6 +20,19 @@ def _get(key: str, default: str | None = None) -> str | None:
     return value
 
 
+def _get_csv(key: str, default: list[str]) -> list[str]:
+    """Comma-separated env list → ``[str, ...]``.
+
+    Splits on commas, strips surrounding whitespace, drops empties. An
+    unset / blank var falls back to ``default`` (returned as a fresh copy
+    so callers can mutate without aliasing the literal).
+    """
+    raw = _get(key)
+    if raw is None:
+        return list(default)
+    return [piece.strip() for piece in raw.split(",") if piece.strip()]
+
+
 # ---------------------------------------------------------------- storage ----
 
 # Project root: ``src/config/settings.py`` → ``../../../`` = repo root.
@@ -49,6 +62,25 @@ PADDLE_OCR_SUBDIR: str = "paddle_ocr"
 def paddle_ocr_root() -> Path:
     """Return the root directory for PaddleOCR outputs."""
     return STORAGE_PATH / PADDLE_OCR_SUBDIR
+
+
+# Subdirectory holding the compiled EvidenceFS Tri-Graph filesystem
+# (documents/ + nodes/ + edges/ + views/), emitted at ingest flush and
+# navigated by the EvidenceFS agents via shell.
+EVIDENCE_FS_SUBDIR: str = "evidence_fs"
+
+
+def evidence_fs_root() -> Path:
+    """Return the root directory of the compiled EvidenceFS filesystem."""
+    return STORAGE_PATH / EVIDENCE_FS_SUBDIR
+
+
+def evfs_sidecar_socket() -> Path:
+    """Unix-domain socket for the EvidenceFS semantic sidecar — a host-side
+    daemon that loads the retrieval channels once and serves the semantic
+    scripts over it. Kept under a dot-dir so it never collides with the
+    compiled FS layout."""
+    return STORAGE_PATH / ".evfs" / "sidecar.sock"
 
 
 # Subdirectory under STORAGE_PATH that holds downloaded model weights
@@ -441,6 +473,42 @@ def vl_embed_model_dir() -> Path:
     return models_root() / VL_EMBED_MODEL_ID.split("/")[-1]
 
 
+# ------------------------------------------------------------------- ner ----
+
+# Open-set GLiNER label prompt (the LinearRAG entity layer). GLiNER's labels
+# are open-set, lowercase, single words or short phrases — domain swap is a
+# label swap, never a code change. The default below is a GENERIC universal
+# palette (content types + a numeric/temporal noise sink) so the algorithm
+# layer ships no domain-specific defaults; deployments override it via the
+# comma-separated ``GLINER_LABELS`` env var (e.g. medical:
+# ``GLINER_LABELS="disease,drug,procedure"``).
+_GENERIC_GLINER_LABELS: list[str] = [
+    "person",
+    "organization",
+    "location",
+    "facility",
+    "product",
+    "event",
+    "creative work",
+    "law",
+    "group",
+    "concept",
+    "date",
+    "time",
+    "money",
+    "number",
+]
+# Sink labels: GLiNER still scores these so junk (bare dates, numbers,
+# amounts) attaches to them, and the pipeline then DROPS any span tagged
+# with a noise label. Members must also appear in ``GLINER_LABELS``.
+_GENERIC_GLINER_NOISE_LABELS: list[str] = ["date", "time", "money", "number"]
+
+GLINER_LABELS: list[str] = _get_csv("GLINER_LABELS", _GENERIC_GLINER_LABELS)
+GLINER_NOISE_LABELS: list[str] = _get_csv(
+    "GLINER_NOISE_LABELS", _GENERIC_GLINER_NOISE_LABELS
+)
+
+
 __all__ = [
     "STORAGE_PATH",
     "PADDLE_OCR_SUBDIR",
@@ -514,6 +582,8 @@ __all__ = [
     "VISUAL_EMBEDDING_BACKEND",
     "VL_EMBED_MODEL_ID",
     "vl_embed_model_dir",
+    "GLINER_LABELS",
+    "GLINER_NOISE_LABELS",
     "TAVILY_API_KEY",
     "TAVILY_API_BASE_URL",
 ]

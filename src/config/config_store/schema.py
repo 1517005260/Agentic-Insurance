@@ -15,18 +15,15 @@ single-source-of-truth contract for every other key.
 from typing import List
 
 from agentic.agent.prompts import (
+    BASE_SYSTEM_PROMPT,
     CLAIM_CHECK_SYSTEM_PROMPT,
     COMPARE_SYSTEM_PROMPT,
-    EXCLUSION_AUDIT_SYSTEM_PROMPT,
+    EVIDENCE_FS_SYSTEM_PROMPT,
     FRAUD_PPR_SYSTEM_PROMPT,
-    GRAPH_SYSTEM_PROMPT,
     POLICY_CALC_SYSTEM_PROMPT,
-    PROOF_SYSTEM_PROMPT,
     RAG_BUSINESS_SYSTEM_PROMPT,
     RECOMMEND_SYSTEM_PROMPT,
     RISK_PREDICT_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
-    WEB_AGENT_SYSTEM_PROMPT,
     WEB_RAG_SYSTEM_PROMPT,
 )
 from config.linear_rag import LinearRAGConfig
@@ -47,26 +44,22 @@ _RAG_DEFAULTS = RAGConfig()
 # ----------------------------- agent factory defaults (mirrored, see note above)
 
 # Mirror the kwarg defaults from ``agentic.agent.factory``:
-# * ``build_default_agent``: max_loops=24, max_token_budget=128_000
-# * ``build_proof_agent``:   max_loops=24, max_token_budget=128_000
-# * ``build_graph_agent``:   max_loops=24, max_token_budget=128_000
-# * ``build_web_agent``:     max_loops=24, max_token_budget=128_000
+# * ``build_base_agent``:  max_loops=24, max_token_budget=128_000
+# * ``build_graph_agent``: max_loops=24, max_token_budget=128_000
 #
-# We use the factory defaults rather than the BaseAgent / ProofAgent
-# constructor defaults because the lifespan calls the factory, so the
-# factory ints are the values that actually take effect today.
+# We use the factory defaults rather than the BaseAgent constructor
+# defaults because the lifespan calls the factory, so the factory ints
+# are the values that actually take effect today.
 #
 # Uniform generous caps: give every agent room to fully explore /
-# navigate (multi-hop, deep proofs) up to a large-context reader's
-# window, instead of terminating early against a tight loop / token
-# cap. A tight budget made the graph agent choke on deep questions
-# (force-answer on a half-built chain → abstain); widening it recovered
-# accuracy. The caps now exist only as a runaway backstop; the token
-# budget (≈ the model window) is the real guard.
+# navigate (multi-hop) up to a large-context reader's window, instead
+# of terminating early against a tight loop / token cap. A tight budget
+# made the graph agent choke on deep questions (force-answer on a
+# half-built chain → abstain); widening it recovered accuracy. The caps
+# now exist only as a runaway backstop; the token budget (≈ the model
+# window) is the real guard.
 _BASE_AGENT_DEFAULT_MAX_LOOPS = 24
 _BASE_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
-_PROOF_AGENT_DEFAULT_MAX_LOOPS = 24
-_PROOF_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
 _GRAPH_AGENT_DEFAULT_MAX_LOOPS = 24
 # 128 k = a large-context generator's window (Claude / GPT-5-class /
 # deepseek-v4-flash) so navigation terminates on a real stop condition,
@@ -75,11 +68,6 @@ _GRAPH_AGENT_DEFAULT_MAX_LOOPS = 24
 # output ≈ 24576 effective input), lower this to ~20 000 via admin
 # override.
 _GRAPH_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 128_000
-# The web agent hits the Tavily API every loop and converges in 2-4
-# turns, so its caps are kept modest (unlike the corpus agents) to avoid
-# runaway external-API cost — large caps give no accuracy benefit here.
-_WEB_AGENT_DEFAULT_MAX_LOOPS = 12
-_WEB_AGENT_DEFAULT_MAX_TOKEN_BUDGET = 96_000
 
 
 # --------------------------------------------------- citation preview default
@@ -149,24 +137,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description="Token-budget force-final-answer threshold for the base agent.",
     ),
     ConfigEntry(
-        key="agent.proof.max_loops",
-        type="int",
-        default=_PROOF_AGENT_DEFAULT_MAX_LOOPS,
-        min=4,
-        max=32,
-        group="agent.proof",
-        description="Hard ceiling on tool-calling loops for the proof agent.",
-    ),
-    ConfigEntry(
-        key="agent.proof.max_token_budget",
-        type="int",
-        default=_PROOF_AGENT_DEFAULT_MAX_TOKEN_BUDGET,
-        min=32_000,
-        max=256_000,
-        group="agent.proof",
-        description="Token-budget early-exit threshold for the proof agent.",
-    ),
-    ConfigEntry(
         key="agent.graph.max_loops",
         type="int",
         default=_GRAPH_AGENT_DEFAULT_MAX_LOOPS,
@@ -203,29 +173,20 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
     ConfigEntry(
         key="prompt.base_agent",
         type="str",
-        default=SYSTEM_PROMPT,
+        default=BASE_SYSTEM_PROMPT,
         max_length=8000,
         min_length=1,
         group="prompt",
-        description="System prompt for the base acquisition agent.",
-    ),
-    ConfigEntry(
-        key="prompt.proof_agent",
-        type="str",
-        default=PROOF_SYSTEM_PROMPT,
-        max_length=8000,
-        min_length=1,
-        group="prompt",
-        description="System prompt for the typed-closure proof agent.",
+        description="System prompt for the base shell agent.",
     ),
     ConfigEntry(
         key="prompt.graph_agent",
         type="str",
-        default=GRAPH_SYSTEM_PROMPT,
+        default=EVIDENCE_FS_SYSTEM_PROMPT,
         max_length=8000,
         min_length=1,
         group="prompt",
-        description="System prompt for the knowledge-graph agent.",
+        description="System prompt for the EvidenceFS graph agent.",
     ),
     # ---------- citation.* ----------
     ConfigEntry(
@@ -274,26 +235,12 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "front of the new query."
         ),
     ),
-    # ---------- linear_rag.* (LinearRAG literal-substring backfill) ----------
-    # Mirror constants in src/config/linear_rag.py +
-    # src/rag/channels/graph_ppr.py:_build_gazetteer (the same defaults
-    # are used both at ingest-time backfill AND at query-time PPR
-    # gazetteer construction; admins tune one knob, both honour it via
-    # GraphPPRChannel constructor and ingest pipeline reading from
-    # config store).
-    ConfigEntry(
-        key="linear_rag.literal_backfill_enabled",
-        type="bool",
-        default=_LINEAR_RAG_DEFAULTS.literal_backfill_enabled,
-        group="linear_rag",
-        description=(
-            "Enable literal-substring backfill at ingest time. When True, "
-            "after NER, sweep every passage against the union of "
-            "discovered entity surfaces and add missing entity↔passage "
-            "edges (KAG-style 'domain mount'; covers the contextual-NER "
-            "miss rate)."
-        ),
-    ),
+    # ---------- linear_rag.* (query-time PPR gazetteer surface filters) ----------
+    # Mirror constants in src/config/linear_rag.py. These two knobs bound
+    # the surface set of the query-time PPR gazetteer built by
+    # ``src/rag/channels/graph_ppr.py:_build_gazetteer``; admins tune one
+    # knob and GraphPPRChannel honours it via its constructor reading from
+    # the config store.
     ConfigEntry(
         key="linear_rag.literal_backfill_min_chars",
         type="int",
@@ -302,9 +249,8 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         max=16,
         group="linear_rag",
         description=(
-            "Minimum surface character length for literal backfill. "
-            "Drops noise like 'us' / 'irs'. Same default applies to the "
-            "query-time PPR gazetteer (graph_ppr channel)."
+            "Minimum surface character length for the query-time PPR "
+            "gazetteer (graph_ppr channel). Drops noise like 'us' / 'irs'."
         ),
     ),
     ConfigEntry(
@@ -313,9 +259,9 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         default=_LINEAR_RAG_DEFAULTS.literal_backfill_multi_word_only,
         group="linear_rag",
         description=(
-            "Require multi-word surfaces only for literal backfill. "
-            "Drops single-word ambiguities like 'axa' / 'company'. "
-            "Same default applies to the query-time PPR gazetteer."
+            "Require multi-word surfaces only for the query-time PPR "
+            "gazetteer (graph_ppr channel). Drops single-word ambiguities "
+            "like 'axa' / 'company'."
         ),
     ),
     # ---------- linear_rag.gliner_* (open-set NER) ----------
@@ -419,22 +365,7 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "insurance / legal surface sits at ~50 chars."
         ),
     ),
-    # ---------- linear_rag.acceptance_handler + propagation policy ----------
-    ConfigEntry(
-        key="linear_rag.acceptance_handler",
-        type="str",
-        default=_LINEAR_RAG_DEFAULTS.acceptance_handler,
-        group="linear_rag",
-        description=(
-            "How accepted alias pairs land in the graph. 'overlay' (default) "
-            "adds an alias edge; physical nodes are preserved for "
-            "surface-path attribution and 1-edge rollback. 'collapse_basic' "
-            "absorbs the other into the canonical. 'collapse_provenance' "
-            "adds a per-edge source_member sidecar. Switching away from "
-            "overlay breaks P4 native attribution and increases P2 "
-            "rollback cost."
-        ),
-    ),
+    # ---------- linear_rag.graphml_flush_every (build persistence cadence) ----------
     ConfigEntry(
         key="linear_rag.graphml_flush_every",
         type="int",
@@ -452,126 +383,18 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "final flush_graphml() at end and before checkpoints."
         ),
     ),
+    # ---------- linear_rag.evidence_fs_enabled (EvidenceFS emission) ----------
     ConfigEntry(
-        key="linear_rag.cluster_shape_every",
-        type="int",
-        default=_LINEAR_RAG_DEFAULTS.cluster_shape_every,
-        min=1,
-        max=1000,
-        group="linear_rag",
-        description=(
-            "How often LinearRAG.index() recomputes the expensive Leiden "
-            "partition for the returned cluster_shape, in index() calls. "
-            "1 (default) = every doc — bit-identical to the per-file API "
-            "builder (fresh instance per file). Leiden is O(E_alias) and "
-            "E_alias grows with the corpus, so a persistent bulk driver "
-            "(GraphIndexBuilder reuse_graph=True) sets this >1 to amortise "
-            "it across docs instead of paying O(N²); skipped docs still "
-            "return the cheap O(V+E_alias) connected-component "
-            "largest_cc_ratio percolation tripwire. Clusters are a "
-            "recomputable derived view so the resulting graph is unchanged."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.cluster_algorithm",
-        type="str",
-        default=_LINEAR_RAG_DEFAULTS.cluster_algorithm,
-        group="linear_rag",
-        description=(
-            "Logical-entity partitioner over the immutable alias "
-            "subgraph. 'leiden_cpm' (default, @resolution 0.01 weighted) "
-            "= Leiden/Constant-Potts communities: chaining-resistant, the "
-            "ER/cross-doc-coref standard; de-percolates the giant component "
-            "without retrieval regression. 'connected_components' = raw "
-            "transitive closure (single-linkage; percolates to a giant "
-            "component at open-domain scale) — available as an alternative. "
-            "Clusters are a recomputable derived view so reversibility / "
-            "P1 / P4 are unchanged either way."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.cluster_leiden_resolution",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.cluster_leiden_resolution,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description=(
-            "CPM resolution for cluster_algorithm='leiden_cpm'. Higher → "
-            "smaller, tighter clusters (more de-percolation, more risk of "
-            "splitting true aliases); tune on the retrieval-quality A/B. "
-            "Ignored when cluster_algorithm='connected_components'."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.cluster_leiden_weighted",
+        key="linear_rag.evidence_fs_enabled",
         type="bool",
-        default=_LINEAR_RAG_DEFAULTS.cluster_leiden_weighted,
+        default=_LINEAR_RAG_DEFAULTS.evidence_fs_enabled,
         group="linear_rag",
         description=(
-            "Whether leiden_cpm uses the alias edge propagation weight "
-            "(cos-derived) so stronger aliases resist being cut. Ignored "
-            "when cluster_algorithm='connected_components'."
+            "Emit EvidenceFS — the shell-operable evidence filesystem — at the "
+            "end of every LinearRAG.flush_all(), compiled from the exact-offset "
+            "segmentation of each document's combined.md. On by default; turn "
+            "off for text-benchmark / bulk paths with no combined.md corpus."
         ),
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_propagation_policy",
-        type="str",
-        default=_LINEAR_RAG_DEFAULTS.alias_propagation_policy,
-        group="linear_rag",
-        description=(
-            "Per-edge propagation-weight policy. 'cos' "
-            "(default) uses the per-edge cos_sim as the propagation "
-            "weight. 'const' / 'clipped_cos' / 'threshold_gate' / "
-            "'calibrated' decouple audit features from propagation "
-            "strength so PPR mass control can be tuned without "
-            "modifying admission."
-        ),
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_prop_const",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.alias_prop_const,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description="Constant propagation weight for policy=const.",
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_prop_lo",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.alias_prop_lo,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description="Lower clip bound for policy=clipped_cos.",
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_prop_hi",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.alias_prop_hi,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description="Upper clip bound for policy=clipped_cos.",
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_prop_tau_cos",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.alias_prop_tau_cos,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description="Cosine threshold τ_c for policy=threshold_gate.",
-    ),
-    ConfigEntry(
-        key="linear_rag.alias_prop_tau_rerank",
-        type="float",
-        default=_LINEAR_RAG_DEFAULTS.alias_prop_tau_rerank,
-        min=0.0,
-        max=1.0,
-        group="linear_rag",
-        description="Reranker threshold τ_r for policy=threshold_gate.",
     ),
     # ---------- graph_explore.* (chain_entity tool runtime) ----------
     ConfigEntry(
@@ -599,25 +422,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
             "Reserved: unused by the current 2-mode entity-lookup tool. "
             "Retained so persisted configs and the admin key still bind."
         ),
-    ),
-    # ---------- agent.web.* ----------
-    ConfigEntry(
-        key="agent.web.max_loops",
-        type="int",
-        default=_WEB_AGENT_DEFAULT_MAX_LOOPS,
-        min=4,
-        max=32,
-        group="agent.web",
-        description="Hard ceiling on tool-calling loops for the web agent.",
-    ),
-    ConfigEntry(
-        key="agent.web.max_token_budget",
-        type="int",
-        default=_WEB_AGENT_DEFAULT_MAX_TOKEN_BUDGET,
-        min=32_000,
-        max=256_000,
-        group="agent.web",
-        description="Token-budget force-final threshold for the web agent.",
     ),
     # ---------- tavily.* ----------
     ConfigEntry(
@@ -649,15 +453,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         description="System prompt for single-call web RAG (chat web mode).",
     ),
     ConfigEntry(
-        key="prompt.web_agent",
-        type="str",
-        default=WEB_AGENT_SYSTEM_PROMPT,
-        max_length=8000,
-        min_length=1,
-        group="prompt",
-        description="System prompt for the web agent (chat web+agent mode).",
-    ),
-    ConfigEntry(
         key="prompt.compare",
         type="str",
         default=COMPARE_SYSTEM_PROMPT,
@@ -665,15 +460,6 @@ CONFIG_ENTRIES: List[ConfigEntry] = [
         min_length=1,
         group="prompt",
         description="System prompt for the multi-product comparison workbench.",
-    ),
-    ConfigEntry(
-        key="prompt.exclusion_audit",
-        type="str",
-        default=EXCLUSION_AUDIT_SYSTEM_PROMPT,
-        max_length=8000,
-        min_length=1,
-        group="prompt",
-        description="System prompt for the underwriting / exclusion audit workbench (ProofAgent forall).",
     ),
     ConfigEntry(
         key="prompt.recommend",
