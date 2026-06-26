@@ -16,7 +16,7 @@ contract for ``kind="web"``:
   agent-internal ``final`` is swallowed in ``kind="web"``;
 * web_fetch redirect: request URL aliased to final_url so the model
   can cite either form;
-* ``kind="base"`` / ``"proof"`` / ``"graph"`` keep the chat contract
+* ``kind="base"`` / ``"graph"`` keep the chat contract
   (no citations event — frontend reverse-derives evidence chips).
 """
 import json
@@ -25,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pytest
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners.agent_runner import stream_agent
 from config.config_store import ConfigStore
 
@@ -401,7 +400,7 @@ async def test_chat_kind_base_emits_read_citations_and_forwards_final():
         stream_agent(query="x", kind="base", agent=agent, config=config)
     )
     names = [n for n, _ in events]
-    # Local kinds (base/proof/graph) flush read-unit citations once, before
+    # Local kinds (base/graph) flush read-unit citations once, before
     # the single forwarded final.
     assert names.index("citations") < names.index("final")
     assert names.count("final") == 1

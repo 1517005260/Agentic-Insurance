@@ -25,7 +25,7 @@ DEFAULT_FILE_IDS: List[str] = [
 ]
 
 # A primary single-product file_id used by single-product workbenches
-# (exclusion audit, policy calc).
+# (policy calc, risk predict).
 DEFAULT_PRIMARY_FILE_ID: str = DEFAULT_FILE_IDS[2]
 
 

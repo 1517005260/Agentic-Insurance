@@ -118,29 +118,7 @@ async def test_compare_two_products_streams_final(app_harness):
 
 
 # ============================================================
-# 2. exclusion audit (ProofAgent SSE)
-# ============================================================
-
-
-@_NEEDS_KEYS
-async def test_exclusion_audit_with_default_customer(app_harness):
-    async with _client_for(app_harness) as (client, app, headers):
-        body = {"file_id": DEFAULT_PRIMARY_FILE_ID, "customer": DEFAULT_CUSTOMER}
-        events, final = await _drain_sse(
-            client,
-            "/insurance/exclusion-audit/stream",
-            body,
-            headers,
-            timeout=600.0,
-        )
-        # ProofAgent should emit at least obligation events
-        assert any(e[0] in {"obligation", "tool_call"} for e in events)
-        assert final is not None
-        assert final.get("flavor") == "exclusion"
-
-
-# ============================================================
-# 3. recommend / needs-analysis (BaseAgent SSE)
+# 2. recommend / needs-analysis (BaseAgent SSE)
 # ============================================================
 
 
@@ -444,21 +422,21 @@ async def test_compare_dup_file_ids_rejected(app_harness):
         assert r.status_code == 422
 
 
-async def test_chat_session_proof_with_web_rejected(app_harness):
+async def test_chat_session_graph_with_web_rejected(app_harness):
     async with _client_for(app_harness) as (client, app, headers):
         r = await client.post(
             "/chat/sessions",
             headers=headers,
-            json={"mode": "agent", "agent_kind": "proof", "web": True},
+            json={"mode": "agent", "agent_kind": "graph", "web": True},
         )
         assert r.status_code == 422
 
 
-async def test_agent_stream_proof_with_web_rejected(app_harness):
+async def test_agent_stream_graph_with_web_rejected(app_harness):
     async with _client_for(app_harness) as (client, app, headers):
         r = await client.post(
             "/agent/stream",
             headers=headers,
-            json={"query": "test", "kind": "proof", "web": True},
+            json={"query": "test", "kind": "graph", "web": True},
         )
         assert r.status_code == 422

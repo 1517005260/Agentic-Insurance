@@ -10,24 +10,19 @@ factory change without a schema bump fails CI loudly.
 import inspect
 
 from agentic.agent.factory import (
-    build_default_agent,
+    build_base_agent,
     build_graph_agent,
-    build_proof_agent,
-    build_web_agent,
 )
 from agentic.agent.prompts import (
+    BASE_SYSTEM_PROMPT,
     CLAIM_CHECK_SYSTEM_PROMPT,
     COMPARE_SYSTEM_PROMPT,
-    EXCLUSION_AUDIT_SYSTEM_PROMPT,
+    EVIDENCE_FS_SYSTEM_PROMPT,
     FRAUD_PPR_SYSTEM_PROMPT,
-    GRAPH_SYSTEM_PROMPT,
     POLICY_CALC_SYSTEM_PROMPT,
-    PROOF_SYSTEM_PROMPT,
     RAG_BUSINESS_SYSTEM_PROMPT,
     RECOMMEND_SYSTEM_PROMPT,
     RISK_PREDICT_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
-    WEB_AGENT_SYSTEM_PROMPT,
     WEB_RAG_SYSTEM_PROMPT,
 )
 from api.services.citation import DEFAULT_PREVIEW_CHARS
@@ -52,14 +47,10 @@ def test_rag_defaults_match_RAGConfig():
 
 def test_agent_factory_defaults_mirrored_in_schema():
     expectations = [
-        ("agent.base.max_loops", build_default_agent, "max_loops"),
-        ("agent.base.max_token_budget", build_default_agent, "max_token_budget"),
-        ("agent.proof.max_loops", build_proof_agent, "max_loops"),
-        ("agent.proof.max_token_budget", build_proof_agent, "max_token_budget"),
+        ("agent.base.max_loops", build_base_agent, "max_loops"),
+        ("agent.base.max_token_budget", build_base_agent, "max_token_budget"),
         ("agent.graph.max_loops", build_graph_agent, "max_loops"),
         ("agent.graph.max_token_budget", build_graph_agent, "max_token_budget"),
-        ("agent.web.max_loops", build_web_agent, "max_loops"),
-        ("agent.web.max_token_budget", build_web_agent, "max_token_budget"),
     ]
     for key, fn, param in expectations:
         assert (
@@ -69,13 +60,10 @@ def test_agent_factory_defaults_mirrored_in_schema():
 
 def test_prompt_defaults_match_module_constants():
     assert CONFIG_ENTRIES_BY_KEY["prompt.rag_business"].default is RAG_BUSINESS_SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.base_agent"].default is SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.proof_agent"].default is PROOF_SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.graph_agent"].default is GRAPH_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.base_agent"].default is BASE_SYSTEM_PROMPT
+    assert CONFIG_ENTRIES_BY_KEY["prompt.graph_agent"].default is EVIDENCE_FS_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.web_rag"].default is WEB_RAG_SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.web_agent"].default is WEB_AGENT_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.compare"].default is COMPARE_SYSTEM_PROMPT
-    assert CONFIG_ENTRIES_BY_KEY["prompt.exclusion_audit"].default is EXCLUSION_AUDIT_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.recommend"].default is RECOMMEND_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.claim_check"].default is CLAIM_CHECK_SYSTEM_PROMPT
     assert CONFIG_ENTRIES_BY_KEY["prompt.policy_calc"].default is POLICY_CALC_SYSTEM_PROMPT
@@ -95,9 +83,9 @@ def test_tavily_defaults():
     assert CONFIG_ENTRIES_BY_KEY["tavily.search_depth"].default == "basic"
 
 
-def test_entry_count_is_54():
+def test_entry_count_is_36():
     # Sanity tripwire: any new admin-tunable knob should bump this
     # counter so reviewers notice when the schema grows.  Update the
     # number AND add a note to the docstring of the new entry in
     # ``schema.py`` when this is intentional.
-    assert len(CONFIG_ENTRIES_BY_KEY) == 54
+    assert len(CONFIG_ENTRIES_BY_KEY) == 36

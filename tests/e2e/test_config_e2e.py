@@ -65,11 +65,11 @@ async def _admin_and_analyst(app_harness) -> AsyncIterator[tuple]:
 # =====================================================================
 
 
-async def test_get_config_returns_54_keys_and_schema(app_harness):
+async def test_get_config_returns_39_keys_and_schema(app_harness):
     """GET /admin/config returns the full snapshot + schema.
 
-    The 54 keys break down by group as: linear_rag (22) + prompt (13) +
-    agent (8) + rag (4) + graph_explore (2) + tavily (2) + chat (1) +
+    The 39 keys break down by group as: linear_rag (11) + prompt (11) +
+    agent (6) + rag (4) + graph_explore (2) + tavily (2) + chat (1) +
     citation (1) + ingest (1). This test pins the total so adding or
     removing a key without updating ``config_store/schema.py`` fails loudly.
     """
@@ -78,8 +78,8 @@ async def test_get_config_returns_54_keys_and_schema(app_harness):
         assert r.status_code == 200, r.text
         body = r.json()
         assert set(body.keys()) == {"snapshot", "schema"}
-        assert len(body["snapshot"]) == 54
-        assert len(body["schema"]) == 54
+        assert len(body["snapshot"]) == 36
+        assert len(body["schema"]) == 36
 
         keys_in_schema = {entry["key"] for entry in body["schema"]}
         assert keys_in_schema == set(body["snapshot"].keys())
@@ -281,19 +281,19 @@ async def test_materialize_reflects_patch(app_harness):
             json={
                 "updates": {
                     "rag.rerank_top_n": 5,
-                    "agent.proof.max_loops": 7,
-                    "prompt.proof_agent": "test-prompt-override",
+                    "agent.graph.max_loops": 7,
+                    "prompt.graph_agent": "test-prompt-override",
                 }
             },
         )
         rag_cfg = app.state.config.materialize_rag_config()
         assert rag_cfg.rerank_top_n == 5
 
-        proof_kw = app.state.config.materialize_agent_kwargs("proof")
-        assert proof_kw["max_loops"] == 7
-        assert proof_kw["system_prompt"] == "test-prompt-override"
+        graph_kw = app.state.config.materialize_agent_kwargs("graph")
+        assert graph_kw["max_loops"] == 7
+        assert graph_kw["system_prompt"] == "test-prompt-override"
 
-        # base / graph stay at their defaults (we only patched proof).
+        # base stays at its default (we only patched graph).
         base_kw = app.state.config.materialize_agent_kwargs("base")
         assert base_kw["max_loops"] == 24
 

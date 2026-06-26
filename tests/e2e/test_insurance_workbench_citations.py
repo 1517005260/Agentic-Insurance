@@ -1,18 +1,18 @@
 """Cheap-tier coverage for the workbench citation channel.
 
-Stubs out the BaseAgent / ProofAgent ``run`` entry point with a
-canned event sequence so the test can run without an LLM key. The
-runner under test is the real ``stream_workbench_agent`` helper —
-the assertions cover its contract:
+Stubs out the BaseAgent ``run`` entry point with a canned event
+sequence so the test can run without an LLM key. The runner under
+test is the real ``stream_workbench_agent`` helper — the assertions
+cover its contract:
 
 * one ``citations`` event per run, with one item per distinct
   ``(file_id, page_id)`` returned by ``read``;
 * sup labels start at 1 and increment in first-seen order;
 * the ``citations`` frame precedes ``final`` and follows every
   ``tool_result``;
-* the agent-internal ``final`` frame (BaseAgent / ProofAgent both
-  emit one before returning) is suppressed; only the runner's
-  flavor-tagged ``final`` reaches the wire;
+* the agent-internal ``final`` frame (BaseAgent emits one before
+  returning) is suppressed; only the runner's flavor-tagged
+  ``final`` reaches the wire;
 * ``_full_result`` (the internal hand-off field) never reaches the
   SSE wire;
 * the exception path still pushes a ``citations`` frame so the
@@ -24,7 +24,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import pytest
 
 from agentic.agent.base import BaseAgent
-from agentic.agent.proof_agent import ProofAgent, ProofRunResult
 from api.runners._workbench import stream_workbench_agent
 from config.config_store import ConfigStore
 
@@ -98,51 +97,6 @@ class _StubBaseAgent(BaseAgent):
             "cached_tokens_total": 0,
             "output_tokens_total": 0,
         }
-
-
-class _StubProofAgent(ProofAgent):
-    """ProofAgent shape with a scripted run() returning a ProofRunResult."""
-
-    def __init__(self, scripted_events: List[Tuple[str, Dict[str, Any]]], answer: str = "stub proof answer [^1]") -> None:
-        self._scripted_events = scripted_events
-        self._answer = answer
-
-    def run(
-        self,
-        query: str,
-        tracer: Optional[Any] = None,
-        on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        *,
-        max_loops: Optional[int] = None,
-        max_token_budget: Optional[int] = None,
-        system_prompt: Optional[str] = None,
-        cancel_check: Optional[Callable[[], bool]] = None,
-    ) -> ProofRunResult:
-        for event_name, data in self._scripted_events:
-            if on_event is not None:
-                on_event(event_name, data)
-        if on_event is not None:
-            on_event(
-                "final",
-                {
-                    "answer": self._answer,
-                    "decision": "CERTIFIED",
-                    "exit_reason": "finalized",
-                    "loops": 2,
-                    "total_cost": 0.0,
-                },
-            )
-        return ProofRunResult(
-            decision="CERTIFIED",
-            answer=self._answer,
-            obligations=[],
-            claims=[],
-            candidate_gaps=[],
-            trajectory=[],
-            loops=2,
-            total_cost=0.0,
-            exit_reason="finalized",
-        )
 
 
 async def _drain(gen) -> List[Tuple[str, Dict[str, Any]]]:
@@ -364,64 +318,6 @@ async def test_workbench_skips_malformed_read_envelope_without_crashing():
     assert citation_frames[0]["items"] == []
 
 
-async def test_workbench_proof_kind_emits_citations_and_swallows_agent_final():
-    """ProofAgent path: same citation contract, decision in final."""
-    page_envelope = _ok(
-        "PageReadObservation",
-        unit_type="page",
-        units=[
-            {
-                "unit_id": "f9::p010",
-                "file_id": "f9",
-                "page_id": "p010",
-                "page_number": 10,
-                "text": "Exclusion clause: war and nuclear events.",
-            }
-        ],
-        summary={"requested": 1, "new": 1},
-    )
-    scripted = [
-        ("status", {"phase": "thinking", "loop": 1}),
-        ("tool_call", {"loop": 1, "name": "read", "args": {"unit_ids": ["f9::p010"]}}),
-        (
-            "tool_result",
-            {
-                "loop": 1,
-                "name": "read",
-                "preview": page_envelope[:300],
-                "observation_id": "obs_0001",
-                "must_finalize_next": False,
-                "_full_result": page_envelope,
-            },
-        ),
-    ]
-    agent = _StubProofAgent(scripted)
-    config = ConfigStore.defaults_only()
-
-    events = await _drain(
-        stream_workbench_agent(
-            user_prompt="dummy",
-            agent=agent,
-            kind="proof",
-            config=config,
-            prompt_key="prompt.exclusion_audit",
-            flavor="exclusion",
-        )
-    )
-
-    citation_frames = [d for n, d in events if n == "citations"]
-    assert len(citation_frames) == 1
-    items = citation_frames[0]["items"]
-    assert len(items) == 1 and items[0]["sup"] == 1
-    assert items[0]["file_id"] == "f9" and items[0]["page_number"] == 10
-
-    final_frames = [d for n, d in events if n == "final"]
-    assert len(final_frames) == 1, "agent-internal final must be swallowed"
-    assert final_frames[0]["flavor"] == "exclusion"
-    assert final_frames[0]["decision"] == "CERTIFIED"
-    assert final_frames[0]["citations_count"] == 1
-
-
 async def test_workbench_pushes_citations_even_when_agent_raises():
     """Exception path: citations frame still emitted before error/done."""
     page_envelope = _ok(
@@ -515,8 +411,8 @@ async def test_workbench_handles_passage_units():
             agent=agent,
             kind="base",
             config=config,
-            prompt_key="prompt.exclusion_audit",
-            flavor="exclusion",
+            prompt_key="prompt.claim_check",
+            flavor="claim",
         )
     )
     items = next(d for n, d in events if n == "citations")["items"]

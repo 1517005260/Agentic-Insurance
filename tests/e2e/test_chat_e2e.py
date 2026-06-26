@@ -189,11 +189,11 @@ async def test_session_lifecycle_crud(app_harness):
         r = await client.post(
             "/chat/sessions",
             headers=headers,
-            json={"mode": "agent", "agent_kind": "proof", "title": "proof-run"},
+            json={"mode": "agent", "agent_kind": "graph", "title": "graph-run"},
         )
         assert r.status_code == 201, r.text
         agent_session = r.json()
-        assert agent_session["agent_kind"] == "proof"
+        assert agent_session["agent_kind"] == "graph"
 
         # List — both visible, newest first
         r = await client.get("/chat/sessions", headers=headers)
